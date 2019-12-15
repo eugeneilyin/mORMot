@@ -4340,7 +4340,7 @@ var i, j, k, len, lenup100, CP, L: integer;
     WS: WideString;
     SU: SynUnicode;
     str: string;
-    U, res, Up,Up2: RawUTF8;
+    U,U2, res, Up,Up2: RawUTF8;
     arr: TRawUTF8DynArray;
     PB: PByte;
     {$ifndef DELPHI5OROLDER}
@@ -4441,10 +4441,27 @@ begin
   Check(GetUnQuoteCSVItem('"""one,',0,',','"')='');
   Check(FormatUTF8('abcd',[U],[WS])='abcd');
 {$endif}
+  U := QuotedStr('','"');
+  Check(U='""');
+  U := QuotedStr('abc','"');
+  Check(U='"abc"');
+  U := QuotedStr('a"c','"');
+  Check(U='"a""c"');
+  U := QuotedStr('abcd"efg','"');
+  Check(U='"abcd""efg"');
+  U := QuotedStr('abcd""efg','"');
+  Check(U='"abcd""""efg"');
+  U := QuotedStr('abcd"e"fg"','"');
+  Check(U='"abcd""e""fg"""');
+  U := QuotedStr('"abcd"efg','"');
+  Check(U='"""abcd""efg"');
   for i := 0 to 1000 do begin
     len := i*5;
     W := RandomAnsi7(len);
     Check(length(W)=len);
+    lenup100 := len;
+    if lenup100>100 then
+      lenup100 := 100;
     str := Ansi7ToString(W); // should be fine on any code page
     if len>0 then begin
       Check(length(str)=len);
@@ -4454,9 +4471,6 @@ begin
         if (str[1]<>str[2]) and (str[2]<>str[3]) and (str[1]<>str[3]) then
           check(PosExString(str[3],str)=3);
       end;
-      lenup100 := len;
-      if lenup100>100 then
-        lenup100 := 100;
       for j := 1 to lenup100 do begin
         check(PosExString(#13,str,j)=0);
         check(PosExString(str[j],str,j)=j);
@@ -4521,7 +4535,7 @@ begin
     Check(IsWinAnsi(pointer(Unic),length(Unic)shr 1)=WA);
     Check(IsWinAnsiU(pointer(U))=WA);
     Up := SynCommons.UpperCase(U);
-    Check(SynCommons.UpperCase(LowerCase(U))=Up);
+    Check(SynCommons.UpperCase(SynCommons.LowerCase(U))=Up);
     Check(UTF8IComp(pointer(U),pointer(U))=0);
     Check(UTF8IComp(pointer(U),pointer(Up))=0);
     Check(UTF8ILComp(pointer(U),pointer(U),length(U),length(U))=0);
@@ -4543,7 +4557,8 @@ begin
     Check(kr32(0,pointer(U),length(U))=kr32reference(pointer(U),length(U)));
     if U='' then
       continue;
-    Check(UnQuoteSQLStringVar(pointer(QuotedStr(U,'"')),res)<>nil);
+    U2 := QuotedStr(U,'"');
+    Check(UnQuoteSQLStringVar(pointer(U2),res)<>nil);
     Check(res=U);
     Check(not IsZero(pointer(W),length(W)));
     FillCharFast(pointer(W)^,length(W),0);
@@ -13070,28 +13085,28 @@ type
   end;
 
 procedure TestMasterSlaveRecordVersion(Test: TSynTestCase; const DBExt: TFileName);
-procedure TestMasterSlave(Master,Slave: TSQLRestServer; SynchronizeFromMaster: TSQLRest);
-var res: TRecordVersion;
-    Rec1,Rec2: TSQLRecordPeopleVersioned;
-begin
-  if SynchronizeFromMaster<>nil then
-    res := Slave.RecordVersionSynchronizeSlave(TSQLRecordPeopleVersioned,SynchronizeFromMaster,500) else
-    res := Slave.RecordVersionCurrent;
-  Test.Check(res=Master.RecordVersionCurrent);
-  Rec1 := TSQLRecordPeopleVersioned.CreateAndFillPrepare(Master,'order by ID','*');
-  Rec2 := TSQLRecordPeopleVersioned.CreateAndFillPrepare(Slave,'order by ID','*');
-  try
-    Test.Check(Rec1.FillTable.RowCount=Rec2.FillTable.RowCount);
-    while Rec1.FillOne do begin
-      Test.Check(Rec2.FillOne);
-      Test.Check(Rec1.SameRecord(Rec2),'simple fields');
-      Test.Check(Rec1.Version=Rec2.Version);
+  procedure TestMasterSlave(Master,Slave: TSQLRestServer; SynchronizeFromMaster: TSQLRest);
+  var res: TRecordVersion;
+      Rec1,Rec2: TSQLRecordPeopleVersioned;
+  begin
+    if SynchronizeFromMaster<>nil then
+      res := Slave.RecordVersionSynchronizeSlave(TSQLRecordPeopleVersioned,SynchronizeFromMaster,500) else
+      res := Slave.RecordVersionCurrent;
+    Test.Check(res=Master.RecordVersionCurrent);
+    Rec1 := TSQLRecordPeopleVersioned.CreateAndFillPrepare(Master,'order by ID','*');
+    Rec2 := TSQLRecordPeopleVersioned.CreateAndFillPrepare(Slave,'order by ID','*');
+    try
+      Test.Check(Rec1.FillTable.RowCount=Rec2.FillTable.RowCount);
+      while Rec1.FillOne do begin
+        Test.Check(Rec2.FillOne);
+        Test.Check(Rec1.SameRecord(Rec2),'simple fields');
+        Test.Check(Rec1.Version=Rec2.Version);
+      end;
+    finally
+      Rec1.Free;
+      Rec2.Free;
     end;
-  finally
-    Rec1.Free;
-    Rec2.Free;
   end;
-end;
 var Model: TSQLModel;
     Master,Slave1,Slave2: TSQLRestServerDB;
     MasterAccess: TSQLRestClientURI;
@@ -13100,31 +13115,33 @@ var Model: TSQLModel;
     Slave2Callback: IServiceRecordVersionCallback;
     i,n: integer;
     timeout: Int64;
-function CreateServer(const DBFileName: TFileName; DeleteDBFile: boolean): TSQLRestServerDB;
-begin
-  if DeleteDBFile then
-    DeleteFile(DBFileName);
-  result := TSQLRestServerDB.Create(Model,DBFileName,false,'');
-  result.DB.Synchronous := smOff;
-  result.DB.LockingMode := lmExclusive;
-  result.CreateMissingTables;
-end;
-procedure CreateMaster(DeleteDBFile: boolean);
-var serv: TSQLHttpServer;
-    ws: TSQLHttpClientWebsockets;
-begin
-  Master := CreateServer('testversion'+DBExt,DeleteDBFile);
-  if Test is TTestBidirectionalRemoteConnection then begin
-    serv := TTestBidirectionalRemoteConnection(Test).fHttpServer;
-    Test.Check(serv.AddServer(Master));
-    serv.WebSocketsEnable(Master,'key2').Settings.SetFullLog;
-    ws := TSQLHttpClientWebsockets.Create('127.0.0.1',HTTP_DEFAULTPORT,Model);
-    ws.WebSockets.Settings.SetFullLog;
-    Test.Check(ws.WebSocketsUpgrade('key2')='');
-    MasterAccess := ws;
-  end else
-    MasterAccess := TSQLRestClientDB.Create(Master);
-end;
+  function CreateServer(const DBFileName: TFileName; DeleteDBFile: boolean): TSQLRestServerDB;
+  begin
+    if DeleteDBFile then
+      DeleteFile(DBFileName);
+    result := TSQLRestServerDB.Create(TSQLModel.Create(Model),DBFileName,false,'');
+    result.Model.Owner := result;
+    result.DB.Synchronous := smOff;
+    result.DB.LockingMode := lmExclusive;
+    result.CreateMissingTables;
+  end;
+  procedure CreateMaster(DeleteDBFile: boolean);
+  var serv: TSQLHttpServer;
+      ws: TSQLHttpClientWebsockets;
+  begin
+    Master := CreateServer('testversion'+DBExt,DeleteDBFile);
+    if Test is TTestBidirectionalRemoteConnection then begin
+      serv := TTestBidirectionalRemoteConnection(Test).fHttpServer;
+      Test.Check(serv.AddServer(Master));
+      serv.WebSocketsEnable(Master,'key2').Settings.SetFullLog;
+      ws := TSQLHttpClientWebsockets.Create('127.0.0.1',HTTP_DEFAULTPORT,TSQLModel.Create(Model));
+      ws.Model.Owner := ws;
+      ws.WebSockets.Settings.SetFullLog;
+      Test.Check(ws.WebSocketsUpgrade('key2')='');
+      MasterAccess := ws;
+    end else
+      MasterAccess := TSQLRestClientDB.Create(Master);
+  end;
 begin
   Model := TSQLModel.Create(
     [TSQLRecordPeople,TSQLRecordPeopleVersioned,TSQLRecordTableDeleted],'root0');

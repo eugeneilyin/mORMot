@@ -1561,8 +1561,8 @@ begin
             action.RedirectToMethodParameters := methodOutput else begin
             // rendering, e.g. with fast Mustache {{template}}
             _Json(methodOutput,renderContext,JSON_OPTIONS_FAST);
-            TDocVariantData(renderContext).AddValue(
-              'main',fApplication.GetViewInfo(fMethodIndex));
+//            TDocVariantData(renderContext).AddValue(
+//              'main',fApplication.GetViewInfo(fMethodIndex));
             if fMethodIndex=fApplication.fFactoryErrorIndex then
               _ObjAddProps(['errorCode',action.ReturnedStatus,
                 'originalErrorContext',JSONReformat(ToUTF8(renderContext))],
@@ -1637,7 +1637,7 @@ end;
 procedure TMVCRendererJson.Renders(outContext: variant;
   status: cardinal; forcesError: boolean);
 begin
-  fOutput.Content := JSONReformat(ToUTF8(outContext));
+  fOutput.Content := ToUTF8(outContext);
   fOutput.Header := JSON_CONTENT_TYPE_HEADER_VAR;
   fOutput.Status := status;
 end;
@@ -1837,7 +1837,7 @@ begin
       end else
         renderer.CommandError('notfound',true,HTTP_NOTFOUND);
       Ctxt.Returns(renderer.Output.Content,renderer.Output.Status,
-        renderer.Output.Header,True,true);
+        renderer.Output.Header,False,true);
     finally
       renderer.Free;
     end;

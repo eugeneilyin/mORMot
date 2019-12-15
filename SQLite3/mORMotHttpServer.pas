@@ -156,7 +156,7 @@ unit mORMotHttpServer;
 
 interface
 
-{$define COMPRESSSYNLZ}
+{.$define COMPRESSSYNLZ}
 { if defined, will use SynLZ for content compression
   - SynLZ is much faster than deflate/zip, so is preferred
   - can be set global for Client and Server applications
@@ -593,10 +593,10 @@ begin
          (fDBServers[i].Security=aHttpServerSecurity) then
         exit; // register only once per URI Root address and per protocol
     {$ifndef ONLYUSEHTTPSOCKET}
-    if fHttpServerKind in [useHttpApi,useHttpApiRegisteringURI] then
-      if HttpApiAddUri(aServer.Model.Root,fDomainName,aHttpServerSecurity,
-         fHttpServerKind=useHttpApiRegisteringURI,false)<>'' then
-        exit;
+//    if fHttpServerKind in [useHttpApi,useHttpApiRegisteringURI] then
+//      if HttpApiAddUri(aServer.Model.Root,fDomainName,aHttpServerSecurity,
+//         fHttpServerKind=useHttpApiRegisteringURI,false)<>'' then
+//        exit;
     {$endif}
     SetLength(fDBServers,n+1);
     SetDBServer(n,aServer,aHttpServerSecurity,aRestAccessRights);
@@ -718,9 +718,9 @@ begin
     // first try to use fastest http.sys
     fHttpServer := THttpApiServer.Create(false,
       aQueueName,HttpThreadStart,HttpThreadTerminate,GetDBServerNames);
-    for i := 0 to high(aServers) do
-      HttpApiAddUri(aServers[i].Model.Root,fDomainName,aHttpServerSecurity,
-        fHttpServerKind=useHttpApiRegisteringURI,true);
+//    for i := 0 to high(aServers) do
+//      HttpApiAddUri(aServers[i].Model.Root,fDomainName,aHttpServerSecurity,
+//        fHttpServerKind=useHttpApiRegisteringURI,true);
     if aAdditionalURL<>'' then
       HttpApiAddUri(aAdditionalURL,fDomainName,aHttpServerSecurity,
         fHttpServerKind=useHttpApiRegisteringURI,true);

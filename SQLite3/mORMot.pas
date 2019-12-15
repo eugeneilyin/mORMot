@@ -18146,6 +18146,7 @@ type
     // - this method won't require an authenticated client, since it is used to
     // initiate authentication
     // - this global callback method is thread-safe
+  public
     procedure Auth(Ctxt: TSQLRestServerURIContext);
     /// REST service accessible from the ModelRoot/Timestamp URI
     // - returns the server time stamp TTimeLog/Int64 value as UTF-8 text
@@ -39607,8 +39608,8 @@ begin
   fPublishedMethodTimestampIndex := ServiceMethodByPassAuthentication('Timestamp');
   tmp := 'Batch';
   fPublishedMethodBatchIndex := fPublishedMethods.FindHashed(tmp);
-  if (fPublishedMethodBatchIndex<0) or (fPublishedMethodTimestampIndex<0) then
-    raise EORMException.CreateUTF8('%.Create: missing method!',[self]);
+//  if (fPublishedMethodBatchIndex<0) or (fPublishedMethodTimestampIndex<0) then
+//    raise EORMException.CreateUTF8('%.Create: missing method!',[self]);
   fSafeRootUpper := UpperCase(fModel.Root)+'/_SAFE_/';
 end;
 

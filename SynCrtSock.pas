@@ -8746,8 +8746,8 @@ var Req: PHTTP_REQUEST;
     // send response
     Resp^.Version := Req^.Version;
     Resp^.SetHeaders(pointer(Context.OutCustomHeaders),Heads);
-    if fCompressAcceptEncoding<>'' then
-      Resp^.AddCustomHeader(pointer(fCompressAcceptEncoding),Heads,false);
+//    if fCompressAcceptEncoding<>'' then
+//      Resp^.AddCustomHeader(pointer(fCompressAcceptEncoding),Heads,false);
     with Resp^.Headers.KnownHeaders[respServer] do begin
       pRawValue := pointer(fServerName);
       RawValueLength := length(fServerName);

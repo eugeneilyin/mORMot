@@ -797,6 +797,8 @@ begin
     nfo := StoredClassRecordProps.Fields.List[f];
     if nfo.SQLFieldType in COPIABLE_FIELDS then begin // ignore sftMany
       SQL := fStoredClassMapping^.ExtFieldNames[f];
+      if rpmQuoteFieldName in options then
+        fStoredClassMapping^.MapField(nfo.Name,'"'+SQL+'"') else 
       if fProperties.IsSQLKeyword(SQL) then begin
         log.Log(sllWarning,'%.%: Field name "%" is not compatible with %',
           [fStoredClass,nfo.Name,SQL,fProperties.DBMSEngineName],self);
@@ -805,8 +807,7 @@ begin
           fStoredClassMapping^.MapField(nfo.Name,SQL+'_');
         end else
           log.Log(sllWarning,'-> you should better use MapAutoKeywordFields',self);
-      end else if rpmQuoteFieldName in options then
-        fStoredClassMapping^.MapField(nfo.Name,'"'+SQL+'"');
+      end;
     end;
   end;
   // create corresponding external table if necessary, and retrieve its fields info
@@ -893,6 +894,7 @@ var Stmt: TSynTableStatement;
     limit: TSQLDBDefinitionLimitClause;
     limitSQL,name: RawUTF8;
     f,n: integer;
+    tmp: TTextWriterStackBuffer;
 begin
   result := false;
   if SQL='' then
@@ -924,7 +926,7 @@ begin
         FormatUTF8(limit.InsertFmt,['%', Stmt.Limit],limitSQL) else
         FormatUTF8(limit.InsertFmt,[Stmt.Limit],limitSQL);
     end;
-    W := TTextWriter.CreateOwnedStream(1024);
+    W := TTextWriter.CreateOwnedStream(tmp);
     try
       W.AddShort('select ');
       if limit.Position=posSelect then

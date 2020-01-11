@@ -766,7 +766,7 @@ type
     // - get initialize the socket with the supplied accepted socket
     // - caller will then use the GetRequest method below to
     // get the request
-    procedure InitRequest(aClientSock: TSocket);
+    procedure InitRequest(aClientSock: TSocket; const aRemoteIP: SockString='');
     /// main object function called after aClientSock := Accept + Create:
     // - get Command, Method, URL, Headers and Body (if withBody is TRUE)
     // - get sent data in Content (if ContentLength<>0)
@@ -2603,6 +2603,9 @@ function AuthorizationBearer(const AuthToken: SockString): SockString;
 /// compute the '1.2.3.4' text representation of a raw IP4 binary
 procedure IP4Text(const ip4addr; var result: SockString); overload;
 
+/// compute the text representation of a IP4/IP6 low-level connection
+procedure IPText(const sin: TVarSin; var result: SockString);
+
 const
   /// the layout of TSMTPConnection.FromText method
   SMTP_DEFAULT = 'user:password@smtpserver:port';
@@ -3197,7 +3200,8 @@ type
     function Stop(connection: TObject): boolean; virtual;
     /// add some data to the asynchronous output buffer of a given connection
     // - this method may block if the connection is currently writing from
-    // another thread, up to timeout milliseconds
+    // another thread (which is not possible from TPollAsynchSockets.Write),
+    // up to timeout milliseconds
     function Write(connection: TObject; const data; datalen: integer;
       timeout: integer=5000): boolean; virtual;
     /// add some data to the asynchronous output buffer of a given connection
@@ -3978,7 +3982,7 @@ begin
     result := SockString(Format('%d.%d.%d.%d',[b[0],b[1],b[2],b[3]]))
 end;
 
-procedure GetSinIPFromCache(const sin: TVarSin; var result: SockString);
+procedure IPText(const sin: TVarSin; var result: SockString);
 begin
   if sin.sin_family=AF_INET then
     IP4Text(sin.sin_addr,result) else begin
@@ -4000,6 +4004,14 @@ begin
 end;
 
 {$ifdef MSWINDOWS}
+
+procedure SleepHiRes(ms: cardinal); // in SynKylix/SynFPCLinux
+begin
+  {$ifndef FPC} // function SwitchToThread oddly not defined in fpc\rtl\win
+  if (ms<>0) or not SwitchToThread then
+  {$endif}
+    Windows.Sleep(ms);
+end;
 
 const
   HexCharsLower: array[0..15] of AnsiChar = '0123456789abcdef';
@@ -4264,7 +4276,7 @@ begin
             end;
             //s := s+'@'+info^.ifa_name;
         end;
-        //AF_INET6: GetSinIPFromCache(PVarSin(info^.ifa_addr)^,s);
+        //AF_INET6: IPText(PVarSin(info^.ifa_addr)^,s);
         end;
         if s<>'' then begin
           if n=length(result) then
@@ -4732,7 +4744,7 @@ begin
     result := 0; // no error
   end else begin
     Sock.fSockInEof := true; // error -> mark end of SockIn
-    result := -WSAGetLastError;
+    result := -integer(WSAGetLastError); // integer() for FPC+Win target
     // result <0 will update ioresult and raise an exception if {$I+}
   end;
 end;
@@ -4846,7 +4858,7 @@ begin
   CreateSockIn; // use SockIn by default if not already initialized: 2x faster
   OpenBind('','',false,aClientSock, fSocketLayer); // set the ACCEPTed aClientSock
   Linger := 5; // should remain open for 5 seconds after a closesocket() call
-  if aRemoteIP<>nil then
+  if (aRemoteIP<>nil) and (aRemoteIP^='') then
     aRemoteIP^ := GetRemoteIP(aClientSock);
 end;
 
@@ -5011,7 +5023,7 @@ begin
       exit; // fatal socket error
     if GetTick64>endtix then
       exit; // identify read timeout as error
-    sleep(1);
+    SleepHiRes(1);
   until false;
   result := true;
 end;
@@ -5245,7 +5257,7 @@ begin
         exit; // fatal socket error
       if GetTick64>endtix then
         exit; // identify read timeout as error
-      sleep(1);
+      SleepHiRes(1);
     until false;
   end;
   result := true;
@@ -5414,16 +5426,6 @@ begin
   result := fPeerAddr.sin_port;
 end;
 
-{$ifdef MSWINDOWS}
-procedure SleepHiRes(ms: cardinal);
-begin
-  {$ifndef FPC} // function SwitchToThread oddly not defined in fpc\rtl\win
-  if (ms<>0) or not SwitchToThread then
-  {$endif}
-    Windows.Sleep(ms);
-end;
-{$endif}
-
 function TCrtSocket.SockReceiveString: SockString;
 var available, resultlen, read: integer;
 begin
@@ -5432,12 +5434,11 @@ begin
     exit;
   resultlen := 0;
   repeat
-    SleepHiRes(0);
-    if IOCtlSocket(fSock, FIONREAD, available)<>0 then // get exact count
+    if (IOCtlSocket(fSock, FIONREAD, available)<>0) or (fSock<=0) then
       exit; // raw socket error
     if available=0 then // no data in the allowed timeout
       if result='' then begin // wait till something
-        SleepHiRes(10); // 10 ms delay in infinite loop
+        SleepHiRes(1);// some delay in infinite loop
         continue;
       end else
         break; // return what we have
@@ -5451,6 +5452,7 @@ begin
     inc(resultlen,read);
     if read<available then
       SetLength(result,resultlen); // e.g. Read=0 may happen
+    SleepHiRes(0); // 1 microsec on POSIX
   until false;
 end;
 
@@ -6169,7 +6171,7 @@ begin
       if ClientSock<=0 then
         if Terminated then
           break else begin
-          SleepHiRes(0);
+          SleepHiRes(1); // failure (too many clients?) -> wait and retry
           continue;
         end;
       if Terminated or (Sock=nil) then begin
@@ -6382,13 +6384,13 @@ begin
   if Terminated then
     exit;
   if MS<32 then begin // smaller than GetTickCount resolution (under Windows)
-    sleep(MS);
+    SleepHiRes(MS);
     if Terminated then
       exit;
   end else begin
     endtix := GetTick64+MS;
     repeat
-      sleep(10);
+      SleepHiRes(10);
       if Terminated then
         exit;
     until GetTick64>endtix;
@@ -6471,7 +6473,7 @@ procedure THttpServerResp.Execute;
               TSynLog.Add.Log(sllCustom1, 'HandleRequestsProcess: sock=% LOWDELAY=%',
                 [fServerSock.fSock, tix-beforetix], self);
               {$endif}
-              sleep(1); // seen only on Windows in practice
+              SleepHiRes(1); // seen only on Windows in practice
               if (fServer=nil) or fServer.Terminated then
                 exit; // server is down -> disconnect the client
             end;
@@ -6636,7 +6638,7 @@ begin
     if s='' then
       break; // headers end with a void line
     if length(Headers)<=n then
-      SetLength(Headers,n+n shr 3+10);
+      SetLength(Headers,n+n shr 3+16);
     Headers[n] := s;
     inc(n);
     P := pointer(s);
@@ -6689,15 +6691,16 @@ begin
       while P^>#13 do inc(P);
       if PDeb<>P then begin // add any not void line
         if length(Headers)<=n then
-          SetLength(Headers,n+n shr 3+8);
+          SetLength(Headers,n+n shr 3+16);
         SetString(Headers[n],PDeb,P-PDeb);
         inc(n);
       end;
       while (P^=#13) or (P^=#10) do inc(P);
     until P^=#0;
-  SetLength(Headers,n);
-  if (aForcedContentType='') or (HeaderGetValue('CONTENT-TYPE')<>'') then
+  if (aForcedContentType='') or (HeaderGetValue('CONTENT-TYPE')<>'') then begin
+    SetLength(Headers,n);
     exit;
+  end;
   SetLength(Headers,n+1);
   Headers[n] := 'Content-Type: '+aForcedContentType;
 end;
@@ -6792,8 +6795,9 @@ begin
   end;
 end;
 
-procedure THttpServerSocket.InitRequest(aClientSock: TSocket);
+procedure THttpServerSocket.InitRequest(aClientSock: TSocket; const aRemoteIP: SockString);
 begin
+  fRemoteIP := aRemoteIP;
   AcceptRequest(aClientSock, @fRemoteIP);
 end;
 
@@ -6915,7 +6919,7 @@ function GetRemoteIP(aClientSock: TSocket): SockString;
 var Name: TVarSin;
 begin
   if GetPeerName(aClientSock,Name)=0 then
-    GetSinIPFromCache(Name,result) else
+    IPText(Name,result) else
     result := '';
 end;
 
@@ -7018,7 +7022,7 @@ begin
     // wait for threads to finish, with 30 seconds TimeOut
     endtix := GetTick64+30000;
     while (fRunningThreads>0) and (GetTick64<endtix) do
-      Sleep(5);
+      SleepHiRes(5);
     fSubThread.Free;
   finally
     {$ifdef USE_WINIOCP}
@@ -8108,7 +8112,7 @@ begin
       inc(P);
   end;
   if (RemoteIP='') and (Request.Address.pRemoteAddress<>nil) then
-    GetSinIPFromCache(PVarSin(Request.Address.pRemoteAddress)^,RemoteIP);
+    IPText(PVarSin(Request.Address.pRemoteAddress)^,RemoteIP);
   // compute headers length
   Lip := length(RemoteIP);
   if Lip<>0 then
@@ -12233,10 +12237,10 @@ begin
     if elapsed>timeoutMS then
       exit else
     if elapsed>300 then
-      sleep(50) else
+      SleepHiRes(50) else
     if elapsed>50 then
-      sleep(10) else
-      sleep(1);
+      SleepHiRes(10) else
+      SleepHiRes(1);
   until fTerminated;
 end;
 
@@ -12275,7 +12279,7 @@ begin
   endtix := GetTick64+timeoutMS; // never wait forever
   ms := 0;
   repeat
-    sleep(ms);
+    SleepHiRes(ms);
     ms := ms xor 1; // 0,1,0,1,0,1...
     if socket=0 then
       exit; // no socket to lock for
@@ -12366,7 +12370,7 @@ begin
             include(lock,w);
           if lock=[r,w] then
             break;
-          sleep(0);
+          SleepHiRes(0); // 1 microsec on POSIX
         until GetTick64>=endtix;
       end;
   finally
@@ -12390,7 +12394,7 @@ begin
     exit;
   endtix := GetTick64+waitforMS;
   repeat
-    Sleep(1);
+    SleepHiRes(1);
     if fProcessing=0 then
       break;
   until GetTick64>endtix;
@@ -12453,7 +12457,6 @@ begin
               try // notify everything written
                 AfterWrite(connection);
                 result := true;
-                exit;
               except
                 result := false;
               end;

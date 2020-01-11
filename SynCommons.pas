@@ -809,6 +809,7 @@ type
     function Init: integer; overload; {$ifdef HASINLINE}inline;{$endif}
     /// initialize a new temporary buffer of a given number of random bytes
     // - will fill the buffer via FillRandom() calls
+    // - forcegsl is true by default, since Lecuyer's generator has no HW bug
     function InitRandom(RandomLen: integer; forcegsl: boolean=true): pointer;
     /// initialize a new temporary buffer filled with 32-bit integer increasing values
     function InitIncreasing(Count: PtrInt; Start: PtrInt=0): PIntegerArray;
@@ -2300,8 +2301,8 @@ function StrLenPas(S: pointer): PtrInt;
 var StrLen: function(S: pointer): PtrInt = StrLenPas;
 
 /// our fast version of FillChar()
-// - this version will use fast SSE2 instructions (if available), on both Win32
-// and Win64 platforms, or an optimized X86 revision on older CPUs
+// - this version will use fast SSE2/ERMS instructions (if available), on both
+// Win32 and Win64 platforms, or an optimized X86 revision on older CPUs
 var FillcharFast: procedure(var Dest; count: PtrInt; Value: byte);
 
 /// our fast version of move()
@@ -7023,6 +7024,11 @@ procedure RecordCopy(var Dest; const Source; TypeInfo: pointer); {$ifdef FPC}inl
 /// clear a record content
 // - this unit includes a fast optimized asm version for x86 on Delphi
 procedure RecordClear(var Dest; TypeInfo: pointer); {$ifdef FPC}inline;{$endif}
+
+/// initialize a record content
+// - calls RecordClear() and FillCharFast() with 0
+// - do nothing if the TypeInfo is not from a record/object
+procedure RecordZero(var Dest; TypeInfo: pointer);
 
 {$ifndef DELPHI5OROLDER}
 /// copy a dynamic array content from source to Dest
@@ -17364,7 +17370,7 @@ end;
 function TSynTempBuffer.InitZero(ZeroLen: PtrInt): pointer;
 begin
   Init(ZeroLen-16);
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(buf^,ZeroLen,0);
+  FillCharFast(buf^,ZeroLen,0);
   result := buf;
 end;
 
@@ -18369,7 +18375,7 @@ function TSynTempWriter.wrfillchar(count: integer; value: byte): PAnsiChar;
 begin
   if pos-PAnsiChar(tmp.buf)+count>tmp.len then
      raise ESynException.CreateUTF8('TSynTempWriter(%) overflow',[tmp.len]);
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(pos^,count,value);
+  FillCharFast(pos^,count,value);
   result := pos;
   inc(pos,count);
 end;
@@ -22796,7 +22802,7 @@ end;
 {$ifdef HASINLINE}
 procedure FillZero(var dest; count: PtrInt);
 begin
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(dest,count,0);
+  FillCharFast(dest,count,0);
 end;
 {$else}
 procedure FillZero(var dest; count: PtrInt);
@@ -23827,7 +23833,7 @@ begin
   end;
   result := '';
   tmpN := 0;
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(inlin,SizeOf(inlin),0);
+  FillCharFast(inlin,SizeOf(inlin),0);
   L := 0;
   A := 0;
   P := 0;
@@ -34540,12 +34546,12 @@ end;
 
 procedure FillZero(var Values: TIntegerDynArray);
 begin
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(Values[0],length(Values)*SizeOf(integer),0);
+  FillCharFast(Values[0],length(Values)*SizeOf(integer),0);
 end;
 
 procedure FillZero(var Values: TInt64DynArray);
 begin
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(Values[0],length(Values)*SizeOf(Int64),0);
+  FillCharFast(Values[0],length(Values)*SizeOf(Int64),0);
 end;
 
 
@@ -35763,7 +35769,7 @@ begin
   if secret<>'' then
     with PStrRec(Pointer(PtrInt(secret)-STRRECSIZE))^ do
     if refCnt=1 then // avoid GPF if const
-      {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(pointer(secret)^,length,0);
+      FillCharFast(pointer(secret)^,length,0);
 end;
 
 procedure FillZero(var secret: RawUTF8);
@@ -35771,7 +35777,7 @@ begin
   if secret<>'' then
     with PStrRec(Pointer(PtrInt(secret)-STRRECSIZE))^ do
     if refCnt=1 then // avoid GPF if const
-      {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(pointer(secret)^,length,0);
+      FillCharFast(pointer(secret)^,length,0);
 end;
 
 procedure mul64x64(const left, right: QWord; out product: THash128Rec);
@@ -35827,6 +35833,238 @@ begin
   product.L := t3.V shl 32 or t1.L;
 end;
 {$endif CPUX86}
+{$endif CPUX64}
+
+{$ifdef CPUX64}
+{ Some notes about MOVNTI opcode use below for x86_64 asm:
+  - Delphi inline assembler is not able to compile the instruction -> so we
+    had to write some manual DB $... values instead (FPC has no problem with it) :(
+  - The I in MOVNTI means "non-temporal hint". It is implemented by using a
+    write combining (WC) memory type protocol when writing the data to memory.
+    The processor does not write the data into the cache hierarchy, nor does
+    it fetch the corresponding cache line from memory into the cache hierarchy.
+    By-passing the cache should enhance move() speed of memory blocks >8KB. }
+procedure FillCharx64; {$ifdef FPC}nostackframe; assembler;
+asm {$else} asm .noframe {$endif} // rcx/rdi=Dest rdx/rsi=Count r8/rdx=Value
+        {$ifndef WIN64} // Linux 64-bit ABI
+        mov     rax, rdx
+        movzx   r8, dl
+        mov     rdx, rsi
+        mov     rcx, rdi
+        cmp     rsi, 32
+        {$else}
+        mov     rax, r8
+        and     r8, 0FFH
+        cmp     rdx, 32
+        {$endif}
+        jle     @_32
+        mov     r9, 101010101010101H
+        imul    r8, r9
+        test    cl, 07H
+        jz      @27C5
+        test    cl, 01H
+        jz      @27A4
+        mov     byte ptr[rcx], r8b
+        add     rcx, 1
+        sub     rdx, 1
+@27A4:  test    cl, 02H
+        jz      @27B5
+        mov     word ptr[rcx], r8w
+        add     rcx, 2
+        sub     rdx, 2
+@27B5:  test    cl, 04H
+        jz      @27C5
+        mov     dword ptr[rcx], r8d
+        add     rcx, 4
+        sub     rdx, 4
+@27C5:  mov     rax, rdx
+        and     rdx, 3FH
+        shr     rax, 6
+        jnz     @_64
+@remain:mov     rax, rdx
+        and     rdx, 07H
+        shr     rax, 3
+        jz      @27EC
+{$ifdef FPC} align 8 {$else} .align 8 {$endif}
+@27E0:  mov     qword ptr[rcx], r8
+        add     rcx, 8
+        dec     rax
+        jnz     @27E0
+@27EC:  test    rdx, rdx
+        jle     @27FC
+@27F1:  mov     byte ptr[rcx], r8b
+        inc     rcx
+        dec     rdx
+        jnz     @27F1
+@27FC:  ret
+@_64:   cmp     rax, 8192
+        jnc     @_8192
+{$ifdef FPC} align 8 {$else} .align 8 {$endif}
+@_64s:  add     rcx, 64
+        mov     qword ptr[rcx - 40H], r8
+        mov     qword ptr[rcx - 38H], r8
+        mov     qword ptr[rcx - 30H], r8
+        mov     qword ptr[rcx - 28H], r8
+        mov     qword ptr[rcx - 20H], r8
+        mov     qword ptr[rcx - 18H], r8
+        mov     qword ptr[rcx - 10H], r8
+        mov     qword ptr[rcx - 8H], r8
+        dec     rax
+        jnz     @_64s
+        jmp     @remain
+{$ifdef FPC} align 8 {$else} .align 8 {$endif}
+@_8192: add     rcx, 64
+        db      $4C, $0F, $C3, $41, $C0 // movnti  qword ptr [rcx-40H],r8
+        db      $4C, $0F, $C3, $41, $C8 // movnti  qword ptr [rcx-38H],r8
+        db      $4C, $0F, $C3, $41, $D0 // movnti  qword ptr [rcx-30H],r8
+        db      $4C, $0F, $C3, $41, $D8 // movnti  qword ptr [rcx-28H],r8
+        db      $4C, $0F, $C3, $41, $E0 // movnti  qword ptr [rcx-20H],r8
+        db      $4C, $0F, $C3, $41, $E8 // movnti  qword ptr [rcx-18H],r8
+        db      $4C, $0F, $C3, $41, $F0 // movnti  qword ptr [rcx-10H],r8
+        db      $4C, $0F, $C3, $41, $F8 // movnti  qword ptr [rcx-8H],r8
+        dec     rax
+        jnz     @_8192
+        mfence
+        jmp     @remain
+@_32:   test    rdx, rdx
+        jle     @done
+        mov     ah, al
+        mov     [rcx + rdx - 1], al
+        lea     r8, [rip + @table]
+        and     rdx, - 2
+        neg     rdx
+        lea     rdx, [r8 + rdx * 2 + 64]
+        jmp     rdx
+{$ifdef FPC} align 4 {$else} .align 4 {$endif}
+@table: mov     [rcx + 30], ax
+        mov     [rcx + 28], ax
+        mov     [rcx + 26], ax
+        mov     [rcx + 24], ax
+        mov     [rcx + 22], ax
+        mov     [rcx + 20], ax
+        mov     [rcx + 18], ax
+        mov     [rcx + 16], ax
+        mov     [rcx + 14], ax
+        mov     [rcx + 12], ax
+        mov     [rcx + 10], ax
+        mov     [rcx + 8], ax
+        mov     [rcx + 6], ax
+        mov     [rcx + 4], ax
+        mov     [rcx + 2], ax
+        mov     [rcx], ax
+@done:  ret // for 4-bytes @table alignment with rdx=1
+end;
+procedure Fillcharx64ERMS; {$ifdef FPC}nostackframe; assembler;
+asm {$else} asm .noframe {$endif} // rcx/rdi=Dest rdx/rsi=Count r8/rdx=Value
+        {$ifndef WIN64} // Linux 64-bit ABI
+        mov     rax, rdx
+        movzx   r8, dl
+        mov     rdx, rsi
+        mov     rcx, rdi
+        cmp     rsi, 32
+        {$else}
+        mov     rax, r8
+        and     r8, 0FFH
+        cmp     rdx, 32
+        {$endif}
+        jle     @_32
+        cmp     rdx, 2048
+        jae     @erms // worth it after 2KB (from Intel's Manual)
+        mov     r9, 101010101010101H
+        imul    r8, r9
+        test    cl, 07H
+        jz      @27C5
+        test    cl, 01H
+        jz      @27A4
+        mov     byte ptr[rcx], r8b
+        add     rcx, 1
+        sub     rdx, 1
+@27A4:  test    cl, 02H
+        jz      @27B5
+        mov     word ptr[rcx], r8w
+        add     rcx, 2
+        sub     rdx, 2
+@27B5:  test    cl, 04H
+        jz      @27C5
+        mov     dword ptr[rcx], r8d
+        add     rcx, 4
+        sub     rdx, 4
+@27C5:  mov     rax, rdx
+        and     rdx, 3FH
+        shr     rax, 6
+        jnz     @_64
+@remain:mov     rax, rdx
+        and     rdx, 07H
+        shr     rax, 3
+        jz      @27EC
+{$ifdef FPC} align 8 {$else} .align 8 {$endif}
+@27E0:  mov     qword ptr[rcx], r8
+        add     rcx, 8
+        dec     rax
+        jnz     @27E0
+@27EC:  test    rdx, rdx
+        jle     @27FC
+@27F1:  mov     byte ptr[rcx], r8b
+        inc     rcx
+        dec     rdx
+        jnz     @27F1
+@27FC:  ret
+{$ifdef FPC} align 8 {$else} .align 8 {$endif}
+@_64:   add     rcx, 64
+        mov     qword ptr[rcx - 40H], r8
+        mov     qword ptr[rcx - 38H], r8
+        mov     qword ptr[rcx - 30H], r8
+        mov     qword ptr[rcx - 28H], r8
+        mov     qword ptr[rcx - 20H], r8
+        mov     qword ptr[rcx - 18H], r8
+        mov     qword ptr[rcx - 10H], r8
+        mov     qword ptr[rcx - 8H], r8
+        dec     rax
+        jnz     @_64
+        jmp     @remain
+{$ifdef FPC} align 8 {$else} .align 8 {$endif}
+@erms:  cld
+        {$ifdef WIN64} // al already set
+        push    rsi // preserve non volatile registers
+        push    rdi
+        mov     rdi, rcx
+        mov     rcx, rdx
+        rep stosb // ERMS magic instruction
+        pop     rdi
+        pop     rsi
+        {$else} // rdi and al already set
+        mov     rcx, rdx
+        rep stosb
+        {$endif}
+        ret
+@_32:   test    rdx, rdx
+        jle     @done
+        mov     ah, al
+        mov     [rcx + rdx - 1], al
+        lea     r8, [rip + @table]
+        and     rdx, - 2
+        neg     rdx
+        lea     rdx, [r8 + rdx * 2 + 64]
+        jmp     rdx
+{$ifdef FPC} align 4 {$else} .align 4 {$endif}
+@table: mov     [rcx + 30], ax
+        mov     [rcx + 28], ax
+        mov     [rcx + 26], ax
+        mov     [rcx + 24], ax
+        mov     [rcx + 22], ax
+        mov     [rcx + 20], ax
+        mov     [rcx + 18], ax
+        mov     [rcx + 16], ax
+        mov     [rcx + 14], ax
+        mov     [rcx + 12], ax
+        mov     [rcx + 10], ax
+        mov     [rcx + 8], ax
+        mov     [rcx + 6], ax
+        mov     [rcx + 4], ax
+        mov     [rcx + 2], ax
+        mov     [rcx], ax
+@done:  ret // for 4-bytes @table alignment with rdx=1
+end;
 {$endif CPUX64}
 
 procedure SymmetricEncrypt(key: cardinal; var data: RawByteString);
@@ -39191,7 +39429,7 @@ begin
   result := 0;
   if GetClassInfo(HInstance, pointer(aWindowName), TempClass) then
     exit; // class name already registered -> fail
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(TempClass,SizeOf(TempClass),0);
+  FillCharFast(TempClass,SizeOf(TempClass),0);
   TempClass.hInstance := HInstance;
   TempClass.lpfnWndProc := @DefWindowProc;
   TempClass.lpszClassName :=  pointer(aWindowName);
@@ -40515,6 +40753,16 @@ asm
 end;
 {$endif FPC}
 
+procedure RecordZero(var Dest; TypeInfo: pointer);
+var info: PTypeInfo;
+begin
+  info := GetTypeInfo(TypeInfo,tkRecordKinds);
+  if info<>nil then begin // record/object only
+    RecordClear(Dest,TypeInfo);
+    FillCharFast(Dest,info^.recSize,0);
+  end;
+end;
+
 function ArrayItemType(var info: PTypeInfo; out len: integer): PTypeInfo;
   {$ifdef HASINLINE}inline;{$endif}
 begin
@@ -41513,16 +41761,7 @@ end;
 
 {$ifdef CPU64}
 
-{ Some notes about MOVNTI opcode use below:
-  - Delphi inline assembler is not able to compile the instruction -> so we
-    had to write some manual DB $... values instead :(
-  - The I in MOVNTI means "non-temporal hint". It is implemented by using a
-    write combining (WC) memory type protocol when writing the data to memory.
-    The processor does not write the data into the cache hierarchy, nor does
-    it fetch the corresponding cache line from memory into the cache hierarchy.
-    By-passing the cache should enhance move() speed of big memory blocks. }
-
-procedure Movex64; // A. Bouchez' version
+procedure Movex64;
 asm .noframe // rcx=Source, rdx=Dest, r8=Count
         mov     rax, r8
         sub     rcx, rdx
@@ -41716,134 +41955,7 @@ asm .noframe // rcx=Source, rdx=Dest, r8=Count
         jmp     @20
 end;
 
-procedure FillCharx64; // A. Bouchez' version
-asm .noframe // rcx=Dest rdx=Count r8=Value
-        mov     rax, r8
-        cmp     rdx, 32
-        jle     @small
-        and     r8, 0FFH
-        mov     r9, 101010101010101H
-        imul    r8, r9
-        test    cl, 07H
-        jz      @27C5
-        test    cl, 01H
-        jz      @27A4
-        mov     byte ptr[rcx], r8b
-        add     rcx, 1
-        sub     rdx, 1
-@27A4:  test    cl, 02H
-        jz      @27B5
-        mov     word ptr[rcx], r8w
-        add     rcx, 2
-        sub     rdx, 2
-@27B5:  test    cl, 04H
-        jz      @27C5
-        mov     dword ptr[rcx], r8d
-        add     rcx, 4
-        sub     rdx, 4
-@27C5:  mov     rax, rdx
-        and     rdx, 3FH
-        shr     rax, 6
-        jnz     @27FD
-@27D2:  mov     rax, rdx
-        and     rdx, 07H
-        shr     rax, 3
-        jz      @27EC
-@27E0:  mov     qword ptr[rcx], r8
-        add     rcx, 8
-        dec     rax
-        jnz     @27E0
-@27EC:  test    rdx, rdx
-        jle     @27FC
-@27F1:  mov     byte ptr[rcx], r8b
-        inc     rcx
-        dec     rdx
-        jnz     @27F1
-@27FC:  ret
-@27FD:  cmp     rax, 8192
-        jnc     @2840
-@2810:  add     rcx, 64
-        mov     qword ptr[rcx - 40H], r8
-        mov     qword ptr[rcx - 38H], r8
-        mov     qword ptr[rcx - 30H], r8
-        mov     qword ptr[rcx - 28H], r8
-        dec     rax
-        mov     qword ptr[rcx - 20H], r8
-        mov     qword ptr[rcx - 18H], r8
-        mov     qword ptr[rcx - 10H], r8
-        mov     qword ptr[rcx - 8H], r8
-        jnz     @2810
-        jmp     @27D2
-@2840:  add     rcx, 64
-        db      $4C, $0F, $C3, $41, $C0 // movnti  qword ptr [rcx-40H],r8
-        db      $4C, $0F, $C3, $41, $C8 // movnti  qword ptr [rcx-38H],r8
-        db      $4C, $0F, $C3, $41, $D0 // movnti  qword ptr [rcx-30H],r8
-        db      $4C, $0F, $C3, $41, $D8 // movnti  qword ptr [rcx-28H],r8
-        dec     rax
-        db      $4C, $0F, $C3, $41, $E0 // movnti  qword ptr [rcx-20H],r8
-        db      $4C, $0F, $C3, $41, $E8 // movnti  qword ptr [rcx-18H],r8
-        db      $4C, $0F, $C3, $41, $F0 // movnti  qword ptr [rcx-10H],r8
-        db      $4C, $0F, $C3, $41, $F8 // movnti  qword ptr [rcx-8H],r8
-        jnz     @2840
-        mfence
-        jmp     @27D2
-@small: // rcx=Dest rdx=Count r8=Value<=32
-        test    rdx, rdx
-        jle     @@done
-        mov     ah, al
-        mov     [rcx + rdx - 1], al
-        lea     r8, [@table]
-        and     rdx,  - 2
-        neg     rdx
-        lea     rdx, [r8 + rdx * 2 + 64]
-        jmp     rdx
-@table: mov     [rcx + 30], ax
-        mov     [rcx + 28], ax
-        mov     [rcx + 26], ax
-        mov     [rcx + 24], ax
-        mov     [rcx + 22], ax
-        mov     [rcx + 20], ax
-        mov     [rcx + 18], ax
-        mov     [rcx + 16], ax
-        mov     [rcx + 14], ax
-        mov     [rcx + 12], ax
-        mov     [rcx + 10], ax
-        mov     [rcx + 8], ax
-        mov     [rcx + 6], ax
-        mov     [rcx + 4], ax
-        mov     [rcx + 2], ax
-        mov     [rcx], ax
-        ret
-@@done:
-end;
-
 {$ifdef WITH_ERMS} // x64 version only for Windows ABI
-procedure MoveERMSB; // Ivy Bridge+ Enhanced REP MOVSB/STOSB CPUs
-asm .noframe // rcx=Source, rdx=Dest, r8=Count
-        test    r8, r8
-        jle     @none
-        cld
-        push    rsi
-        push    rdi
-        cmp     rdx, rcx
-        ja      @down
-        mov     rsi, rcx
-        mov     rdi, rdx
-        mov     rcx, r8
-        rep     movsb
-        pop     rdi
-        pop     rsi
-@none:  ret
-@down:  lea     rsi, [rcx + r8 - 1]
-        lea     rdi, [rdx + r8 - 1]
-        mov     rcx, r8
-        std
-        rep     movsb
-        cld
-        pop     rdi
-        pop     rsi
-end;
-
 procedure FillCharERMSB; // Ivy Bridge+ Enhanced REP MOVSB/STOSB CPUs
 asm .noframe // rcx=Dest, rdx=Count, r8b=Value
         test    rdx, rdx
@@ -41916,7 +42028,7 @@ asm // eax=Dest edx=Count cl=Value
         mov     [eax + 4], cx
         mov     [eax + 2], cx
         mov     [eax], cx
-        ret                         // for alignment
+        ret                         // for 4-bytes @fill alignment
 @done:  db      $f3 // rep ret AMD trick here
 end;
 
@@ -42184,7 +42296,9 @@ begin
     FillcharFast := @FillCharERMSB;
   end else {$endif}{$endif} begin
     MoveFast := @Movex64;
-    FillCharFast := @Fillcharx64;
+    if cfERMS in CpuFeatures then
+      FillCharFast := @Fillcharx64ERMS else
+      FillCharFast := @Fillcharx64;
   end;
   {$else CPU64}
   {$ifdef CPUINTEL}
@@ -42523,7 +42637,7 @@ var added: boolean;
 begin
   if (aTypeInfo=nil) or (self=nil) then
     raise ESynException.CreateUTF8('%.Search(%)',[self,aTypeInfo]);
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(Reg,SizeOf(Reg),0);
+  FillCharFast(Reg,SizeOf(Reg),0);
   case PTypeKind(aTypeInfo)^ of
   tkDynArray: begin
     Reg.DynArrayTypeInfo := aTypeInfo;
@@ -42963,7 +43077,7 @@ begin
         result := P;
     ktBinary:
       if wasString then begin // default hexa serialization
-        {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(aValue,fDataSize,0);
+        FillCharFast(aValue,fDataSize,0);
         if (PropValueLen=0) or ((PropValueLen=fFixedSize*2) and
            HexDisplayToBin(PAnsiChar(PropValue),@aValue,fFixedSize)) then
           result := P;
@@ -43391,7 +43505,7 @@ begin
   ReAllocMem(pointer(Data),SizeOf(TDynArrayRec)+fNestedDataSize*NewLength);
   OldLength := PDynArrayRec(Data)^.length;
   if NewLength>OldLength then
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(
+    FillCharFast(
       PByteArray(Data)[SizeOf(TDynArrayRec)+fNestedDataSize*OldLength],
       fNestedDataSize*(NewLength-OldLength),0);
   PDynArrayRec(Data)^.length := NewLength;
@@ -48385,7 +48499,7 @@ begin
     P := pointer(PtrUInt(fValue^)+PtrUInt(Index)*ElemSize);
     {$ifdef FPC}Move{$else}MoveFast{$endif}(P[0],P[ElemSize],PtrUInt(n-Index)*ElemSize);
     if ElemType<>nil then // avoid GPF in ElemCopy() below
-      {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(P^,ElemSize,0);
+      FillCharFast(P^,ElemSize,0);
   end else
     // Index>=Count -> add at the end
     P := pointer(PtrUInt(fValue^)+PtrUInt(n)*ElemSize);
@@ -48434,9 +48548,9 @@ begin
   if n>aIndex then begin
     len := PtrUInt(n-aIndex)*ElemSize;
     {$ifdef FPC}Move{$else}MoveFast{$endif}(P[ElemSize],P[0],len);
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(P[len],ElemSize,0);
+    FillCharFast(P[len],ElemSize,0);
   end else
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(P^,ElemSize,0);
+    FillCharFast(P^,ElemSize,0);
   SetCount(n);
 end;
 
@@ -48487,7 +48601,7 @@ begin
     exit;
   ElemClear(Dest);
   MoveSmall(p,@Dest,ElemSize);
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(p^,ElemSize,0); // ElemType=nil for ObjArray
+  FillCharFast(p^,ElemSize,0); // ElemType=nil for ObjArray
 end;
 
 procedure TDynArray.ElemCopyFrom(const Source; index: PtrInt; ClearBeforeCopy: boolean);
@@ -50091,7 +50205,7 @@ begin // this method is faster than default System.DynArraySetLength() function
           if GetIsObjArray then begin // FreeAndNil() of resized objects list
             for i := NewLength to OldLength-1 do
               PObjectArray(fValue^)^[i].Free;
-            {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(
+            FillCharFast(
               PAnsiChar(p)[NeededSize],(OldLength-NewLength) shl POINTERSHR,0);
           end;
       ReallocMem(p,NeededSize);
@@ -50103,7 +50217,7 @@ begin // this method is faster than default System.DynArraySetLength() function
         minLength := newLength;
       pp := PAnsiChar(p)+SizeOf(TDynArrayRec);
       if ElemType<>nil then begin
-        {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(pp^,minLength*elemSize,0);
+        FillCharFast(pp^,minLength*elemSize,0);
         CopyArray(pp,fValue^,ElemType,minLength);
       end else
         {$ifdef FPC}Move{$else}MoveFast{$endif}(fValue^^,pp^,minLength*elemSize);
@@ -50123,7 +50237,7 @@ begin // this method is faster than default System.DynArraySetLength() function
   // reset new allocated elements content to zero
   if NewLength>OldLength then begin
     OldLength := OldLength*elemSize;
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(
+    FillCharFast(
       PAnsiChar(p)[OldLength],NewLength*ElemSize-OldLength,0);
   end;
 end;
@@ -50253,7 +50367,7 @@ begin
     {$ifdef FPC}FPCFinalize{$else}_Finalize{$endif}(@Elem,ElemType) else
     if (fIsObjArray=oaTrue) or ((fIsObjArray=oaUnknown) and ComputeIsObjArray) then
       TObject(Elem).Free;
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(Elem,ElemSize,0); // always
+  FillCharFast(Elem,ElemSize,0); // always
 end;
 
 function TDynArray.ElemLoad(Source: PAnsiChar): RawByteString;
@@ -50261,7 +50375,7 @@ begin
   if (Source<>nil) and (ElemType=nil) then
     SetString(result,Source,ElemSize) else begin
     SetString(result,nil,ElemSize);
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(pointer(result)^,ElemSize,0);
+    FillCharFast(pointer(result)^,ElemSize,0);
     ElemLoad(Source,pointer(result)^);
   end;
 end;
@@ -50300,7 +50414,7 @@ begin
     exit;
   if ElemType=nil then
     data := Source else begin
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(tmp,ElemSize,0);
+    FillCharFast(tmp,ElemSize,0);
     ManagedTypeLoad(@tmp,Source,ElemType);
     if Source=nil then
       exit;
@@ -52454,7 +52568,7 @@ begin
   if BEnd-B<=Integer(ntabs)+1 then
     FlushToStream;
   PWord(B+1)^ := 13+10 shl 8; // CR + LF
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(B[3],ntabs,9); // #9=tab
+  FillCharFast(B[3],ntabs,9); // #9=tab
   inc(B,ntabs+2);
 end;
 
@@ -52466,7 +52580,7 @@ begin
     if aCount<n then
       n := aCount else
       FlushToStream; // loop to avoid buffer overflow
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(B[1],n,ord(aChar));
+    FillCharFast(B[1],n,ord(aChar));
     inc(B,n);
     dec(aCount,n);
   until aCount<=0;
@@ -55375,7 +55489,7 @@ begin
   if Values=nil then
     exit; // avoid GPF
   n := length(Names);
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(Values[0],n*SizeOf(Values[0]),0);
+  FillCharFast(Values[0],n*SizeOf(Values[0]),0);
   dec(n);
   if P=nil then
     exit;
@@ -57252,12 +57366,12 @@ end;
 {$ifdef FPC} {$push} {$endif} {$HINTS OFF} // avoid "loop executed zero times"
 procedure TPrecisionTimer.Init;
 begin
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(self,SizeOf(self),0);
+  FillCharFast(self,SizeOf(self),0);
 end;
 
 procedure TPrecisionTimer.Start;
 begin
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(self,SizeOf(self),0);
+  FillCharFast(self,SizeOf(self),0);
   {$ifdef LINUX}QueryPerformanceMicroSeconds{$else}QueryPerformanceCounter{$endif}(fStart);
   fLast := fStart;
 end;
@@ -60248,7 +60362,7 @@ end;
 
 function TSynQueue.InternalWaitDone(endtix: Int64; const idle: TThreadMethod): boolean;
 begin
-  Sleep(1);
+  SleepHiRes(1);
   if Assigned(idle) then
     idle; // e.g. Application.ProcessMessages
   result := InternalDestroying(0) or (GetTickCount64>endtix);
@@ -60305,7 +60419,7 @@ begin
   end;
   endtix := GetTickCount64 + 100;
   repeat
-    Sleep(1); // ensure WaitPos() is actually finished
+    SleepHiRes(1); // ensure WaitPos() is actually finished
   until (fWaitPopCounter=0) or (GetTickCount64>endtix);
 end;
 
@@ -60622,7 +60736,7 @@ begin
       len := Count;
     if fPos+len>fBufLen then
       InternalFlush;
-    {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(fBuffer^[fPos],len,Data);
+    FillCharFast(fBuffer^[fPos],len,Data);
     inc(fPos,len);
     dec(Count,len);
   end;
@@ -63268,7 +63382,7 @@ begin
   List := nil;
   DynArray.HashInvalidate;
   // initialize hashed storage
-  {$ifdef FPC}FillChar{$else}FillCharFast{$endif}(self,SizeOf(self),0);
+  FillCharFast(self,SizeOf(self),0);
   DynArray.InitSpecific(TypeInfo(TSynNameValueItemDynArray),List,
     djRawUTF8,@Count,not aCaseSensitive);
 end;
@@ -63950,27 +64064,33 @@ initialization
   {$endif MSWINDOWS}
   {$ifdef CPUINTEL}
   TestIntelCpuFeatures;
-  {$endif}
+  {$endif CPUINTEL}
   {$ifdef PUREPASCAL}
   {$ifndef HASINLINE}
   PosEx := @PosExPas;
-  {$endif}
+  {$endif HASINLINE}
   PosExString := @PosExStringPas; // fast pure pascal process
   {$else}
   {$ifdef UNICODE}
   PosExString := @PosExStringPas; // fast PWideChar process
   {$else}
   PosExString := @PosEx; // use optimized PAnsiChar asm
-  {$endif}
-  {$endif}
+  {$endif UNICODE}
+  {$endif PUREPASCAL}
   crc32c := @crc32cfast; // now to circumvent Internal Error C11715 for Delphi 5
   crc32cBy4 := @crc32cBy4fast;
   MoveFast := @System.Move;
   {$ifdef FPC}
-  FillCharFast := @System.FillChar; // FPC cross-platform RTL is optimized enough
+  {$ifdef CPUX64} // we have our own x64 asm version, faster for small blocks
+  if cfERMS in CpuFeatures then
+    FillCharFast := @Fillcharx64ERMS else
+    FillCharFast := @Fillcharx64;
+  {$else}
+  FillCharFast := @System.FillChar; // fallback to FPC cross-platform RTL
+  {$endif CPUX64}
   {$ifdef Linux}
   stdoutIsTTY := IsATTY(StdOutputHandle)=1;
-  {$endif}
+  {$endif Linux}
   {$else}
   {$ifdef CPUARM}
   FillCharFast := @System.FillChar;

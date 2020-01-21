@@ -2295,8 +2295,9 @@ function StrIComp(Str1, Str2: pointer): PtrInt;
 function StrLenPas(S: pointer): PtrInt;
 
 /// our fast version of StrLen(), to be used with PUTF8Char/PAnsiChar
+// - if available, a fast SSE2 asm will be used on Intel/AMD CPUs
 // - won't use SSE4.2 instructions on supported CPUs by default, which may read
-// some bytes beyond the s string, so should be avoided e.g. over memory mapped
+// some bytes beyond the string, so should be avoided e.g. over memory mapped
 // files - call explicitely StrLenSSE42() if you are confident on your input
 var StrLen: function(S: pointer): PtrInt = StrLenPas;
 
@@ -2985,6 +2986,10 @@ function TrimLeft(const S: RawUTF8): RawUTF8;
 /// trims trailing whitespace characters from the string by removing trailing
 // newline, space, and tab characters
 function TrimRight(const S: RawUTF8): RawUTF8;
+
+// single-allocation (therefore faster) alternative to Trim(copy())
+procedure TrimCopy(const S: RawUTF8; start,count: PtrInt;
+  out result: RawUTF8);
 
 /// fast WinAnsi comparison using the NormToUpper[] array for all 8 bits values
 function AnsiIComp(Str1, Str2: PWinAnsiChar): PtrInt;
@@ -4889,6 +4894,145 @@ function _LStrLenP(s: pointer): SizeInt; inline;
 
 function ToText(k: TDynArrayKind): PShortString; overload;
 
+{$ifndef NOVARIANTS}
+
+type
+  /// possible options for a TDocVariant JSON/BSON document storage
+  // - dvoIsArray and dvoIsObject will store the "Kind: TDocVariantKind" state -
+  // you should never have to define these two options directly
+  // - dvoNameCaseSensitive will be used for every name lookup - here
+  // case-insensitivity is restricted to a-z A-Z 0-9 and _ characters
+  // - dvoCheckForDuplicatedNames will be used for method
+  // TDocVariantData.AddValue(), but not when setting properties at
+  // variant level: for consistency, "aVariant.AB := aValue" will replace
+  // any previous value for the name "AB"
+  // - dvoReturnNullForUnknownProperty will be used when retrieving any value
+  // from its name (for dvObject kind of instance), or index (for dvArray or
+  // dvObject kind of instance)
+  // - by default, internal values will be copied by-value from one variant
+  // instance to another, to ensure proper safety - but it may be too slow:
+  // if you set dvoValueCopiedByReference, the internal
+  // TDocVariantData.VValue/VName instances will be copied by-reference,
+  // to avoid memory allocations, BUT it may break internal process if you change
+  // some values in place (since VValue/VName and VCount won't match) - as such,
+  // if you set this option, ensure that you use the content as read-only
+  // - any registered custom types may have an extended JSON syntax (e.g.
+  // TBSONVariant does for MongoDB types), and will be searched during JSON
+  // parsing, unless dvoJSONParseDoNotTryCustomVariants is set (slightly faster)
+  // - by default, it will only handle direct JSON [array] of {object}: but if
+  // you define dvoJSONObjectParseWithinString, it will also try to un-escape
+  // a JSON string first, i.e. handle "[array]" or "{object}" content (may be
+  // used e.g. when JSON has been retrieved from a database TEXT column) - is
+  // used for instance by VariantLoadJSON()
+  // - JSON serialization will follow the standard layout, unless
+  // dvoSerializeAsExtendedJson is set so that the property names would not
+  // be escaped with double quotes, writing '{name:"John",age:123}' instead of
+  // '{"name":"John","age":123}': this extended json layout is compatible with
+  // http://docs.mongodb.org/manual/reference/mongodb-extended-json and with
+  // TDocVariant JSON unserialization, also our SynCrossPlatformJSON unit, but
+  // NOT recognized by most JSON clients, like AJAX/JavaScript or C#/Java
+  // - by default, only integer/Int64/currency number values are allowed, unless
+  // dvoAllowDoubleValue is set and 32-bit floating-point conversion is tried,
+  // with potential loss of precision during the conversion
+  // - dvoInternNames and dvoInternValues will use shared TRawUTF8Interning
+  // instances to maintain a list of RawUTF8 names/values for all TDocVariant,
+  // so that redundant text content will be allocated only once on heap
+  TDocVariantOption =
+    (dvoIsArray, dvoIsObject,
+     dvoNameCaseSensitive, dvoCheckForDuplicatedNames,
+     dvoReturnNullForUnknownProperty,
+     dvoValueCopiedByReference, dvoJSONParseDoNotTryCustomVariants,
+     dvoJSONObjectParseWithinString, dvoSerializeAsExtendedJson,
+     dvoAllowDoubleValue, dvoInternNames, dvoInternValues);
+
+  /// set of options for a TDocVariant storage
+  // - you can use JSON_OPTIONS[true] if you want to create a fast by-reference
+  // local document as with _ObjFast/_ArrFast/_JsonFast - i.e.
+  // [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference]
+  // - when specifying the options, you should not include dvoIsArray nor
+  // dvoIsObject directly in the set, but explicitly define TDocVariantDataKind
+  TDocVariantOptions = set of TDocVariantOption;
+
+  /// pointer to a set of options for a TDocVariant storage
+  // - you may use e.g. @JSON_OPTIONS[true], @JSON_OPTIONS[false],
+  // @JSON_OPTIONS_FAST_STRICTJSON or @JSON_OPTIONS_FAST_EXTENDED
+  PDocVariantOptions = ^TDocVariantOptions;
+
+const
+  /// some convenient TDocVariant options, as JSON_OPTIONS[CopiedByReference]
+  // - JSON_OPTIONS[false] is e.g. _Json() and _JsonFmt() functions default
+  // - JSON_OPTIONS[true] are used e.g. by _JsonFast() and _JsonFastFmt() functions
+  JSON_OPTIONS: array[Boolean] of TDocVariantOptions = (
+    [dvoReturnNullForUnknownProperty],
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference]);
+
+  /// same as JSON_OPTIONS[true], but can not be used as PDocVariantOptions
+  JSON_OPTIONS_FAST =
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference];
+
+  /// TDocVariant options which may be used for plain JSON parsing
+  // - this won't recognize any extended syntax
+  JSON_OPTIONS_FAST_STRICTJSON: TDocVariantOptions =
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoJSONParseDoNotTryCustomVariants];
+
+  /// TDocVariant options to be used for case-sensitive TSynNameValue-like
+  // storage, with optional extended JSON syntax serialization
+  // - consider using JSON_OPTIONS_FAST_EXTENDED for case-insensitive objects
+  JSON_OPTIONS_NAMEVALUE: array[boolean] of TDocVariantOptions = (
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoNameCaseSensitive],
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoNameCaseSensitive,dvoSerializeAsExtendedJson]);
+
+  /// TDocVariant options to be used for case-sensitive TSynNameValue-like
+  // storage, RawUTF8 interning and optional extended JSON syntax serialization
+  // - consider using JSON_OPTIONS_FAST_EXTENDED for case-insensitive objects,
+  // or JSON_OPTIONS_NAMEVALUE[] if you don't expect names and values interning
+  JSON_OPTIONS_NAMEVALUEINTERN: array[boolean] of TDocVariantOptions = (
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoNameCaseSensitive,dvoInternNames,dvoInternValues],
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoNameCaseSensitive,dvoInternNames,dvoInternValues,
+     dvoSerializeAsExtendedJson]);
+
+  /// TDocVariant options to be used so that JSON serialization would
+  // use the unquoted JSON syntax for field names
+  // - you could use it e.g. on a TSQLRecord variant published field to
+  // reduce the JSON escape process during storage in the database, by
+  // customizing your TSQLModel instance:
+  // !  (aModel.Props[TSQLMyRecord]['VariantProp'] as TSQLPropInfoRTTIVariant).
+  // !    DocVariantOptions := JSON_OPTIONS_FAST_EXTENDED;
+  // or - in a cleaner way - by overriding TSQLRecord.InternalDefineModel():
+  // ! class procedure TSQLMyRecord.InternalDefineModel(Props: TSQLRecordProperties);
+  // ! begin
+  // !   (Props.Fields.ByName('VariantProp') as TSQLPropInfoRTTIVariant).
+  // !     DocVariantOptions := JSON_OPTIONS_FAST_EXTENDED;
+  // ! end;
+  // or to set all variant fields at once:
+  // ! class procedure TSQLMyRecord.InternalDefineModel(Props: TSQLRecordProperties);
+  // ! begin
+  // !   Props.SetVariantFieldsDocVariantOptions(JSON_OPTIONS_FAST_EXTENDED);
+  // ! end;
+  // - consider using JSON_OPTIONS_NAMEVALUE[true] for case-sensitive
+  // TSynNameValue-like storage, or JSON_OPTIONS_FAST_EXTENDEDINTERN if you
+  // expect RawUTF8 names and values interning
+  JSON_OPTIONS_FAST_EXTENDED: TDocVariantOptions =
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoSerializeAsExtendedJson];
+
+  /// TDocVariant options for JSON serialization with efficient storage
+  // - i.e. unquoted JSON syntax for field names and RawUTF8 interning
+  // - may be used e.g. for efficient persistence of similar data
+  // - consider using JSON_OPTIONS_FAST_EXTENDED if you don't expect
+  // RawUTF8 names and values interning, or need BSON variants parsing
+  JSON_OPTIONS_FAST_EXTENDEDINTERN: TDocVariantOptions =
+    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
+     dvoSerializeAsExtendedJson,dvoJSONParseDoNotTryCustomVariants,
+     dvoInternNames,dvoInternValues];
+
+{$endif NOVARIANTS}
+
 const
   /// TDynArrayKind alias for a pointer field hashing / comparison
   djPointer = {$ifdef CPU64}djInt64{$else}djCardinal{$endif};
@@ -5316,7 +5460,8 @@ type
     // any existing instance before unserializing, to avoid memory leak
     // - warning: the content of P^ will be modified during parsing: please
     // make a local copy if it will be needed later (using e.g. TSynTempBufer)
-    function LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char=nil): PUTF8Char;
+    function LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char=nil{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions=nil{$endif}): PUTF8Char;
     {$ifndef NOVARIANTS}
     /// load the dynamic array content from a TDocVariant instance
     // - will convert the TDocVariant into JSON, the call LoadFromJSON
@@ -5575,7 +5720,8 @@ type
     function SaveToJSON(EnumSetsAsText: boolean=false;
       reformat: TTextWriterJSONFormat=jsonCompact): RawUTF8; inline;
     procedure Sort(aCompare: TDynArraySortCompare=nil); inline;
-    function LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char=nil): PUTF8Char; inline;
+    function LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char=nil{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions=nil{$endif}): PUTF8Char; inline;
     function SaveToLength: integer; inline;
     function LoadFrom(Source: PAnsiChar): PAnsiChar;  inline;
     property Count: PtrInt read GetCount write SetCount;
@@ -5611,6 +5757,7 @@ type
     function GetHashFromIndex(aIndex: PtrInt): Cardinal;
     procedure HashInvalidate;
     procedure RaiseFatalCollision(const caller: RawUTF8; aHashCode: cardinal);
+    function InternalCompare(Index: cardinal; const Elem): boolean;
   public
     /// initialize the wrapper with a one-dimension dynamic array
     // - this version accepts some hash-dedicated parameters: aHashElement to
@@ -5647,8 +5794,9 @@ type
     // any collision
     // - is a brute force search within fHashs[].Hash values, which may be handy
     // to validate the current HashElement() function
+    // - nocompare=true won't check the actual values for collision, just the hash
     // - returns -1 if no collision was found, or the index of the first collision
-    function IsHashElementWithoutCollision: integer;
+    function IsHashElementWithoutCollision(nocompare: boolean): integer;
     /// search for an element value inside the dynamic array using hashing
     // - ELem should be of the same exact type than the dynamic array, or at
     // least matchs the fields used by both the hash function and Equals method:
@@ -7006,7 +7154,8 @@ function RecordLoadBase64(Source: PAnsiChar; Len: PtrInt; var Rec; TypeInfo: poi
 // a temporary copy if you need to access it later or if the string comes from
 // a constant (refcount=-1) - see e.g. the overloaded RecordLoadJSON()
 function RecordLoadJSON(var Rec; JSON: PUTF8Char; TypeInfo: pointer;
-  EndOfObject: PUTF8Char=nil): PUTF8Char; overload;
+  EndOfObject: PUTF8Char=nil{$ifndef NOVARIANTS};
+  CustomVariantOptions: PDocVariantOptions=nil{$endif}): PUTF8Char; overload;
 
 /// fill a record content from a JSON serialization as saved by
 // TTextWriter.AddRecordJSON / RecordSaveJSON
@@ -7015,7 +7164,8 @@ function RecordLoadJSON(var Rec; JSON: PUTF8Char; TypeInfo: pointer;
 // - will use default Base64 encoding over RecordSave() binary - or custom true
 // JSON format (as set by TTextWriter.RegisterCustomJSONSerializer or via
 // enhanced RTTI), if available
-function RecordLoadJSON(var Rec; const JSON: RawUTF8; TypeInfo: pointer): boolean; overload;
+function RecordLoadJSON(var Rec; const JSON: RawUTF8; TypeInfo: pointer{$ifndef NOVARIANTS};
+  CustomVariantOptions: PDocVariantOptions=nil{$endif}): boolean; overload;
 
 /// copy a record content from source to Dest
 // - this unit includes a fast optimized asm version for x86 on Delphi
@@ -7479,8 +7629,8 @@ type
   // ! end;
   // - implementation code shall follow the same exact format for the
   // associated TDynArrayJSONCustomWriter callback
-  TDynArrayJSONCustomReader = function(P: PUTF8Char; var aValue;
-    out aValid: Boolean): PUTF8Char of object;
+  TDynArrayJSONCustomReader = function(P: PUTF8Char; var aValue; out aValid: Boolean
+    {$ifndef NOVARIANTS}; CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char of object;
 
   /// the kind of variables handled by TJSONCustomParser
   // - the last item should be ptCustom, for non simple types
@@ -7582,7 +7732,8 @@ type
     /// unserialize some JSON content into its binary internal representation
     // - on error, returns false and P should point to the faulty text input
     function ReadOneLevel(var P: PUTF8Char; var Data: PByte;
-      Options: TJSONCustomParserSerializationOptions): boolean; virtual;
+      Options: TJSONCustomParserSerializationOptions{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions{$endif}): boolean; virtual;
     /// serialize a binary internal representation into JSON content
     // - this method won't append a trailing ',' character
     procedure WriteOneLevel(aWriter: TTextWriter; var P: PByte;
@@ -7623,7 +7774,8 @@ type
     procedure CustomWriter(const aWriter: TTextWriter; const aValue); virtual; abstract;
     /// abstract method to read the instance from JSON
     // - should return nil on parsing error
-    function CustomReader(P: PUTF8Char; var aValue; out EndOfObject: AnsiChar): PUTF8Char; virtual; abstract;
+    function CustomReader(P: PUTF8Char; var aValue; out EndOfObject: AnsiChar{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char; virtual; abstract;
     /// release any memory used by the instance
     procedure FinalizeItem(Data: Pointer); virtual;
     /// the associated RTTI structure
@@ -7658,7 +7810,8 @@ type
     /// method to write the instance as JSON
     procedure CustomWriter(const aWriter: TTextWriter; const aValue); override;
     /// method to read the instance from JSON
-    function CustomReader(P: PUTF8Char; var aValue; out EndOfObject: AnsiChar): PUTF8Char; override;
+    function CustomReader(P: PUTF8Char; var aValue; out EndOfObject: AnsiChar{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char; override;
     /// which kind of simple property this instance does refer to
     property KnownType: TJSONCustomParserCustomSimpleKnownType read fKnownType;
     /// the element type for ktStaticArray and ktDynamicArray
@@ -7679,7 +7832,8 @@ type
     /// method to write the instance as JSON
     procedure CustomWriter(const aWriter: TTextWriter; const aValue); override;
     /// method to read the instance from JSON
-    function CustomReader(P: PUTF8Char; var aValue; out EndOfObject: AnsiChar): PUTF8Char; override;
+    function CustomReader(P: PUTF8Char; var aValue; out EndOfObject: AnsiChar{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char; override;
     /// release any memory used by the instance
     procedure FinalizeItem(Data: Pointer); override;
   end;
@@ -7713,7 +7867,8 @@ type
     procedure CustomWriter(const aWriter: TTextWriter; const aValue);
     /// callback for custom JSON unserialization
     // - will follow the RTTI textual information as supplied to the constructor
-    function CustomReader(P: PUTF8Char; var aValue; out aValid: Boolean): PUTF8Char;
+    function CustomReader(P: PUTF8Char; var aValue; out aValid: Boolean{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
     /// release used memory
     // - when created via Compute() call, instances of this class are managed
     // via a GarbageCollector() global list, so you do not need to free them
@@ -8217,6 +8372,13 @@ type
     procedure AddStringCopy(const Text: RawUTF8; start,len: PtrInt);
     /// append after trim first lowercase chars ('otDone' will add 'Done' e.g.)
     procedure AddTrimLeftLowerCase(Text: PShortString);
+    /// append a UTF-8 String excluding any space or control char
+    // - this won't escape the text as expected by JSON
+    procedure AddTrimSpaces(const Text: RawUTF8); overload;
+      {$ifdef HASINLINE}inline;{$endif}
+    /// append a UTF-8 String excluding any space or control char
+    // - this won't escape the text as expected by JSON
+    procedure AddTrimSpaces(P: PUTF8Char); overload;
     /// append a ShortString property name, as '"PropName":'
     // - PropName content should not need to be JSON escaped (e.g. no " within,
     // and only ASCII 7-bit characters)
@@ -9726,13 +9888,15 @@ type
     /// unserialize the content from "key":value JSON object
     // - if the JSON input may not be correct (i.e. if not coming from SaveToJSON),
     // you may set EnsureNoKeyCollision=TRUE for a slow but safe keys validation
-    function LoadFromJSON(const JSON: RawUTF8; EnsureNoKeyCollision: boolean=false): boolean; overload;
+    function LoadFromJSON(const JSON: RawUTF8; EnsureNoKeyCollision: boolean=false{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions=nil{$endif}): boolean; overload;
     /// unserialize the content from "key":value JSON object
     // - note that input JSON buffer is not modified in place: no need to create
     // a temporary copy if the buffer is about to be re-used
     // - if the JSON input may not be correct (i.e. if not coming from SaveToJSON),
-    // you may set EnsureNoKeyCollision=TRUE for a slow but safe keys validation
-    function LoadFromJSON(JSON: PUTF8Char; EnsureNoKeyCollision: boolean=false): boolean; overload;
+    // you may set EnsureNoKeyCollision=TRUE for a slow but safe keys uniqueness
+    function LoadFromJSON(JSON: PUTF8Char; EnsureNoKeyCollision: boolean=false{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions=nil{$endif}): boolean; overload;
     /// save the content as SynLZ-compressed raw binary data
     // - warning: this format is tied to the values low-level RTTI, so if you
     // change the value/key type definitions, LoadFromBinary() would fail
@@ -10603,13 +10767,19 @@ function IsString(P: PUTF8Char): boolean;
 // '0' is excluded at the begining of a number) and '123' is not a string
 function IsStringJSON(P: PUTF8Char): boolean;
 
+/// test if the supplied buffer is a correct JSON value
+function IsValidJSON(P: PUTF8Char; len: PtrInt): boolean; overload;
+
+/// test if the supplied buffer is a correct JSON value
+function IsValidJSON(const s: RawUTF8): boolean; overload;
+
 /// reach positon just after the current JSON item in the supplied UTF-8 buffer
 // - buffer can be either any JSON item, i.e. a string, a number or even a
 // JSON array (ending with ]) or a JSON object (ending with })
 // - returns nil if the specified buffer is not valid JSON content
 // - returns the position in buffer just after the item excluding the separator
 // character - i.e. result^ may be ',','}',']'
-function GotoEndJSONItem(P: PUTF8Char): PUTF8Char;
+function GotoEndJSONItem(P: PUTF8Char; strict: boolean=false): PUTF8Char;
 
 /// reach the positon of the next JSON item in the supplied UTF-8 buffer
 // - buffer can be either any JSON item, i.e. a string, a number or even a
@@ -11263,6 +11433,12 @@ function BinToBase64(const s: RawByteString): RawUTF8; overload;
 
 /// fast conversion from binary data into Base64 encoded UTF-8 text
 function BinToBase64(Bin: PAnsiChar; BinBytes: integer): RawUTF8; overload;
+
+/// fast conversion from a small binary data into Base64 encoded UTF-8 text
+function BinToBase64Short(const s: RawByteString): shortstring; overload;
+
+/// fast conversion from a small binary data into Base64 encoded UTF-8 text
+function BinToBase64Short(Bin: PAnsiChar; BinBytes: integer): shortstring; overload;
 
 /// fast conversion from binary data into prefixed/suffixed Base64 encoded UTF-8 text
 // - with optional JSON_BASE64_MAGIC prefix (UTF-8 encoded \uFFF0 special code)
@@ -13381,6 +13557,9 @@ var
   // - contains e.g. 'Windows Seven 64 SP1 (6.1.7601)' or
   // 'Ubuntu 16.04.5 LTS - Linux 3.13.0 110 generic#157 Ubuntu SMP Mon Feb 20 11:55:25 UTC 2017'
   OSVersionText: RawUTF8;
+  /// some addition system information as text, e.g. 'Wine 1.1.5'
+  // - also always appended to OSVersionText high-level description
+  OSVersionInfoEx: RawUTF8;
   /// some textual information about the current CPU
   CpuInfoText: RawUTF8;
   /// some textual information about the current computer hardware, from BIOS
@@ -13391,7 +13570,7 @@ var
 
 {$ifdef MSWINDOWS}
   {$ifndef UNICODE}
-  type
+type
   /// low-level API structure, not defined in older Delphi versions
   TOSVersionInfoEx = record
     dwOSVersionInfoSize: DWORD;
@@ -13544,6 +13723,9 @@ function GetTickCount64: Int64;
 /// overloaded function optimized for one pass file reading
 // - will use e.g. the FILE_FLAG_SEQUENTIAL_SCAN flag under Windows, as stated
 // by http://blogs.msdn.com/b/oldnewthing/archive/2012/01/20/10258690.aspx
+// - under XP, we observed ERROR_NO_SYSTEM_RESOURCES problems with FileRead()
+// bigger than 32MB
+// - under POSIX, calls plain FileOpen(FileName,fmOpenRead or fmShareDenyNone)
 // - is used e.g. by StringFromFile() and TSynMemoryStreamMapped.Create()
 function FileOpenSequentialRead(const FileName: string): Integer;
   {$ifdef HASINLINE}inline;{$endif}
@@ -13990,142 +14172,6 @@ type
 // - is called in case of TSynTableVariant, TDocVariant, TBSONVariant or
 // TSQLDBRowVariant
 function SynRegisterCustomVariantType(aClass: TSynInvokeableVariantTypeClass): TSynInvokeableVariantType;
-
-
-type
-  /// possible options for a TDocVariant JSON/BSON document storage
-  // - dvoIsArray and dvoIsObject will store the "Kind: TDocVariantKind" state -
-  // you should never have to define these two options directly
-  // - dvoNameCaseSensitive will be used for every name lookup - here
-  // case-insensitivity is restricted to a-z A-Z 0-9 and _ characters
-  // - dvoCheckForDuplicatedNames will be used for method
-  // TDocVariantData.AddValue(), but not when setting properties at
-  // variant level: for consistency, "aVariant.AB := aValue" will replace
-  // any previous value for the name "AB"
-  // - dvoReturnNullForUnknownProperty will be used when retrieving any value
-  // from its name (for dvObject kind of instance), or index (for dvArray or
-  // dvObject kind of instance)
-  // - by default, internal values will be copied by-value from one variant
-  // instance to another, to ensure proper safety - but it may be too slow:
-  // if you set dvoValueCopiedByReference, the internal
-  // TDocVariantData.VValue/VName instances will be copied by-reference,
-  // to avoid memory allocations, BUT it may break internal process if you change
-  // some values in place (since VValue/VName and VCount won't match) - as such,
-  // if you set this option, ensure that you use the content as read-only
-  // - any registered custom types may have an extended JSON syntax (e.g.
-  // TBSONVariant does for MongoDB types), and will be searched during JSON
-  // parsing, unless dvoJSONParseDoNotTryCustomVariants is set (slightly faster)
-  // - by default, it will only handle direct JSON [array] of {object}: but if
-  // you define dvoJSONObjectParseWithinString, it will also try to un-escape
-  // a JSON string first, i.e. handle "[array]" or "{object}" content (may be
-  // used e.g. when JSON has been retrieved from a database TEXT column) - is
-  // used for instance by VariantLoadJSON()
-  // - JSON serialization will follow the standard layout, unless
-  // dvoSerializeAsExtendedJson is set so that the property names would not
-  // be escaped with double quotes, writing '{name:"John",age:123}' instead of
-  // '{"name":"John","age":123}': this extended json layout is compatible with
-  // http://docs.mongodb.org/manual/reference/mongodb-extended-json and with
-  // TDocVariant JSON unserialization, also our SynCrossPlatformJSON unit, but
-  // NOT recognized by most JSON clients, like AJAX/JavaScript or C#/Java
-  // - by default, only integer/Int64/currency number values are allowed, unless
-  // dvoAllowDoubleValue is set and 32-bit floating-point conversion is tried,
-  // with potential loss of precision during the conversion
-  // - dvoInternNames and dvoInternValues will use shared TRawUTF8Interning
-  // instances to maintain a list of RawUTF8 names/values for all TDocVariant,
-  // so that redundant text content will be allocated only once on heap
-  TDocVariantOption =
-    (dvoIsArray, dvoIsObject,
-     dvoNameCaseSensitive, dvoCheckForDuplicatedNames,
-     dvoReturnNullForUnknownProperty,
-     dvoValueCopiedByReference, dvoJSONParseDoNotTryCustomVariants,
-     dvoJSONObjectParseWithinString, dvoSerializeAsExtendedJson,
-     dvoAllowDoubleValue, dvoInternNames, dvoInternValues);
-
-  /// set of options for a TDocVariant storage
-  // - you can use JSON_OPTIONS[true] if you want to create a fast by-reference
-  // local document as with _ObjFast/_ArrFast/_JsonFast - i.e.
-  // [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference]
-  // - when specifying the options, you should not include dvoIsArray nor
-  // dvoIsObject directly in the set, but explicitly define TDocVariantDataKind
-  TDocVariantOptions = set of TDocVariantOption;
-
-  /// pointer to a set of options for a TDocVariant storage
-  // - you may use e.g. @JSON_OPTIONS[true], @JSON_OPTIONS[false],
-  // @JSON_OPTIONS_FAST_STRICTJSON or @JSON_OPTIONS_FAST_EXTENDED
-  PDocVariantOptions = ^TDocVariantOptions;
-
-const
-  /// some convenient TDocVariant options, as JSON_OPTIONS[CopiedByReference]
-  // - JSON_OPTIONS[false] is e.g. _Json() and _JsonFmt() functions default
-  // - JSON_OPTIONS[true] are used e.g. by _JsonFast() and _JsonFastFmt() functions
-  JSON_OPTIONS: array[Boolean] of TDocVariantOptions = (
-    [dvoReturnNullForUnknownProperty],
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference]);
-
-  /// same as JSON_OPTIONS[true], but can not be used as PDocVariantOptions
-  JSON_OPTIONS_FAST =
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference];
-
-  /// TDocVariant options which may be used for plain JSON parsing
-  // - this won't recognize any extended syntax
-  JSON_OPTIONS_FAST_STRICTJSON: TDocVariantOptions =
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoJSONParseDoNotTryCustomVariants];
-
-  /// TDocVariant options to be used for case-sensitive TSynNameValue-like
-  // storage, with optional extended JSON syntax serialization
-  // - consider using JSON_OPTIONS_FAST_EXTENDED for case-insensitive objects
-  JSON_OPTIONS_NAMEVALUE: array[boolean] of TDocVariantOptions = (
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoNameCaseSensitive],
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoNameCaseSensitive,dvoSerializeAsExtendedJson]);
-
-  /// TDocVariant options to be used for case-sensitive TSynNameValue-like
-  // storage, RawUTF8 interning and optional extended JSON syntax serialization
-  // - consider using JSON_OPTIONS_FAST_EXTENDED for case-insensitive objects,
-  // or JSON_OPTIONS_NAMEVALUE[] if you don't expect names and values interning
-  JSON_OPTIONS_NAMEVALUEINTERN: array[boolean] of TDocVariantOptions = (
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoNameCaseSensitive,dvoInternNames,dvoInternValues],
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoNameCaseSensitive,dvoInternNames,dvoInternValues,
-     dvoSerializeAsExtendedJson]);
-
-  /// TDocVariant options to be used so that JSON serialization would
-  // use the unquoted JSON syntax for field names
-  // - you could use it e.g. on a TSQLRecord variant published field to
-  // reduce the JSON escape process during storage in the database, by
-  // customizing your TSQLModel instance:
-  // !  (aModel.Props[TSQLMyRecord]['VariantProp'] as TSQLPropInfoRTTIVariant).
-  // !    DocVariantOptions := JSON_OPTIONS_FAST_EXTENDED;
-  // or - in a cleaner way - by overriding TSQLRecord.InternalDefineModel():
-  // ! class procedure TSQLMyRecord.InternalDefineModel(Props: TSQLRecordProperties);
-  // ! begin
-  // !   (Props.Fields.ByName('VariantProp') as TSQLPropInfoRTTIVariant).
-  // !     DocVariantOptions := JSON_OPTIONS_FAST_EXTENDED;
-  // ! end;
-  // or to set all variant fields at once:
-  // ! class procedure TSQLMyRecord.InternalDefineModel(Props: TSQLRecordProperties);
-  // ! begin
-  // !   Props.SetVariantFieldsDocVariantOptions(JSON_OPTIONS_FAST_EXTENDED);
-  // ! end;
-  // - consider using JSON_OPTIONS_NAMEVALUE[true] for case-sensitive
-  // TSynNameValue-like storage, or JSON_OPTIONS_FAST_EXTENDEDINTERN if you
-  // expect RawUTF8 names and values interning
-  JSON_OPTIONS_FAST_EXTENDED: TDocVariantOptions =
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoSerializeAsExtendedJson];
-
-  /// TDocVariant options for JSON serialization with efficient storage
-  // - i.e. unquoted JSON syntax for field names and RawUTF8 interning
-  // - may be used e.g. for efficient persistence of similar data
-  // - consider using JSON_OPTIONS_FAST_EXTENDED if you don't expect
-  // RawUTF8 names and values interning, or need BSON variants parsing
-  JSON_OPTIONS_FAST_EXTENDEDINTERN: TDocVariantOptions =
-    [dvoReturnNullForUnknownProperty,dvoValueCopiedByReference,
-     dvoSerializeAsExtendedJson,dvoJSONParseDoNotTryCustomVariants,
-     dvoInternNames,dvoInternValues];
 
 /// same as Dest := Source, but copying by reference
 // - i.e. VType is defined as varVariant or varByRef
@@ -21348,6 +21394,7 @@ end;
 const
   NULL_LOW  = ord('n')+ord('u')shl 8+ord('l')shl 16+ord('l')shl 24;
   FALSE_LOW = ord('f')+ord('a')shl 8+ord('l')shl 16+ord('s')shl 24;
+  FALSE_LOW2 = ord('a')+ord('l')shl 8+ord('s')shl 16+ord('e')shl 24;
   TRUE_LOW  = ord('t')+ord('r')shl 8+ord('u')shl 16+ord('e')shl 24;
   NULL_UPP  = ord('N')+ord('U')shl 8+ord('L')shl 16+ord('L')shl 24;
 
@@ -26688,24 +26735,25 @@ procedure RetrieveSystemInfo;
 var
   IsWow64Process: function(Handle: THandle; var Res: BOOL): BOOL; stdcall;
   GetNativeSystemInfo: procedure(var SystemInfo: TSystemInfo); stdcall;
+  wine_get_version: function: PAnsiChar; stdcall;
   Res: BOOL;
-  Kernel: THandle;
+  h: THandle;
   P: pointer;
   Vers: TWindowsVersion;
   cpu, manuf, prod, prodver: RawUTF8;
   reg: TWinRegistry;
 begin
-  Kernel := GetModuleHandle(kernel32);
-  GetTickCount64 := GetProcAddress(Kernel,'GetTickCount64');
+  h := GetModuleHandle(kernel32);
+  GetTickCount64 := GetProcAddress(h,'GetTickCount64');
   if not Assigned(GetTickCount64) then
     GetTickCount64 := @GetTickCount64ForXP;
-  IsWow64Process := GetProcAddress(Kernel,'IsWow64Process');
+  IsWow64Process := GetProcAddress(h,'IsWow64Process');
   Res := false;
   IsWow64 := Assigned(IsWow64Process) and
     IsWow64Process(GetCurrentProcess,Res) and Res;
   FillcharFast(SystemInfo,SizeOf(SystemInfo),0);
   if IsWow64 then // see http://msdn.microsoft.com/en-us/library/ms724381(v=VS.85).aspx
-    GetNativeSystemInfo := GetProcAddress(Kernel,'GetNativeSystemInfo') else
+    GetNativeSystemInfo := GetProcAddress(h,'GetNativeSystemInfo') else
     @GetNativeSystemInfo := nil;
   if Assigned(GetNativeSystemInfo) then
     GetNativeSystemInfo(SystemInfo) else
@@ -26788,6 +26836,15 @@ begin
     cpu := StringToUTF8(GetEnvironmentVariable('PROCESSOR_IDENTIFIER'));
   cpu := Trim(cpu);
   FormatUTF8('% x % ('+CPU_ARCH_TEXT+')',[SystemInfo.dwNumberOfProcessors,cpu],CpuInfoText);
+  h := LoadLibrary('ntdll.dll');
+  if h>0 then begin
+    wine_get_version := GetProcAddress(h,'wine_get_version');
+    if Assigned(wine_get_version) then
+      OSVersionInfoEx := trim('Wine '+trim(wine_get_version));
+    FreeLibrary(h);
+  end;
+  if OSVersionInfoEx<>'' then
+    OSVersionText := FormatUTF8('% - %', [OSVersionText,OSVersionInfoEx]);
 end;
 
 {$else}
@@ -28170,6 +28227,24 @@ begin
   Base64Encode(pointer(result),pointer(s),len);
 end;
 
+function BinToBase64Short(Bin: PAnsiChar; BinBytes: integer): shortstring;
+var destlen: integer;
+begin
+  result := '';
+  if BinBytes=0 then
+    exit;
+  destlen := BinToBase64Length(BinBytes);
+  if destlen>255 then
+    exit; // avoid buffer overflow
+  result[0] := AnsiChar(destlen);
+  Base64Encode(@result[1],Bin,BinBytes);
+end;
+
+function BinToBase64Short(const s: RawByteString): shortstring;
+begin
+  result := BinToBase64Short(pointer(s),length(s));
+end;
+
 function BinToBase64(Bin: PAnsiChar; BinBytes: integer): RawUTF8;
 begin
   result := '';
@@ -28767,6 +28842,29 @@ begin
   while (i > 0) and (S[i] <= ' ') do
     Dec(i);
   FastSetString(result,pointer(S),i);
+end;
+
+procedure TrimCopy(const S: RawUTF8; start,count: PtrInt;
+  out result: RawUTF8);
+var L: PtrInt;
+begin
+  if count<=0 then
+    exit;
+  if start<=0 then
+    start := 1;
+  L := Length(S);
+  while (start<=L) and (S[start]<=' ') do begin
+    inc(start); dec(count); end;
+  dec(start);
+  dec(L,start);
+  if count<L then
+    L := count;
+  while L>0 do
+    if S[start+L]<=' ' then
+      dec(L) else
+      break;
+  if L>0 then
+    FastSetString(result,@PByteArray(S)[start],L);
 end;
 
 type
@@ -29888,7 +29986,8 @@ end;
 
 function StringFromFile(const FileName: TFileName; HasNoSize: boolean): RawByteString;
 var F: THandle;
-    Read, Size: integer;
+    Read, Size, Chunk: integer;
+    P: PUTF8Char;
     tmp: array[0..$7fff] of AnsiChar;
 begin
   result := '';
@@ -29910,8 +30009,21 @@ begin
       Size := GetFileSize(F,nil);
       if Size>0 then begin
         SetLength(result,Size);
-        if FileRead(F,pointer(result)^,Size)<>Size then
-          result := '';
+        P := pointer(result);
+        repeat
+          Chunk := Size;
+          {$ifdef MSWINDOWS} // FILE_FLAG_SEQUENTIAL_SCAN has limits on XP
+          if Chunk>32 shl 20 then
+            Chunk := 32 shl 20; // avoid e.g. ERROR_NO_SYSTEM_RESOURCES
+          {$endif}
+          Read := FileRead(F,P^,Chunk);
+          if Read<=0 then begin
+            result := '';
+            break;
+          end;
+          inc(P,Read);
+          dec(Size,Read);
+        until Size=0;
       end;
     end;
     FileClose(F);
@@ -36025,13 +36137,11 @@ asm {$else} asm .noframe {$endif} // rcx/rdi=Dest rdx/rsi=Count r8/rdx=Value
 {$ifdef FPC} align 8 {$else} .align 8 {$endif}
 @erms:  cld
         {$ifdef WIN64} // al already set
-        push    rsi // preserve non volatile registers
-        push    rdi
+        push    rdi // preserve non volatile registers
         mov     rdi, rcx
         mov     rcx, rdx
         rep stosb // ERMS magic instruction
         pop     rdi
-        pop     rsi
         {$else} // rdi and al already set
         mov     rcx, rdx
         rep stosb
@@ -36042,7 +36152,7 @@ asm {$else} asm .noframe {$endif} // rcx/rdi=Dest rdx/rsi=Count r8/rdx=Value
         mov     ah, al
         mov     [rcx + rdx - 1], al
         lea     r8, [rip + @table]
-        and     rdx, - 2
+        and     rdx, -2
         neg     rdx
         lea     rdx, [r8 + rdx * 2 + 64]
         jmp     rdx
@@ -38973,7 +39083,7 @@ begin
   i := PosEx('boundary=',MimeType);
   if i=0 then
     exit;
-  boundary := trim(copy(MimeType,i+9,200));
+  TrimCopy(MimeType,i+9,200,boundary);
   if (boundary<>'') and (boundary[1]='"') then
     boundary := copy(boundary,2,length(boundary)-2); // "boundary" -> boundary
   boundary := '--'+boundary;
@@ -42829,8 +42939,8 @@ end;
 const
   NULCHAR: AnsiChar = #0;
 
-function RecordLoadJSON(var Rec; JSON: PUTF8Char; TypeInfo: pointer;
-  EndOfObject: PUTF8Char=nil): PUTF8Char;
+function RecordLoadJSON(var Rec; JSON: PUTF8Char; TypeInfo: pointer; EndOfObject: PUTF8Char
+  {$ifndef NOVARIANTS}; CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
 var wasString, wasValid: boolean;
     Reader: TDynArrayJSONCustomReader;
     FirstChar,EndOfObj: AnsiChar;
@@ -42856,7 +42966,7 @@ begin // code below must match TTextWriter.AddRecordJSON
     if not GlobalJSONCustomParsers.RecordSearch(TypeInfo,Reader) then
       exit;
     FirstChar := JSON^;
-    JSON := Reader(JSON,Rec,wasValid);
+    JSON := Reader(JSON,Rec,wasValid{$ifndef NOVARIANTS},CustomVariantOptions{$endif});
     if not wasValid then
       exit;
     if (JSON<>nil) and (JSON^ in [#1..' ']) then
@@ -42876,12 +42986,13 @@ begin // code below must match TTextWriter.AddRecordJSON
     EndOfObject^ := EndOfObj;
 end;
 
-function RecordLoadJSON(var Rec; const JSON: RawUTF8; TypeInfo: pointer): boolean;
+function RecordLoadJSON(var Rec; const JSON: RawUTF8; TypeInfo: pointer{$ifndef NOVARIANTS};
+  CustomVariantOptions: PDocVariantOptions{$endif}): boolean;
 var tmp: TSynTempBuffer;
 begin
   tmp.Init(JSON); // make private copy before in-place decoding
   try
-    result := RecordLoadJSON(Rec,tmp.buf,TypeInfo)<>nil;
+    result := RecordLoadJSON(Rec,tmp.buf,TypeInfo,nil,CustomVariantOptions)<>nil;
   finally
     tmp.Done;
   end;
@@ -43016,8 +43127,8 @@ begin
   end;
 end;
 
-function TJSONCustomParserCustomSimple.CustomReader(P: PUTF8Char;
-  var aValue; out EndOfObject: AnsiChar): PUTF8Char;
+function TJSONCustomParserCustomSimple.CustomReader(P: PUTF8Char; var aValue;
+  out EndOfObject: AnsiChar{$ifndef NOVARIANTS}; CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
 var PropValue: PUTF8Char;
     i, PropValueLen, i32: integer;
     u64: QWord;
@@ -43034,7 +43145,8 @@ begin
       exit; // invalid number of items
     Val := @aValue;
     for i := 1 to PTypeInfo(fTypeData)^.elCount do
-      if not fNestedArray.ReadOneLevel(P,Val,[]) then
+      if not fNestedArray.ReadOneLevel(
+          P,Val,[]{$ifndef NOVARIANTS},CustomVariantOptions{$endif}) then
         exit else
       if P=nil then
         exit;
@@ -43131,13 +43243,13 @@ begin
   parser^.Writer(aWriter,aValue);
 end;
 
-function TJSONCustomParserCustomRecord.CustomReader(P: PUTF8Char;
-  var aValue; out EndOfObject: AnsiChar): PUTF8Char;
+function TJSONCustomParserCustomRecord.CustomReader(P: PUTF8Char; var aValue;
+  out EndOfObject: AnsiChar{$ifndef NOVARIANTS}; CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
 var valid: boolean;
     callback: PJSONCustomParserRegistration; // D5/D6 Internal error: C3890
 begin
   callback := GetJSONCustomParserRegistration;
-  result := callback^.Reader(P,aValue,valid);
+  result := callback^.Reader(P,aValue,valid{$ifndef NOVARIANTS},CustomVariantOptions{$endif});
   if not valid then
     result := nil;
   if result=nil then
@@ -43513,7 +43625,8 @@ begin
 end;
 
 function TJSONCustomParserRTTI.ReadOneLevel(var P: PUTF8Char; var Data: PByte;
-  Options: TJSONCustomParserSerializationOptions): boolean;
+  Options: TJSONCustomParserSerializationOptions{$ifndef NOVARIANTS};
+  CustomVariantOptions: PDocVariantOptions{$endif}): boolean;
 var EndOfObject: AnsiChar;
   function ProcessValue(const Prop: TJSONCustomParserRTTI; var P: PUTF8Char;
     var Data: PByte): boolean;
@@ -43527,7 +43640,8 @@ var EndOfObject: AnsiChar;
     P := GotoNextNotSpace(P);
     case Prop.PropertyType of
     ptRecord: begin
-      if not Prop.ReadOneLevel(P,Data,Options) then
+      if not Prop.ReadOneLevel(
+          P,Data,Options{$ifndef NOVARIANTS},CustomVariantOptions{$endif}) then
         exit;
       EndOfObject := P^;
       if P^ in [',','}'] then
@@ -43576,7 +43690,8 @@ var EndOfObject: AnsiChar;
           end else begin
             // array of record
             ptr := P;
-            if not Prop.ReadOneLevel(ptr,DynArray,Options) or (ptr=nil) then
+            if not Prop.ReadOneLevel(ptr,DynArray,Options{$ifndef NOVARIANTS},
+                 CustomVariantOptions{$endif}) or (ptr=nil) then
               goto Error;
             P := GotoNextNotSpace(ptr);
             EndOfObject := P^;
@@ -43608,7 +43723,8 @@ Error:      Prop.FinalizeNestedArray(PPtrUInt(Data)^);
         inc(P);
     end;
     ptCustom: begin
-      ptr := TJSONCustomParserCustom(Prop).CustomReader(P,Data^,EndOfObject);
+      ptr := TJSONCustomParserCustom(Prop).CustomReader(P,Data^,EndOfObject
+        {$ifndef NOVARIANTS},CustomVariantOptions{$endif});
       if ptr=nil then
         exit;
       P := ptr;
@@ -43922,12 +44038,14 @@ begin
   fItems.Add(result);
 end;
 
-function TJSONRecordAbstract.CustomReader(P: PUTF8Char; var aValue; out aValid: Boolean): PUTF8Char;
+function TJSONRecordAbstract.CustomReader(P: PUTF8Char; var aValue;
+  out aValid: Boolean{$ifndef NOVARIANTS}; CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
 var Data: PByte;
     EndOfObject: AnsiChar;
 begin
   if Root.PropertyType=ptCustom then begin
-    result := TJSONCustomParserCustom(Root).CustomReader(P,aValue,EndOfObject);
+    result := TJSONCustomParserCustom(Root).CustomReader(P,aValue,EndOfObject
+      {$ifndef NOVARIANTS},CustomVariantOptions{$endif});
     aValid := result<>nil;
     if (EndOfObject<>#0) and aValid then begin
        dec(result);
@@ -43936,7 +44054,7 @@ begin
     exit;
   end;
   Data := @aValue;
-  aValid := Root.ReadOneLevel(P,Data,Options);
+  aValid := Root.ReadOneLevel(P,Data,Options{$ifndef NOVARIANTS},CustomVariantOptions{$endif});
   result := P;
 end;
 
@@ -49030,7 +49148,8 @@ end;
 const // kind of types which are serialized as JSON text
   DJ_STRING = [djTimeLog..djHash512];
 
-function TDynArray.LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char=nil): PUTF8Char;
+function TDynArray.LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char{$ifndef NOVARIANTS};
+  CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
 var n, i, ValLen: integer;
     T: TDynArrayKind;
     wasString, expectedString, isValid: boolean;
@@ -49062,6 +49181,10 @@ begin // code below must match TTextWriter.AddDynArrayJSON()
     end;
     exit; // handle '[]' array
   end;
+  {$ifndef NOVARIANTS}
+  if CustomVariantOptions=nil then
+    CustomVariantOptions := @JSON_OPTIONS[true];
+  {$endif}
   if HasCustomJSONParser then
     CustomReader := GlobalJSONCustomParsers.fParser[fParser].Reader else
     CustomReader := nil;
@@ -49072,7 +49195,8 @@ begin // code below must match TTextWriter.AddDynArrayJSON()
     Count := n; // fast allocation of the whole dynamic array memory at once
     for i := 0 to n-1 do begin
       NestedDynArray.Init(ElemType,PPointerArray(fValue^)^[i]);
-      P := NestedDynArray.LoadFromJSON(P,@EndOfObject);
+      P := NestedDynArray.LoadFromJSON(P,@EndOfObject{$ifndef NOVARIANTS},
+        CustomVariantOptions{$endif});
       if P=nil then
         exit;
       EndOfObject := P^; // ',' or ']' for the last item of the array
@@ -49097,12 +49221,12 @@ begin // code below must match TTextWriter.AddDynArrayJSON()
     {$ifndef NOVARIANTS}
     djVariant:
       for i := 0 to n-1 do
-        P := VariantLoadJSON(PVariantArray(fValue^)^[i],P,@EndOfObject,@JSON_OPTIONS[true]);
+        P := VariantLoadJSON(PVariantArray(fValue^)^[i],P,@EndOfObject,CustomVariantOptions);
     {$endif}
     djCustom: begin
       Val := fValue^;
       for i := 1 to n do begin
-        P := CustomReader(P,Val^,isValid);
+        P := CustomReader(P,Val^,isValid{$ifndef NOVARIANTS},CustomVariantOptions{$endif});
         if not isValid then
           exit;
         EndOfObject := P^; // ',' or ']' for the last item of the array
@@ -50528,9 +50652,11 @@ procedure TDynArrayHashed.Sort(aCompare: TDynArraySortCompare);
 begin
   InternalDynArray.Sort(aCompare);
 end;
-function TDynArrayHashed.LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char=nil): PUTF8Char;
+function TDynArrayHashed.LoadFromJSON(P: PUTF8Char; aEndOfObject: PUTF8Char{$ifndef NOVARIANTS};
+      CustomVariantOptions: PDocVariantOptions{$endif}): PUTF8Char;
 begin
-  result := InternalDynArray.LoadFromJSON(P,aEndOfObject);
+  result := InternalDynArray.LoadFromJSON(P,aEndOfObject{$ifndef NOVARIANTS},
+    CustomVariantOptions{$endif});
 end;
 function TDynArrayHashed.SaveToLength: integer;
 begin
@@ -51011,9 +51137,19 @@ begin
   RaiseFatalCollision('HashFind',aHashCode);
 end;
 
+function TDynArrayHashed.InternalCompare(Index: cardinal; const Elem): boolean;
+var P: PAnsiChar;
+begin
+  P := PAnsiChar(Value^)+Index*ElemSize;
+  if Assigned(fEventCompare) then
+    result := fEventCompare(P^,Elem)=0 else
+    if @{$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}fCompare<>nil then
+      result := {$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}fCompare(P^,Elem)=0 else
+      result := {$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}ElemEquals(P^,Elem);
+end;
+
 function TDynArrayHashed.HashFindAndCompare(aHashCode: cardinal; const Elem): integer;
 var first,last: integer;
-    P: PAnsiChar;
 begin
   if fHashs=nil then begin // e.g. Count<fHashCountTrigger
     result := Scan(Elem);
@@ -51029,23 +51165,10 @@ begin
   repeat
     with fHashs[result] do
     if Hash=aHashCode then begin
-      P := PAnsiChar(Value^)+Index*ElemSize;
-      if not Assigned(fEventCompare) then
-        if @{$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}fCompare<>nil then begin
-          if {$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}fCompare(P^,Elem)=0 then begin
-            result := Index;
-            exit; // found -> returns index in dynamic array
-          end;
-        end else begin
-          if {$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}ElemEquals(P^,Elem) then begin
-            result := Index;
-            exit; // found
-          end;
-        end else
-        if fEventCompare(P^,Elem)=0 then begin
-          result := Index;
-          exit; // found
-        end;
+      if InternalCompare(Index,Elem) then begin
+        result := Index;
+        exit; // found -> returns index in dynamic array
+      end;
     end else
     if Hash=HASH_VOID then begin
       result := -(result+1);
@@ -51095,20 +51218,27 @@ begin
   end;
 end;
 
-function TDynArrayHashed.IsHashElementWithoutCollision: integer;
-var i,j: integer;
+function TDynArrayHashed.IsHashElementWithoutCollision(nocompare: boolean): integer;
+var i,j: PtrInt;
+    pi,pj: ^TSynHash;
     h: cardinal;
 begin
-  if Count>0 then begin
+  if {$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}GetCount>0 then begin
     ReHash;
-    for i := 0 to fHashsCount-1 do begin
-      h := fHashs[i].Hash;
-      if h=HASH_VOID then
-        continue;
-      result := fHashs[i].Index;
-      for j := 0 to fHashsCount-1 do
-        if (i<>j) and (fHashs[j].Hash=h) then
-          exit; // found duplicate
+    pi := pointer(fHashs);
+    for i := 1 to fHashsCount do begin
+      h := pi^.Hash;
+      if h<>HASH_VOID then begin
+        pj := pointer(fHashs);
+        for j := 1 to fHashsCount do // O(n*n) brute force check
+          if (pj^.Hash=h) and (pi<>pj) and (nocompare or
+              InternalCompare(pi^.Index,PAnsiChar(Value)[pj^.Index*ElemSize])) then begin
+            result := pj^.Index; // found duplicate
+            exit;
+          end else
+            inc(pj);
+      end;
+      inc(pi);
     end;
   end;
   result := -1;
@@ -54935,6 +55065,23 @@ begin
     AddNoJSONEscape(P,L);
 end;
 
+procedure TTextWriter.AddTrimSpaces(const Text: RawUTF8);
+begin
+  AddTrimSpaces(pointer(Text));
+end;
+
+procedure TTextWriter.AddTrimSpaces(P: PUTF8Char);
+var c: AnsiChar;
+begin
+  if P<>nil then
+    repeat
+      c := P^;
+      inc(P);
+      if c>' ' then
+        Add(c);
+    until c=#0;
+end;
+
 procedure TTextWriter.AddString(const Text: RawUTF8);
 var L: integer;
 begin
@@ -56064,36 +56211,64 @@ begin
     result := true; // don't begin with a numerical value -> must be a string
 end;
 
-function GotoEndJSONItem(P: PUTF8Char): PUTF8Char;
+function GotoEndJSONItem(P: PUTF8Char; strict: boolean): PUTF8Char;
+label ok;
 begin
   result := nil; // to notify unexpected end
   if P=nil then
     exit;
   while (P^<=' ') and (P^<>#0) do inc(P);
-  // get a field
   case P^ of
   #0: exit;
   '"': begin
     P := GotoEndOfJSONString(P);
     if P^<>'"' then
-      exit; // P^ should be '"' here -> execute repeat.. below
+      exit;
+    inc(P);
+    goto ok;
   end;
   '[','{': begin
     P := GotoNextJSONObjectOrArray(P);
     if P=nil then
       exit;
-    while (P^<=' ') and (P^<>#0) do inc(P);
+ok: while (P^<=' ') and (P^<>#0) do inc(P);
     result := P;
     exit;
   end;
   end;
-  repeat // numeric or true/false/null or MongoDB extended {age:{$gt:18}}
-    inc(P);
-    if P^=#0 then exit; // unexpected end
-  until P^ in [':',',',']','}'];
+  if strict then
+    case P^ of
+    't': if PInteger(P)^=TRUE_LOW then begin inc(P,4); goto ok; end;
+    'f': if PInteger(P+1)^=FALSE_LOW2 then begin inc(P,5); goto ok; end;
+    'n': if PInteger(P)^=NULL_LOW then begin inc(P,4); goto ok; end;
+    '-','+','0'..'9': begin
+      repeat inc(P) until not (P^ in DigitFloatChars);
+      goto ok;
+    end;
+    end else
+    repeat // numeric or true/false/null or MongoDB extended {age:{$gt:18}}
+      inc(P);
+      if P^=#0 then exit; // unexpected end
+    until P^ in [':',',',']','}'];
   if P^=#0 then
     exit;
   result := P;
+end;
+
+function IsValidJSON(const s: RawUTF8): boolean;
+begin
+  result := IsValidJSON(pointer(s),length(s));
+end;
+
+function IsValidJSON(P: PUTF8Char; len: PtrInt): boolean;
+var B: PUTF8Char;
+begin
+  result := false;
+  if (P=nil) or (len<=0) or (StrLen(P)<>len) then
+    exit;
+  B := P;
+  P :=  GotoEndJSONItem(B,{strict=}true);
+  result := (P<>nil) and (P-B=len);
 end;
 
 procedure GetJSONItemAsRawJSON(var P: PUTF8Char; var result: RawJSON;
@@ -56103,7 +56278,7 @@ begin
   result := '';
   if P=nil then
     exit;
-  B := P;
+  B := GotoNextNotSpace(P);
   P := GotoEndJSONItem(B);
   if P=nil then
     exit;
@@ -56193,9 +56368,9 @@ begin // should match GetJSONPropName()
         inc(P);
       until not (P^ in DigitFloatChars);
     't': if PInteger(P)^=TRUE_LOW then inc(P,4) else goto Prop;
-    'f': if PInteger(P)^=FALSE_LOW then inc(P,5) else goto Prop;
+    'f': if PInteger(P+1)^=FALSE_LOW2 then inc(P,5) else goto Prop;
     'n': if PInteger(P)^=NULL_LOW then inc(P,4) else goto Prop;
-    '''': begin
+    '''': begin // single-quoted identifier
       repeat inc(P); if P^<=' ' then exit; until P^='''';
       repeat inc(P) until (P^>' ') or (P^=#0);
       if P^<>':' then exit;
@@ -59114,8 +59289,8 @@ begin
     fHash.fHashElement := aHashElement;
   if Assigned(aCompare) then
     fHash.{$ifdef UNDIRECTDYNARRAY}InternalDynArray.{$endif}fCompare := aCompare;
-  fHash.EventCompare := IntComp;
-  fHash.EventHash := IntHash;
+  fHash.fEventCompare := IntComp;
+  fHash.fEventHash := IntHash;
 end;
 
 function TObjectListPropertyHashed.IntHash(const Elem): cardinal;
@@ -60125,27 +60300,29 @@ begin
   end;
 end;
 
-function TSynDictionary.LoadFromJSON(const JSON: RawUTF8;
-  EnsureNoKeyCollision: boolean): boolean;
-begin
-  result := LoadFromJSON(pointer(JSON),EnsureNoKeyCollision);
+function TSynDictionary.LoadFromJSON(const JSON: RawUTF8; EnsureNoKeyCollision: boolean
+  {$ifndef NOVARIANTS}; CustomVariantOptions: PDocVariantOptions{$endif}): boolean;
+begin // pointer(JSON) is not modified in-place thanks to JSONObjectAsJSONArrays()
+  result := LoadFromJSON(pointer(JSON),EnsureNoKeyCollision{$ifndef NOVARIANTS},
+      CustomVariantOptions{$endif});
 end;
 
-function TSynDictionary.LoadFromJSON(JSON: PUTF8Char; EnsureNoKeyCollision: boolean): boolean;
-var k,v: RawUTF8;
+function TSynDictionary.LoadFromJSON(JSON: PUTF8Char; EnsureNoKeyCollision: boolean{$ifndef NOVARIANTS};
+  CustomVariantOptions: PDocVariantOptions{$endif}): boolean;
+var k,v: RawUTF8; // private copy of the JSON input, expanded as Keys/Values arrays
 begin
   result := false;
   if not JSONObjectAsJSONArrays(JSON,k,v) then
     exit;
   fSafe.Lock;
   try
-    if fKeys.LoadFromJSON(pointer(k))<>nil then
-      if fValues.LoadFromJSON(pointer(v))<>nil then
+    if fKeys.LoadFromJSON(pointer(k),nil{$ifndef NOVARIANTS},CustomVariantOptions{$endif})<>nil then
+      if fValues.LoadFromJSON(pointer(v),nil{$ifndef NOVARIANTS},CustomVariantOptions{$endif})<>nil then
         if fKeys.Count=fValues.Count then begin
           SetTimeouts;
           if EnsureNoKeyCollision then
             // fKeys.Rehash is not enough, since input JSON may be invalid
-            result := fKeys.IsHashElementWithoutCollision<0 else begin
+            result := fKeys.IsHashElementWithoutCollision({nocompare=}false)<0 else begin
             // optimistic approach
             fKeys.Rehash;
             result := true;

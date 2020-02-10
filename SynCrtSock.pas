@@ -4062,7 +4062,7 @@ begin
   end;
   if aAcceptEncoding='' then
     aAcceptEncoding := 'Accept-Encoding: '+aName else
-    aAcceptEncoding := aAcceptEncoding+','+aName;
+    aAcceptEncoding := aAcceptEncoding+', '+aName;
   result := aName;
 end;
 

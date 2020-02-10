@@ -794,9 +794,9 @@ type
     procedure TrailerBytes(count: cardinal);
   public
     /// creates a new instance with the very same values
-    // - by design, our classes will use stateless context, so this method
+    // - by design, our classes will use TAES stateless context, so this method
     // will just copy the current fields to a new instance, by-passing
-    // the key creation
+    // the key creation step
     function Clone: TAESAbstract; override;
     /// release the used instance memory and resources
     // - also fill the TAES instance with zeros, for safety
@@ -2522,7 +2522,7 @@ type
   // and another one for decryption, with PKCS7 padding and no MAC validation
   TProtocolAES = class(TInterfacedObjectLocked, IProtocol)
   protected
-    fAES: array[boolean] of TAESAbstract;
+    fAES: array[boolean] of TAESAbstract; // [false]=decrypt [true]=encrypt
   public
     /// initialize this encryption protocol with the given AES settings
     constructor Create(aClass: TAESAbstractClass; const aKey; aKeySize: cardinal;
@@ -2594,15 +2594,15 @@ type
   TJWTContent = record
     /// store latest Verify() result
     result: TJWTResult;
-    /// set of registered claims, as stored in the JWT payload
+    /// set of known/registered claims, as stored in the JWT payload
     claims: TJWTClaims;
     /// match TJWTAbstract.Audience[] indexes for reg[jrcAudience]
     audience: set of 0..15;
-    /// registered claims UTF-8 values, as stored in the JWT payload
+    /// known/registered claims UTF-8 values, as stored in the JWT payload
     // - e.g. reg[jrcSubject]='1234567890' and reg[jrcIssuer]='' for
     // $ {"sub": "1234567890","name": "John Doe","admin": true}
     reg: array[TJWTClaim] of RawUTF8;
-    /// unregistered public/private claim values, as stored in the JWT payload
+    /// custom/unregistered claim values, as stored in the JWT payload
     // - registered claims will be available from reg[], not in this field
     // - e.g. data.U['name']='John Doe' and data.B['admin']=true for
     // $ {"sub": "1234567890","name": "John Doe","admin": true}
@@ -2921,7 +2921,7 @@ const
     'HS256','HS256','HS384','HS512','S3224','S3256','S3384','S3512','S3S128','S3S256');
 
   /// able to instantiate any of the TJWTSynSignerAbstract instance expected
-  // - SHA-1 will fallback to TJWTHS256 (since there will never be SHA-1 support)
+  // - SHA-1 will fallback to TJWTHS256 (since SHA-1 will never be supported)
   // - SHA-3 is not yet officially defined in @http://tools.ietf.org/html/rfc7518
   // - typical use is the following:
   // ! result := JWT_CLASS[algo].Create(master, round, claims, [], expirationMinutes);
@@ -14342,7 +14342,7 @@ begin
   fSafe.Lock;
   try
     try
-      aPlain := fAES[false].DecryptPKCS7(aEncrypted,true);
+      aPlain := fAES[false].DecryptPKCS7(aEncrypted,{iv=}true,{raise=}false);
       if aPlain='' then
         result := sprBadRequest else
         result := sprSuccess;
@@ -14359,7 +14359,7 @@ procedure TProtocolAES.Encrypt(const aPlain: RawByteString;
 begin
   fSafe.Lock;
   try
-    aEncrypted := fAES[true].EncryptPKCS7(aPlain,true);
+    aEncrypted := fAES[true].EncryptPKCS7(aPlain,{iv=}true);
   finally
     fSafe.UnLock;
   end;
@@ -14564,7 +14564,9 @@ var payloadend,j,toklen,c,cap,headerlen,len,a: integer;
     aud: TDocVariantData;
     tok: PAnsiChar absolute Token;
 begin
-  JWT.data.InitFast(0,dvObject);
+  // 0. initialize parsing
+  Finalize(JWT.reg);
+  JWT.data.InitFast(0,dvObject); // custom claims
   byte(JWT.claims) := 0;
   word(JWT.audience) := 0;
   toklen := length(Token);
@@ -14572,8 +14574,9 @@ begin
     JWT.result := jwtNoToken;
     exit;
   end;
+  // 1. validate the header (including algorithm "alg" verification)
   JWT.result := jwtInvalidAlgorithm;
-  if joHeaderParse in fOptions then begin
+  if joHeaderParse in fOptions then begin // slower parsing
     headerlen := PosExChar('.',Token);
     if (headerlen=0) or (headerlen>512) then
       exit;
@@ -14582,11 +14585,12 @@ begin
     if not head[0].Idem(fAlgorithm) or
        ((head[1].Value<>nil) and not head[1].Idem('JWT')) then
       exit;
-  end else begin
-    headerlen := length(fHeaderB64); // fast direct compare of fHeaderB64 (including "alg")
+  end else begin // fast direct compare of fHeaderB64 (including "alg")
+    headerlen := length(fHeaderB64);
     if (toklen<=headerlen) or not CompareMem(pointer(fHeaderB64),tok,headerlen) then
       exit;
   end;
+  // 2. extract the payload
   JWT.result := jwtWrongFormat;
   if toklen>JWT_MAXSIZE Then
     exit;
@@ -14600,14 +14604,16 @@ begin
   Base64URIToBin(tok+headerlen,payloadend-headerlen-1,RawByteString(payload));
   if payload='' then
     exit;
+  // 3. decode the payload into JWT.reg[]/JWT.claims (known) and JWT.data (custom)
   P := GotoNextNotSpace(pointer(payload));
   if P^<>'{' then
     exit;
   P := GotoNextNotSpace(P+1);
   cap := JSONObjectPropCount(P);
-  if cap<=0 then
+  if cap<0 then
     exit;
   requiredclaims := fClaims - excluded;
+  if cap>0 then
   repeat
     N := GetJSONPropName(P);
     if N=nil then
@@ -15035,7 +15041,7 @@ initialization
     if (cfSSE42 in CpuFeatures) and (cfAesNi in CpuFeatures) then
       crc32c := @crc32c_sse42_aesni;
   {$endif CRC32C_X64}
-  if cfSSE41 in CpuFeatures then begin // optimized Intel's sha256_sse4.asm ?
+  if cfSSE41 in CpuFeatures then begin // optimized Intel's sha256_sse4.asm
     if K256AlignedStore='' then
       GetMemAligned(K256AlignedStore,@K256,SizeOf(K256),K256Aligned);
     if PtrUInt(K256Aligned) and 15<>0 then

@@ -1741,8 +1741,8 @@ type
   // - uses internally a TSynTableData object
   TSynTableVariantType = class(TSynInvokeableVariantType)
   protected
-    procedure IntGet(var Dest: TVarData; const V: TVarData; Name: PAnsiChar); override;
-    procedure IntSet(const V, Value: TVarData; Name: PAnsiChar); override;
+    procedure IntGet(var Dest: TVarData; const V: TVarData; Name: PAnsiChar; NameLen: PtrInt); override;
+    procedure IntSet(const V, Value: TVarData; Name: PAnsiChar; NameLen: PtrInt); override;
   public
     /// retrieve the SBF compact binary format representation of a record content
     class function ToSBF(const V: Variant): TSBFString;
@@ -2205,11 +2205,11 @@ type
     function NextSafe(out Data: Pointer; DataLen: PtrInt): boolean; {$ifdef HASINLINE}inline;{$endif}
     {$ifndef NOVARIANTS}
     /// read the next variant from the buffer
-    // - is a wrapper around VariantLoad(), so may suffer from buffer overflow
-    procedure NextVariant(var Value: variant; CustomVariantOptions: pointer);
+    // - is a wrapper around VariantLoad()
+    procedure NextVariant(var Value: variant; CustomVariantOptions: PDocVariantOptions);
     /// read the JSON-serialized TDocVariant from the buffer
     // - matches TFileBufferWriter.WriteDocVariantData format
-    procedure NextDocVariantData(out Value: variant; CustomVariantOptions: pointer);
+    procedure NextDocVariantData(out Value: variant; CustomVariantOptions: PDocVariantOptions);
     {$endif NOVARIANTS}
     /// copy data from the current position, and move ahead the specified bytes
     procedure Copy(out Dest; DataLen: PtrInt); {$ifdef HASINLINE}inline;{$endif}
@@ -3891,15 +3891,19 @@ begin
 end;
 
 procedure TSynTableVariantType.IntGet(var Dest: TVarData;
-  const V: TVarData; Name: PAnsiChar);
+  const V: TVarData; Name: PAnsiChar; NameLen: PtrInt);
+var aName: RawUTF8;
 begin
-  TSynTableData(V).GetFieldVariant(RawByteString(Name),variant(Dest));
+  FastSetString(aName,Name,NameLen);
+  TSynTableData(V).GetFieldVariant(aName,variant(Dest));
 end;
 
 procedure TSynTableVariantType.IntSet(const V, Value: TVarData;
-  Name: PAnsiChar);
+  Name: PAnsiChar; NameLen: PtrInt);
+var aName: RawUTF8;
 begin
-  TSynTableData(V).SetFieldValue(RawByteString(Name),Variant(Value));
+  FastSetString(aName,Name,NameLen);
+  TSynTableData(V).SetFieldValue(aName,Variant(Value));
 end;
 
 class function TSynTableVariantType.ToID(const V: Variant): integer;
@@ -9280,16 +9284,18 @@ begin
 end;
 
 {$ifndef NOVARIANTS}
-procedure TFastReader.NextVariant(var Value: variant; CustomVariantOptions: pointer);
+procedure TFastReader.NextVariant(var Value: variant;
+  CustomVariantOptions: PDocVariantOptions);
 begin
-  P := VariantLoad(Value,P,CustomVariantOptions);
+  P := VariantLoad(Value,P,CustomVariantOptions,Last);
   if P=nil then
     ErrorData('VariantLoad=nil',[]) else
   if P>Last then
     ErrorOverFlow;
 end;
 
-procedure TFastReader.NextDocVariantData(out Value: variant; CustomVariantOptions: pointer);
+procedure TFastReader.NextDocVariantData(out Value: variant;
+  CustomVariantOptions: PDocVariantOptions);
 var json: TValueResult;
     temp: TSynTempBuffer;
 begin
@@ -9300,7 +9306,7 @@ begin
   try
     if CustomVariantOptions=nil then
       CustomVariantOptions := @JSON_OPTIONS[true];
-    TDocVariantData(Value).InitJSONInPlace(temp.buf,PDocVariantOptions(CustomVariantOptions)^);
+    TDocVariantData(Value).InitJSONInPlace(temp.buf,CustomVariantOptions^);
   finally
     temp.Done;
   end;
@@ -9594,7 +9600,7 @@ end;
 
 procedure TFastReader.Read(var DA: TDynArray; NoCheckHash: boolean);
 begin
-  P := DA.LoadFrom(P,nil,NoCheckHash);
+  P := DA.LoadFrom(P,nil,NoCheckHash,Last);
   if P=nil then
     ErrorData('TDynArray.LoadFrom %',[DA.ArrayTypeShort^]);
 end;
@@ -10356,7 +10362,7 @@ begin
       i := PosExChar(':',fPassword);
       if i>0 then
         raise ESynException.CreateUTF8('%.GetPassWordPlain unable to retrieve the '+
-          'stored value: current user is "%", but password in % was encoded for "%"',
+          'stored value: current user is [%], but password in % was encoded for [%]',
           [self,ExeVersion.User,AppSecret,copy(fPassword,1,i-1)]);
     end;
   end;
@@ -11725,7 +11731,7 @@ begin
                 {$ifdef DELPHI5OROLDER}
                 on E: Exception do
                   fBackgroundException := ESynException.CreateUTF8(
-                    'Redirected %: "%"',[E,E.Message]);
+                    'Redirected % [%]',[E,E.Message]);
                 {$else}
                 E := AcquireExceptionObject;
                 if E.InheritsFrom(Exception) then

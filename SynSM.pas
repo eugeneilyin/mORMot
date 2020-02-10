@@ -884,8 +884,8 @@ type
   TSMVariant = class(TSynInvokeableVariantType)
   protected
     /// fast getter/setter implementation of object properties
-    procedure IntGet(var Dest: TVarData; const V: TVarData; Name: PAnsiChar); override;
-    procedure IntSet(const V, Value: TVarData; Name: PAnsiChar); override;
+    procedure IntGet(var Dest: TVarData; const V: TVarData; Name: PAnsiChar; NameLen: PtrInt); override;
+    procedure IntSet(const V, Value: TVarData; Name: PAnsiChar; NameLen: PtrInt); override;
   public
     /// initialize a variant instance to store a JavaScript object
     class procedure New(const aObject: TSMObject; out aValue: variant); overload;
@@ -1172,7 +1172,7 @@ begin
   end;
   if res=JS_FALSE then begin
     SynSMLog.Add.Log(sllError, 'Error compiling script %', FLastErrorFileName);
-    raise ESMException.CreateUTF8('%: Error compiling script "%". Line %',
+    raise ESMException.CreateUTF8('%: Error compiling script [%]. Line %',
       [self,FLastErrorFileName,FLastErrorLine]);
   end;
 end;
@@ -2411,7 +2411,7 @@ end;
 { TSMVariant }
 
 procedure TSMVariant.IntGet(var Dest: TVarData; const V: TVarData;
-  Name: PAnsiChar);
+  Name: PAnsiChar; NameLen: PtrInt);
 var res: TSMValue;
 begin
   //Assert(V.VType=SMVariantType.VarType);
@@ -2458,7 +2458,7 @@ begin
   end;
 end;
 
-procedure TSMVariant.IntSet(const V, Value: TVarData; Name: PAnsiChar);
+procedure TSMVariant.IntSet(const V, Value: TVarData; Name: PAnsiChar; NameLen: PtrInt);
 var smValue: TSMValue;
 begin
   with TSMVariantData(V) do begin

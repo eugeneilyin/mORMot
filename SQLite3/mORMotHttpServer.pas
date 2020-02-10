@@ -310,10 +310,8 @@ type
     function GetDBServerNames: RawUTF8;
     function HttpApiAddUri(const aRoot,aDomainName: RawByteString;
       aSecurity: TSQLHttpServerSecurity; aRegisterURI,aRaiseExceptionOnError: boolean): RawUTF8;
-    function NotifyCallback(aSender: TSQLRestServer;
-      const aInterfaceDotMethodName,aParams: RawUTF8;
-      aConnectionID: Int64; aFakeCallID: integer;
-      aResult, aErrorMsg: PRawUTF8): boolean;
+    function NotifyCallback(aSender: TSQLRestServer; const aInterfaceDotMethodName,aParams: RawUTF8;
+      aConnectionID: THttpServerConnectionID; aFakeCallID: integer; aResult, aErrorMsg: PRawUTF8): boolean;
   public
     /// create a Server instance, binded and listening on a TCP port to HTTP requests
     // - raise a EHttpServer exception if binding failed
@@ -426,6 +424,8 @@ type
     // ! fMainRunner := TMVCRunOnRestServer.Create(self,nil,'blog');
     // ! ...
     // - if aURI='' is given, the corresponding host redirection will be disabled
+    // - note: by design, 'something.localhost' is likely to be not recognized
+    // as aDomain, since 'localhost' can not be part of proper DNS resolution
     procedure DomainHostRedirect(const aDomain,aURI: RawUTF8);
     /// allow to temporarly redirect ip:port root URI to a given sub-URI
     // - by default, only sub-URI, as defined by TSQLRestServer.Model.Root, are
@@ -539,7 +539,7 @@ type
     // - you can share several HTTP log servers on the same port, if you use
     // a dedicated root URI and use the http.sys server (which is the default)
     constructor Create(const aRoot: RawUTF8; aPort: integer;
-      const aEvent: TRemoteLogReceivedOne);
+      const aEvent: TRemoteLogReceivedOne); reintroduce;
     /// release the HTTP server and its internal mORMot server
     destructor Destroy; override;
     /// the associated mORMot server instance running with this HTTP server
@@ -658,10 +658,15 @@ begin
 end;
 
 procedure TSQLHttpServer.DomainHostRedirect(const aDomain,aURI: RawUTF8);
+var uri: TURI;
 begin
+  if uri.From(aDomain) and EndWith(uri.Server,'.LOCALHOST') then
+      fLog.Add.Log(sllWarning, 'DomainHostRedirect(%) is very likely to be unresolved'+
+        ': consider using a real host name instead of the loopback',[aDomain],self);
   if aURI='' then
     fHosts.Delete(aDomain) else
     fHosts.Add(aDomain,aURI); // e.g. Add('project1.com','root1')
+
 end;
 
 constructor TSQLHttpServer.Create(const aPort: AnsiString;
@@ -1142,7 +1147,7 @@ begin
 end;
 
 function TSQLHttpServer.NotifyCallback(aSender: TSQLRestServer;
-  const aInterfaceDotMethodName, aParams: RawUTF8; aConnectionID: Int64;
+  const aInterfaceDotMethodName, aParams: RawUTF8; aConnectionID: THttpServerConnectionID;
   aFakeCallID: integer; aResult, aErrorMsg: PRawUTF8): boolean;
 var ctxt: THttpServerRequest;
     status: cardinal;

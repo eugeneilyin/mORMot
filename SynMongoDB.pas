@@ -3203,7 +3203,7 @@ begin
           W.AddNoJSONEscape(item.Name,item.NameLen);
           W.Add(':');
         end else
-          W.AddFieldName(item.Name,item.NameLen);
+          W.AddProp(item.Name,item.NameLen);
         item.AddMongoJSON(W,Mode);
         W.Add(',');
       end;
@@ -3386,11 +3386,11 @@ begin
 end;
 
 procedure TBSONWriter.BSONWriteDateTime(const name: RawUTF8; const value: TDateTime);
-var UnixTime: TUnixMSTime;
+var ms: TUnixMSTime;
 begin
-  UnixTime := DateTimeToUnixMSTime(value);
+  ms := DateTimeToUnixMSTime(value);
   BSONWrite(name,betDateTime);
-  Write8(UnixTime);
+  Write8(ms);
 end;
 
 procedure TBSONWriter.BSONWrite(const name: RawUTF8; Data: pointer; DataLen: integer);
@@ -5969,7 +5969,7 @@ begin
         split(full,'.',db,coll);
         if db<>aDatabaseName then
           raise EMongoConnectionException.CreateUTF8(
-            '%.Create: invalid "%" collection name for DB "%"',
+            '%.Create: invalid [%] collection name for DB [%]',
             [self,full,aDatabaseName],Client.Connections[0]);
         fCollections.AddObject(coll,TMongoCollection.Create(self,coll));
       end;

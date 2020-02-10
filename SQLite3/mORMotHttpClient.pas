@@ -293,6 +293,7 @@ type
   protected
     /// internal HTTP/1.1 compatible client
     fSocketClass: THttpClientSocketClass;
+    /// either THttpClientSocket or THttpClientWebSockets
     fSocket: THttpClientSocket;
     /// call fSocket.Request()
     function InternalRequest(const url, method: RawUTF8;
@@ -753,11 +754,13 @@ end;
 
 procedure TSQLHttpClientWinSock.InternalClose;
 begin
-  try
-    FreeAndNil(fSocket);
-  except
-    ; // ignore any error here
-  end;
+  if fSocket<>nil then
+    try
+      InternalLog('InternalClose: fSocket.Free', sllTrace);
+      FreeAndNil(fSocket);
+    except
+      ; // ignore any error here
+    end;
 end;
 
 function TSQLHttpClientWinSock.InternalRequest(const url, method: RawUTF8;
@@ -790,6 +793,7 @@ begin
     try
       if fSocketClass=nil then
         fSocketClass := THttpClientWebSockets;
+      InternalLog('InternalCheckOpen: calling %.Open', [fSocketClass]);
       result := inherited InternalCheckOpen;
       if result then begin
         include(fInternalState,isOpened);
@@ -820,9 +824,8 @@ begin
       ParamValue,TInterfaceFactory.Get(ParamInfo.ArgTypeInfo));
 end;
 
-function TSQLHttpClientWebsockets.FakeCallbackUnregister(
-  Factory: TInterfaceFactory; FakeCallbackID: integer;
-  Instance: pointer): boolean;
+function TSQLHttpClientWebsockets.FakeCallbackUnregister(Factory: TInterfaceFactory;
+  FakeCallbackID: integer; Instance: pointer): boolean;
 var body,head,resp: RawUTF8;
 begin
   if (FakeCallbackID=0) or not WebSocketsConnected then begin

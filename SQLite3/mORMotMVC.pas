@@ -1576,7 +1576,7 @@ var action: TMVCAction;
     isAction: boolean;
     WR: TTextWriter;
     methodOutput: RawUTF8;
-    renderContext, info: variant;
+    renderContext{, info}: variant;
     err: shortstring;
     tmp: TTextWriterStackBuffer;
 begin
@@ -1617,8 +1617,8 @@ begin
             action.RedirectToMethodParameters := methodOutput else begin
             // rendering, e.g. with fast Mustache {{template}}
             _Json(methodOutput,renderContext,JSON_OPTIONS_FAST);
-            fApplication.GetViewInfo(fMethodIndex,info);
-            _Safe(renderContext)^.AddValue('main',info);
+//            fApplication.GetViewInfo(fMethodIndex,info);
+//            _Safe(renderContext)^.AddValue('main',info);
             if fMethodIndex=fApplication.fFactoryErrorIndex then
               _ObjAddProps(['errorCode',action.ReturnedStatus,
                 'originalErrorContext',JSONReformat(ToUTF8(renderContext))],
@@ -1695,7 +1695,7 @@ end;
 procedure TMVCRendererJson.Renders(var outContext: variant;
   status: cardinal; forcesError: boolean);
 begin
-  fOutput.Content := JSONReformat(ToUTF8(outContext));
+  fOutput.Content := ToUTF8(outContext);
   fOutput.Header := JSON_CONTENT_TYPE_HEADER_VAR;
   fOutput.Status := status;
 end;
@@ -1912,8 +1912,8 @@ begin
         body := StringReplaceAll(body,fViews.ViewGenerationTimeTag,
           ShortStringToAnsi7String(timer.Stop));
       Ctxt.Returns(body,renderer.Output.Status,
-        renderer.Output.Header,{handle304=}true,{noerrorprocess=}true,
-        {cachecontrol=}0,{hashwithouttime:}crc32cUTF8ToHex(renderer.Output.Content));
+        renderer.Output.Header,{handle304=}false,{noerrorprocess=}true,
+        {cachecontrol=}0,{hashwithouttime:}{crc32cUTF8ToHex(renderer.Output.Content)}'');
     finally
       renderer.Free;
     end;

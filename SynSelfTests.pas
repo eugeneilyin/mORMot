@@ -340,7 +340,11 @@ type
     procedure _TObjectDynArrayWrapper;
     /// test T*ObjArray types and the ObjArray*() wrappers
     procedure _TObjArray;
-    {$endif}
+    {$endif DELPHI5OROLDER}
+    {$ifdef CPUINTEL}
+    /// validate our optimized MoveFast/FillCharFast functions
+    procedure CustomRTL;
+    {$endif CPUINTEL}
     /// test StrIComp() and AnsiIComp() functions
     procedure FastStringCompare;
     /// test IdemPropName() and IdemPropNameU() functions
@@ -381,6 +385,9 @@ type
     procedure IniFiles;
     /// test UTF-8 and Win-Ansi conversion (from or to, through RawUnicode)
     procedure _UTF8;
+    /// test UrlEncode() and UrlDecode() functions
+    // - this method use some ISO-8601 encoded dates and times for the testing
+    procedure UrlDecoding;
     /// test ASCII Baudot encoding
     procedure BaudotCode;
     /// the ISO-8601 date and time encoding
@@ -388,9 +395,6 @@ type
     procedure Iso8601DateAndTime;
     /// test the TSynTimeZone class and its cross-platform local time process
     procedure TimeZones;
-    /// test UrlEncode() and UrlDecode() functions
-    // - this method use some ISO-8601 encoded dates and times for the testing
-    procedure UrlDecoding;
     /// test mime types recognition
     procedure MimeTypes;
     /// validates the median computation using the "Quick Select" algorithm
@@ -573,8 +577,6 @@ type
   published
     /// RTSP over HTTP, as implemented in SynProtoRTSPHTTP unit
     procedure RTSPOverHTTP;
-    /// secure Relay of TCP/HTTP connections
-    procedure SynRelay;
   end;
 
 {$ifdef MSWINDOWS}
@@ -1527,7 +1529,7 @@ const N = 1000000;
     timer.Start;
     for i := 1 to N do
       GetBitsCountPtrInt(i);
-    NotifyTestSpeed(ctxt,N,N shl POINTERSHR,@timer);
+    NotifyTestSpeed(ctxt,N,N shl POINTERSHR,@timer,{onlylog=}true);
   end;
 var Bits: array[byte] of byte;
     Bits64: Int64 absolute Bits;
@@ -1554,7 +1556,7 @@ begin
   timer.Start;
   for u := 1 to N do
     i := popcnt(u);
-  NotifyTestSpeed('FPC',N,N shl POINTERSHR,@timer);
+  NotifyTestSpeed('FPC',N,N shl POINTERSHR,@timer,{onlylog=}true);
   {$endif FPC}
   FillcharFast(Bits,sizeof(Bits),0);
   for i := 0 to high(Bits)*8+7 do
@@ -1970,7 +1972,7 @@ var ACities: TDynArrayHashed;
     AmountCollection: TAmountCollection;
     AmountICollection: TAmountICollection;
     AmountDA,AmountIDA1,AmountIDA2: TDynArrayHashed;
-const CITIES_MAX=20000;
+const CITIES_MAX=200000;
 begin
   // default Init() will hash and compare binary content before string, i.e. firmID
   AmountDA.Init(TypeInfo(TAmountCollection), AmountCollection);
@@ -2893,6 +2895,183 @@ begin
   TestCities;
 end;
 
+{$ifdef CPUINTEL}
+function BufEquals(P, n, b: PtrInt): boolean;
+begin // slower than FillChar, faster than for loop, but fast enough for testing
+  result := false;
+  b := b*{$ifdef CPU32}$01010101{$else}$0101010101010101{$endif};
+  inc(n,P-SizeOf(P));
+  if n>=P then
+    repeat
+      if PPtrInt(P)^<>b then
+        exit;
+      inc(PPtrInt(P));
+    until n<P;
+  inc(n,SizeOf(P));
+  if P<n then
+    repeat
+      if PByte(P)^<>byte(b) then
+        exit;
+      inc(P);
+    until P>=n;
+  result := true;
+end;
+
+function BufIncreasing(P: PByteArray; n: PtrInt; b: byte): boolean;
+var i: PtrInt;
+begin
+  result := false;
+  for i := 0 to n-1 do
+    if P[i]<>b then
+      exit else
+      inc(b);
+  result := true;
+end;
+
+procedure TTestLowLevelCommon.CustomRTL;
+// note: FPC uses the RTL for FillCharFast/MoveFast
+var buf: RawByteString;
+   procedure Validate(rtl: boolean=false);
+   var i,len,filled,moved: PtrInt;
+       b1,b2: byte;
+       timer: TPrecisionTimer;
+       P: PByteArray;
+       msg: string;
+       elapsed: Int64;
+   begin
+     // first validate FillCharFast
+     filled := 0;
+     b1 := 0;
+     len := 1;
+     repeat
+       b2 := (b1+1) and 255;
+       buf[len+1] := AnsiChar(b1);
+       if rtl then
+         FillChar(pointer(buf)^,len,b2) else
+         FillCharFast(pointer(buf)^,len,b2);
+       inc(filled,len);
+       Check(BufEquals(PtrInt(buf),len,b2));
+       Check(ord(buf[len+1])=b1);
+       b1 := b2;
+       if len<16384 then
+         inc(len) else
+         inc(len,777+len shr 4);
+     until len>=length(buf);
+     // small len makes timer.Resume/Pause unreliable -> single shot measure
+     b1 := 0;
+     len := 1;
+     timer.Start;
+     repeat
+       b2 := (b1+1) and 255;
+       if rtl then
+         FillChar(pointer(buf)^,len,b2) else
+         FillCharFast(pointer(buf)^,len,b2);
+       b1 := b2;
+       if len<16384 then
+         inc(len) else
+         inc(len,777+len shr 4);
+     until len>=length(buf);
+     timer.Stop;
+     if rtl then
+       msg := 'FillChar' else
+       {$ifdef CPUX64}
+       FormatString('FillCharFast [%]',[GetSetName(TypeInfo(TX64CpuFeatures),CPUIDX64)],msg);
+       {$else}
+       msg := 'FillCharFast';
+       {$endif}
+     NotifyTestSpeed(msg,1,filled,@timer);
+     // validates overlapping forward Move/MoveFast
+     if rtl then
+       msg := 'Move' else
+       {$ifdef CPUX64}
+       FormatString('MoveFast [%]',[GetSetName(TypeInfo(TX64CpuFeatures),CPUIDX64)],msg);
+       {$else}
+       msg := 'MoveFast';
+       {$endif}
+     P := pointer(buf);
+     for i := 0 to length(buf)-1 do
+       P[i] := i; // fills with 0,1,2,...
+     Check(BufIncreasing(p,length(buf),0));
+     len := 1;
+     moved := 0;
+     timer.Start;
+     repeat
+       if rtl then
+         Move(P[moved+1],P[moved],len) else
+         MoveFast(p[moved+1],p[moved],len);
+       inc(moved,len);
+       Check(p[moved]=p[moved-1]);
+       inc(len);
+     until moved+len>=length(buf);
+     NotifyTestSpeed(msg,1,moved,@timer);
+     Check(BufIncreasing(p,moved,1));
+     checkEqual(Hash32(buf),2284147540);
+     // forward and backward overlapped moves on small buffers
+     elapsed := 0;
+     moved := 0;
+     for len := 1 to 48 do begin
+       timer.Start;
+       if rtl then
+         for i := 1 to 10000 do begin
+           Move(P[100],P[i],len);
+           Move(P[i],P[100],len);
+         end else
+         for i := 1 to 10000 do begin
+           MoveFast(P[100],P[i],len);
+           MoveFast(P[i],P[100],len);
+         end;
+       inc(moved,20000*len);
+       inc(elapsed,NotifyTestSpeed('%b %',[len,msg],1,20000*len,@timer,{onlylog=}true));
+     end;
+     timer.FromExternalMicroSeconds(elapsed);
+     NotifyTestSpeed('small %',[msg],1,moved,@timer);
+     checkEqual(Hash32(buf),1635609040);
+     // forward and backward non-overlapped moves on big buffers
+     len := (length(buf)-3200) shr 1;
+     timer.Start;
+     for i := 1 to 25 do
+       if rtl then begin
+         Move(P[len],P[i],len-i*10);
+         Move(P[i],P[len],len-i*10);
+       end else begin
+         MoveFast(p[len],p[i],len-i*10);
+         MoveFast(P[i],P[len],len-i*10);
+       end;
+     NotifyTestSpeed('big %',[msg],1,50*len,@timer);
+     checkEqual(Hash32(buf),818419281);
+     // forward and backward overlapped moves on big buffers
+     len := length(buf)-3200;
+     for i := 1 to 3 do
+       if rtl then begin
+         Move(P[3100],P[i],len-i);
+         Move(P[i],P[3200],len-i);
+       end else begin
+         MoveFast(p[3100],p[i],len-i);
+         MoveFast(P[i],P[3200],len-i);
+       end;
+     checkEqual(Hash32(buf),1646145792);
+   end;
+{$ifdef CPUX64} var cpu: TX64CpuFeatures; {$endif}
+begin
+  SetLength(buf,16 shl 20); // 16MB
+  Validate({rtl=}true);
+  {$ifdef CPUX64} // activate and validate the available SSE2 + AVX branches
+  cpu := CPUIDX64;
+  CPUIDX64 := []; // default SSE2 128-bit process
+  Validate;
+  {$ifdef FPC} // Delphi doesn't support AVX asm
+  if cpuAvx in cpu then begin
+    CPUIDX64 := [cpuAvx]; // AVX 256-bit process
+    Validate;
+  end;
+  {$endif FPC}
+  CPUIDX64 := cpu; // there is no AVX2 move/fillchar (still 256-bit wide)
+  if (cpu<>[]) and (cpu<>[cpuAvx]) and (cpu<>[cpuAvx,cpuAvx2]) then
+  {$endif CPUX64}
+    Validate;
+end;
+{$endif CPUINTEL}
+
 procedure TTestLowLevelCommon.SystemCopyRecord;
 type TR = record
        One: integer;
@@ -3556,7 +3735,7 @@ begin
       v := i and 511;
       int.Unique(vs[i],pointer(SmallUInt32UTF8[v]),length(SmallUInt32UTF8[v]));
     end;
-    NotifyTestSpeed(Format('interning %s',[KB(INTSIZE)]),MAX,DIRSIZE,@timer);
+    NotifyTestSpeed('interning %',[KB(INTSIZE)],MAX,DIRSIZE,@timer);
     for i := 0 to MAX do
       check(UTF8ToInteger(vs[i])=i and 511);
     check(int.Count=512);
@@ -3577,7 +3756,7 @@ begin
     v := i and 511;
     FastSetString(vs[i],pointer(SmallUInt32UTF8[v]),length(SmallUInt32UTF8[v]));
   end;
-  NotifyTestSpeed(Format('direct %s',[KB(DIRSIZE)]),MAX,DIRSIZE,@timer);
+  NotifyTestSpeed('direct %',[KB(DIRSIZE)],MAX,DIRSIZE,@timer);
   for i := 0 to MAX do
     check(UTF8ToInteger(vs[i])=i and 511);
 end;
@@ -3707,7 +3886,6 @@ begin
   for i := 0 to High(crc) do
     with crc[i] do
       Check(hash(0,pointer(s),length(s))=crc);
-  Timer.ComputeTime;
   fRunConsole := format('%s %s %s/s',[fRunConsole,name,KB(Timer.PerSec(totallen))]);
 end;
 procedure test16(const text: RawUTF8; expected: cardinal);
@@ -4009,6 +4187,7 @@ var i, j, b, err: integer;
     q: QWord;
     s,s2: RawUTF8;
     d,e: double;
+    sd,se: single;
     {$ifndef DELPHI5OROLDER}
     c: currency;
     ident: TRawUTF8DynArray;
@@ -4328,6 +4507,23 @@ begin
     Check(not SameValue(e+1,d));
     u := DoubleToString(d);
     Check(Ansi7ToString(s)=u,u);
+    sd := d;
+    e := d;
+    Check(d=e);
+    Check(SortDynArrayDouble(d,d)=0);
+    Check(SortDynArrayDouble(d,e)=0);
+    se := sd;
+    Check(SortDynArraySingle(sd,sd)=0);
+    Check(SortDynArraySingle(sd,se)=0);
+    if d<0 then
+      e := e*0.9 else
+      e := e*1.1;
+    check(d<e);
+    Check(SortDynArrayDouble(d,e)=-1);
+    Check(SortDynArrayDouble(e,d)=1);
+    se := e;
+    Check(SortDynArraySingle(sd,se)=-1);
+    Check(SortDynArraySingle(se,sd)=1);
     PC := ToVarUInt32(juint,@varint);
     Check(PC<>nil);
     Check(PtrInt(PC)-PtrInt(@varint)=integer(ToVarUInt32Length(juint)));
@@ -4418,18 +4614,16 @@ begin
   end;
   exit; // code below is speed informative only, without any test
   Timer.Start;
-  RandSeed := 10;
   for i := 0 to 99999 do
-    SysUtils.IntToStr(Int64(7777)*Random(maxInt));
+    SysUtils.IntToStr(Int64(7777)*Random32gsl);
   fRunConsole := format('%s SysUtils.IntToStr %s %s/s',[fRunConsole,Timer.Stop,
     IntToThousandString(Timer.PerSec(100000))]);
   Timer.Start;
   RandSeed := 10;
   for i := 0 to 99999 do
-    StrInt64(@varint[31],Int64(7777)*Random(maxInt));
+    StrInt64(@varint[31],Int64(7777)*Random32gsl);
   fRunConsole := format('%s StrInt64 %s %s/s',[fRunConsole,Timer.Stop,
     IntToThousandString(Timer.PerSec(100000))]);
-  Randomize; // we fixed the RandSeed value above -> get true random now
 end;
 
 function LowerCaseReference(const S: RawByteString): RawByteString;
@@ -5686,6 +5880,8 @@ begin
     Check(UrlDecodeInteger(U,'WHERE=',V,@U));
     Check(U=nil);
   end;
+  s := '{"b":30,"a":"toto"}'; // temp read-only var for proper overload call 
+  CheckEqual(UrlEncodeJsonObject('',s,[]),'?b=30&a=toto');
 end;
 
 procedure TTestLowLevelCommon.MimeTypes;
@@ -5914,10 +6110,20 @@ begin
   try
     //obj.Hash.Capacity := MAX; // we will test hash size growing abilities
     Check(obj.Count=0);
-    for i := 1 to MAX do
-      obj.Add(pointer(Random(MaxInt)),added);
+    for i := 0 to MAX do begin
+      obj.Add(pointer(i),added);
+      check(added);
+    end;
     for i := 0 to obj.Count-1 do
       Check(obj.IndexOf(obj.List[i])=i);
+    for i := obj.Count-1 downto 0 do
+      if i and 255=0 then
+        obj.Delete(i); // will invalidate hash, but won't rehash now
+     CheckEqual(obj.IndexOf(TObject(255)),254);
+     CheckEqual(obj.IndexOf(TObject(256)),-1);
+     CheckEqual(obj.IndexOf(TObject(512)),-1);
+    for i := 0 to obj.Count-1 do
+      Check(obj.IndexOf(obj.List[i])=i); // will rehash after trigger=32
   finally
     obj.Free;
   end;
@@ -6556,7 +6762,7 @@ begin
   test.Check(Ansi=WinAnsiString(self.Test));
   test.Check(Unicode=WinAnsiToRawUnicode(Ansi));
   test.Check(ValFloat=i*2.5);
-  test.Check(ValWord=i+offset);
+  test.Check(ValWord=(i+offset) and $ffff);
   test.Check(ValDate=i+30000);
   if checkblob then
     test.Check(Data=self.Test);
@@ -10245,7 +10451,7 @@ var Model: TSQLModel;
     R: TSQLRecordTest;
     Batch: TSQLRestBatch;
     IDs: TIDDynArray;
-    i,j: integer;
+    i,j,n: integer;
     dummy: RawUTF8;
 {$ifndef NOVARIANTS}
 procedure CheckVariantWith(V: Variant; i: Integer; offset: integer=0);
@@ -10347,7 +10553,7 @@ begin
             R.CheckWith(self,i);
           end;
           for i := 1 to 19999 do begin
-            j := Random(9999)+1;
+            j := Random32(9999)+1;
             Check(R.FillRow(j));
             R.CheckWith(self,j);
           end;
@@ -10455,11 +10661,32 @@ begin
           R.Free;
         end;
         {$endif}
+        n := 20000;
+        R := TSQLRecordTest.create;
+        try
+          for i := 10100 to n do begin
+            R.FillWith(i);
+            Check(Server.AddWithBlobs(R,false)=i);
+          end;
+        finally
+          R.Free;
+        end;
+        CheckEqual(Server.TableRowCount(TSQLRecordTest),n);
+        for i := 1 to n do
+          if i and 511=0 then begin
+            Check(Server.Delete(TSQLRecordTest,i));
+            dec(n);
+          end;
+        CheckEqual(Server.TableRowCount(TSQLRecordTest),n);
+        for i := 1 to n do
+          Check(Server.MemberExists(TSQLRecordTest,i)=(i and 511<>0));
         R := TSQLRecordTest.CreateAndFillPrepare(Server,'','*');
         try
           i := 0;
           while R.FillOne do begin
             inc(i);
+            if i and 511=0 then
+              inc(i);
             if i=110 then
               R.CheckWith(self,i,10) else
             if (i=200) or (i=300) then begin
@@ -10471,7 +10698,7 @@ begin
             end else
               R.CheckWith(self,i);
           end;
-          Check(i=10099);
+          Check(i=20000);
         finally
           R.Free;
         end;
@@ -11162,12 +11389,10 @@ procedure TTestCompression._TAlgoCompress;
         s := RandomTextParagraph(i*8);
       timer.Start;
       t := algo.Compress(s);
-      timer.ComputeTime;
-      inc(timecomp, timer.LastTimeInMicroSec);
+      inc(timecomp, timer.StopInMicroSec);
       timer.Start;
       s2 := algo.Decompress(t,aclNoCrcFast);
-      timer.ComputeTime;
-      inc(timedecomp, timer.LastTimeInMicroSec);
+      inc(timedecomp, timer.StopInMicroSec);
       Check(s2=s, algo.ClassName);
       if (log<>'') and (s2<>s) then FileFromString(s2,'bigTest'+algo.ClassName+'.log');
       inc(plain, length(s));
@@ -11357,7 +11582,6 @@ begin
         Timer[noaesni].Resume;
         Check(SynCrypto.AES(Key,ks,SynCrypto.AES(Key,ks,st,true),false)=st);
         Timer[noaesni].Pause;
-        Timer[noaesni].ComputeTime;
         st := st+RandomString(4);
       end;
       PC := Pointer(orig);
@@ -11421,7 +11645,7 @@ begin
     {$else}
     if noaesni then begin
       fRunConsole := format('%s cypher 1..%d bytes with AES-NI: %s, without: %s',
-        [fRunConsole,length(st),Timer[false].Time,Timer[true].Time]);
+        [fRunConsole,length(st),Timer[false].Stop,Timer[true].Stop]);
       Include(CpuFeatures,cfAESNI); // revert Exclude() below from previous loop
     end;
     if A.UsesAESNI then
@@ -12033,7 +12257,7 @@ procedure TTestCryptographicRoutines._JWT;
         check(jwt.result=jwtValid);
         check(jwt.reg[jrcIssuer]='myself');
       end;
-      NotifyTestSpeed(string(JWT_TEXT[algo]),1000,0,@tim);
+      NotifyTestSpeed('%',[JWT_TEXT[algo]],1000,0,@tim);
     finally
       j.Free;
     end;
@@ -12185,9 +12409,7 @@ begin
         end;
         Check((b >= bRC4) or (dig.d0 <> 0) or (dig.d1 <> 0));
       end;
-      //NotifyTestSpeed(format('%s %s',[TXT[b],SIZ[s]]),COUNT,SIZ[s]*COUNT,@timer);
-      timer.ComputeTime;
-      inc(time[b],timer.LastTimeInMicroSec);
+      inc(time[b],NotifyTestSpeed('% %',[TXT[b],SIZ[s]],COUNT,SIZ[s]*COUNT,@timer,{onlylog=}true));
       //if b in [bSHA3_512,high(b)] then AddConsole('');
     end;
     inc(size,SIZ[s]*COUNT);
@@ -12891,7 +13113,7 @@ end;
 
 procedure TTestECCCryptography.ECDHEStreamProtocol;
 const MAX = 10000;
-var timer: TPrecisionTimer;
+var //timer: TPrecisionTimer;
     str: TRawByteStringDynArray;
   function Test(const prot: IProtocol; const name: string): integer;
   var i: integer;
@@ -12900,7 +13122,7 @@ var timer: TPrecisionTimer;
   begin
     ref := prot;
     result := 0;
-    timer.Start;
+    //timer.Start;
     for i := 0 to MAX do begin
       prot.Encrypt(str[i],enc);
       inc(result,length(str[i])+length(enc));
@@ -12908,7 +13130,6 @@ var timer: TPrecisionTimer;
       check(prot.Decrypt(enc,after)=sprSuccess);
       check(after=str[i]);
     end;
-    timer.ComputeTime;
     //fRunConsole := format('%s %s %s',[fRunConsole,name,KB(timer.PerSec(result))]);
   end;
 var key: THash256;
@@ -16064,6 +16285,8 @@ procedure TestVirtual(aClient: TSQLRestClient; DirectSQL: boolean; const Msg: st
 var n, i, ndx, added: integer;
     VD, VD2: TSQLRecordDali1;
     Rest: TSQLRest;
+    stor: TSQLRestStorageInMemoryExternal;
+    fn: TFileName;
 begin
   Client.Server.StaticVirtualTableDirect := DirectSQL;
   Check(Client.Server.ExecuteFmt('DROP TABLE %',[aClass.SQLTableName]));
@@ -16120,19 +16343,19 @@ begin
       Rest := Client.Server.StaticVirtualTable[aClass];
       if CheckFailed(Rest<>nil) then
         exit;
-      if TSQLRestStorageInMemoryExternal(Rest).FileName<>'' then begin
+      fn := TSQLRestStorageInMemoryExternal(Rest).FileName;
+      if fn<>'' then begin
         // no file content if ':memory' DB
         TSQLRestStorageInMemoryExternal(Rest).UpdateFile; // force update (COMMIT not always calls xCommit)
-        Rest := TSQLRestStorageInMemoryExternal.Create(aClass,nil,
-          TSQLRestStorageInMemoryExternal(Rest).FileName,
-          aClass=TSQLRecordDali2);
+        stor := TSQLRestStorageInMemoryExternal.Create(
+          aClass,nil,fn,{bin=}aClass=TSQLRecordDali2);
         try
-          Check(TSQLRestStorageInMemory(Rest).Count=n);
+          Check(stor.Count=n);
           for i := 1 to n do begin
-            ndx := TSQLRestStorageInMemory(Rest).IDToIndex(i);
+            ndx := stor.IDToIndex(i);
             if CheckFailed(ndx>=0) then
               continue;
-            VD2 := TSQLRestStorageInMemory(Rest).Items[ndx] as TSQLRecordDali1;
+            VD2 := stor.Items[ndx] as TSQLRecordDali1;
             if CheckFailed(VD2<>nil) then
               continue;
             Check(VD2.ID=i);
@@ -16141,7 +16364,7 @@ begin
             Check(VD2.YearOfDeath=1989+i);
           end;
         finally
-          Rest.Free;
+          stor.Free;
         end;
       end;
     except
@@ -17924,6 +18147,7 @@ begin
   fClient.Server.Services.ExpectMangledURI := true;
   Check(fClient.Server.Services[S.InterfaceMangledURI]=S);
   fClient.Server.Services.ExpectMangledURI := false;
+  Check(fClient.Server.Services['Calculator']=S);
   Check(fClient.Server.Services['CALCULAtor']=S);
   Check(fClient.Server.Services['CALCULAtors']=nil);
   if CheckFailed(length(S.InterfaceFactory.Methods)=13) then exit;
@@ -19816,11 +20040,6 @@ begin
   finally
     proxy.Free;
   end;
-end;
-
-procedure TTestProtocols.SynRelay;
-begin
-
 end;
 
 

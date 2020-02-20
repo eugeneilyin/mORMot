@@ -37,6 +37,7 @@ unit SynCrtSock;
   - Eugene Ilyin
   - EvaF
   - f-vicente
+  - macc2010
   - Maciej Izak (hnb)
   - Marius Maximus
   - Mr Yang (ysair)
@@ -6249,7 +6250,7 @@ begin
   Terminate; // set Terminated := true for THttpServerResp.Execute
   if fThreadPool<>nil then
     fThreadPool.fTerminated := true; // notify background process
-  if not fExecuteFinished then begin
+  if not fExecuteFinished and (Sock<>nil) then begin
     Sock.Close; // shutdown the socket to unlock Accept() in Execute
     DirectShutdown(CallServer('127.0.0.1',Sock.Port,false,cslTCP,1));
   end;
@@ -6273,7 +6274,7 @@ begin
   LeaveCriticalSection(fProcessCS);
   FreeAndNil(fThreadPool); // release all associated threads and I/O completion
   FreeAndNil(fSock);
-  inherited Destroy;     // direct Thread abort, no wait till ended
+  inherited Destroy;       // direct Thread abort, no wait till ended
   DeleteCriticalSection(fProcessCS);
 end;
 
@@ -9211,8 +9212,8 @@ begin
           continue;
         end;
         if Assigned(OnBeforeBody) then begin
-          with Context do
-            Err := OnBeforeBody(URL,Method,InHeaders,InContentType,RemoteIP,InContentLength,fUseSSL);
+          Err := OnBeforeBody(Context.URL,Context.Method,Context.InHeaders,
+            Context.InContentType,RemoteIP,InContentLength,Context.fUseSSL);
           if Err<>STATUS_SUCCESS then begin
             SendError(Err,'Rejected');
             continue;

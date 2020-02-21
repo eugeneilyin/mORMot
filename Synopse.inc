@@ -296,7 +296,7 @@
     {$define LINUX} // not true, but a POSIX/BSD system - see LINUXNOTBSD
     {$ifdef DARWIN}
       {$define FPCSQLITE3STATIC} // we supply Darwin static libs
-      {$ifdef CPUX86}
+      {$ifdef CPUINTEL}
         {$define FPC_PIC} // may have not be defined by the compiler options
       {$endif}
       {$undef FORCE_STRSSE42}  // fails otherwise for sure
@@ -314,6 +314,9 @@
   {$ifdef LINUX}
      {$undef FORCE_STRSSE42}  // avoid fatal SIGABRT/SIGSEGV on POSIX systems
      {$define FPCLINUX}
+     {$ifdef CPUX64}
+       {$define CPUX64LINUX}  // e.g. for tuned server-side asm
+     {$endif CPUX64}
   {$endif}
   {$ifdef FPC_PIC}
     {$define PUREPASCAL} // most asm code is not PIC-safe with global constants
@@ -325,7 +328,9 @@
     {$ifdef CPUX64}
       {$define CPUINTEL}
       {$define FPC_CPUINTEL}
-      {$define CPUX64ASM} // Delphi XE4 SSE asm is buggy :(
+      {$ifndef DARWIN}
+        {$define CPUX64ASM} // Delphi XE4 SSE asm is buggy :(
+      {$endif DARWIN}
       {$define FPC_X64}   // supports AVX/AVX2/AVX512 - which Delphi doesn't
       {$ASMMODE INTEL}    // to share asm code with Delphi
     {$endif CPUX64}

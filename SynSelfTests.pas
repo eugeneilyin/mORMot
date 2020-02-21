@@ -1545,10 +1545,12 @@ begin
   TestPopCnt('pas');
   GetBitsCountPtrInt := @GetBitsCountPas; // x86/x86_64 assembly
   TestPopCnt('asm');
+  {$ifndef ABSOLUTEPASCAL}
   if cfPOPCNT in CpuFeatures then begin
     GetBitsCountPtrInt := @GetBitsCountSSE42;
     TestPopCnt('sse4.2');
   end;
+  {$endif ABSOLUTEPASCAL}
   {$else}
   TestPopCnt('pas');
   {$endif CPUINTEL}
@@ -1883,14 +1885,14 @@ end;
 
 procedure TTestLowLevelCommon._TRawUTF8List;
 const MAX=20000;
-var i: integer;
+var i,n: integer;
     L: TRawUTF8List;
     C: TComponent;
     Rec: TSynFilterOrValidate;
     s: RawUTF8;
 begin
-  L := TRawUTF8List.Create(true);
-  try
+  L := TRawUTF8List.Create([fObjectsOwned]);
+  try // no hash table involved
     for i := 0 to MAX do begin
       C := TComponent.Create(nil);
       C.Tag := i;
@@ -1901,37 +1903,53 @@ begin
       Check(GetInteger(Pointer(L[i]))=i);
     for i := 0 to MAX do
       Check(TComponent(L.Objects[i]).Tag=i);
+    Check(L.IndexOf('')<0);
+    Check(L.IndexOf('5')=5);
+    Check(L.IndexOf('999')=999);
     for i := MAX downto 0 do
       if i and 1=0 then
-        L.Delete(i);
+        L.Delete(i); // delete half the array
     Check(L.Count=MAX div 2);
     for i := 0 to L.Count-1 do
       Check(GetInteger(Pointer(L[i]))=TComponent(L.Objects[i]).Tag);
+    Check(L.IndexOf('5')=2);
+    Check(L.IndexOf('6')<0);
   finally
     L.Free;
   end;
-  L := TRawUTF8ListHashed.Create(true);
-  try
+  L := TRawUTF8List.Create([fObjectsOwned,fNoDuplicate,fCaseSensitive]);
+  try // with hash table
     for i := 1 to MAX do begin
      Rec := TSynFilterOrValidate.create;
      Rec.Parameters := Int32ToUTF8(i);
-     L.AddObjectIfNotExisting(Rec.Parameters,Rec);
+     Check(L.AddObject(Rec.Parameters,Rec)=i-1);
+     Check(L.IndexOf(Rec.Parameters)=i-1);
     end;
     Check(L.IndexOf('')<0);
     Check(L.IndexOf('abcd')<0);
+    Check(L.Count=MAX);
+    n := 0;
     for i := 1 to MAX do begin
       UInt32ToUTF8(i,s);
-      Check(L.IndexOf(s)=i-1);
-      Check(TSynFilterOrValidate(L.Objects[i-1]).Parameters=s);
+      Check(L.IndexOf(s)=n);
+      Check(TSynFilterOrValidate(L.Objects[n]).Parameters=s);
+      if i and 127=0 then
+        Check(L.Delete(s)=n) else
+        inc(n);
+    end;
+    Check(L.Count=n);
+    for i := 1 to MAX do begin
+      UInt32ToUTF8(i,s);
+      Check((L.IndexOf(s)>=0)=(i and 127<>0));
     end;
     L.SaveToFile('utf8list.txt');
     L.Clear;
     Check(L.Count=0);
     L.LoadFromFile('utf8list.txt');
-    Check(L.Count=MAX);
+    Check(L.Count=n);
     for i := 1 to MAX do begin
       UInt32ToUTF8(i,s);
-      Check(L.IndexOf(s)=i-1);
+      Check((L.IndexOf(s)>=0)=(i and 127<>0));
     end;
     DeleteFile('utf8list.txt');
   finally
@@ -2928,6 +2946,12 @@ begin
   result := true;
 end;
 
+{$ifndef ABSOLUTEPASCAL}
+{$ifdef CPUX64} // will define its own self-dispatched SSE2/AVX functions
+  {$define HASCPUIDX64}
+{$endif}
+{$endif}
+
 procedure TTestLowLevelCommon.CustomRTL;
 // note: FPC uses the RTL for FillCharFast/MoveFast
 var buf: RawByteString;
@@ -2937,6 +2961,7 @@ var buf: RawByteString;
        timer: TPrecisionTimer;
        P: PByteArray;
        msg: string;
+       cpu: RawUTF8;
        elapsed: Int64;
    begin
      // first validate FillCharFast
@@ -2972,22 +2997,17 @@ var buf: RawByteString;
          inc(len,777+len shr 4);
      until len>=length(buf);
      timer.Stop;
+     {$ifdef HASCPUIDX64}
+     cpu := GetSetName(TypeInfo(TX64CpuFeatures),CPUIDX64);
+     {$endif}
      if rtl then
        msg := 'FillChar' else
-       {$ifdef CPUX64}
-       FormatString('FillCharFast [%]',[GetSetName(TypeInfo(TX64CpuFeatures),CPUIDX64)],msg);
-       {$else}
-       msg := 'FillCharFast';
-       {$endif}
+       FormatString('FillCharFast [%]',[cpu],msg);
      NotifyTestSpeed(msg,1,filled,@timer);
      // validates overlapping forward Move/MoveFast
      if rtl then
        msg := 'Move' else
-       {$ifdef CPUX64}
-       FormatString('MoveFast [%]',[GetSetName(TypeInfo(TX64CpuFeatures),CPUIDX64)],msg);
-       {$else}
-       msg := 'MoveFast';
-       {$endif}
+       FormatString('MoveFast [%]',[cpu],msg);
      P := pointer(buf);
      for i := 0 to length(buf)-1 do
        P[i] := i; // fills with 0,1,2,...
@@ -3051,11 +3071,11 @@ var buf: RawByteString;
        end;
      checkEqual(Hash32(buf),1646145792);
    end;
-{$ifdef CPUX64} var cpu: TX64CpuFeatures; {$endif}
+{$ifdef HASCPUIDX64} var cpu: TX64CpuFeatures; {$endif}
 begin
   SetLength(buf,16 shl 20); // 16MB
   Validate({rtl=}true);
-  {$ifdef CPUX64} // activate and validate the available SSE2 + AVX branches
+  {$ifdef HASCPUIDX64} // activate and validate SSE2 + AVX branches
   cpu := CPUIDX64;
   CPUIDX64 := []; // default SSE2 128-bit process
   Validate;
@@ -3067,7 +3087,7 @@ begin
   {$endif FPC}
   CPUIDX64 := cpu; // there is no AVX2 move/fillchar (still 256-bit wide)
   if (cpu<>[]) and (cpu<>[cpuAvx]) and (cpu<>[cpuAvx,cpuAvx2]) then
-  {$endif CPUX64}
+  {$endif HASCPUIDX64}
     Validate;
 end;
 {$endif CPUINTEL}
@@ -3789,6 +3809,29 @@ begin
   result := not result;
 end;
 
+function Hash32Reference(Data: PCardinal; Len: integer): cardinal;
+var s1,s2: cardinal;
+    i: integer;
+begin
+  if Data<>nil then begin
+    s1 := 0;
+    s2 := 0;
+    for i := 1 to Len shr 2 do begin // 4 bytes (DWORD) by loop
+      inc(s1,Data^);
+      inc(s2,s1);
+      inc(Data);
+    end;
+    case Len and 3 of // remaining 0..3 bytes
+    1: inc(s1,PByte(Data)^);
+    2: inc(s1,PWord(Data)^);
+    3: inc(s1,PWord(Data)^ or (PByteArray(Data)^[2] shl 16));
+    end;
+    inc(s2,s1);
+    result := s1 xor (s2 shl 16);
+  end else
+    result := 0;
+end;
+
 {$ifndef FPC} // RolDWord is an intrinsic function under FPC :)
 function RolDWord(value: cardinal; count: integer): cardinal;
   {$ifdef HASINLINE}inline;{$endif}
@@ -4402,6 +4445,7 @@ begin
   for i := 0 to 10000 do begin
     j := i shr 6; // circumvent weird FPC code generation bug in -O2 mode
     s := RandomString(j);
+    Check(hash32(s)=Hash32Reference(pointer(s),length(s)));
     Check(kr32(0,pointer(s),length(s))=kr32reference(pointer(s),length(s)));
     Check(fnv32(0,pointer(s),length(s))=fnv32reference(0,pointer(s),length(s)));
     crc := crc32creference(0,pointer(s),length(s));
@@ -12137,7 +12181,7 @@ begin
   Check(clo+chi=2000);
   Check(dlo+dhi=4000);
   Check(elo+ehi=4000);
-  CheckUTF8((clo>=950) and (clo<=1050),'Random32 distribution clo=%',[clo]);
+  CheckUTF8((clo>=945) and (clo<=1055),'Random32 distribution clo=%',[clo]);
   CheckUTF8((dlo>=1900) and (dlo<=2100),'RandomDouble distribution dlo=%',[dlo]);
   CheckUTF8((elo>=1900) and (elo<=2100),'RandomExt distribution elo=%',[elo]);
   s1 := TAESPRNG.Main.FillRandom(100);

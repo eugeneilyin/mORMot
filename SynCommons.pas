@@ -2294,11 +2294,11 @@ function strspnsse42(s,accept: pointer): integer;
 // - could be used instead of strcspn() when you are confident about your
 // s/reject input buffers, checking if cfSSE42 in CpuFeatures
 function strcspnsse42(s,reject: pointer): integer;
-{$endif ABSOLUTEPASCAL}
 
 /// SSE 4.2 version of GetBitsCountPtrInt()
 // - defined just for regression tests - call GetBitsCountPtrInt() instead
 function GetBitsCountSSE42(value: PtrInt): PtrInt;
+{$endif ABSOLUTEPASCAL}
 {$endif CPUINTEL}
 
 /// use our fast version of StrIComp(), to be used with PUTF8Char/PAnsiChar
@@ -2318,27 +2318,37 @@ function StrLenPas(S: pointer): PtrInt;
 // files - call explicitely StrLenSSE42() if you are confident on your input
 var StrLen: function(S: pointer): PtrInt = StrLenPas;
 
+{$ifdef ABSOLUTEPASCAL}
+var FillcharFast: procedure(var Dest; count: PtrInt; Value: byte) = FillChar;
+var MoveFast: procedure(const Source; var Dest; Count: PtrInt) = Move;
+{$else}
+{$ifdef CPUX64} // will define its own self-dispatched SSE2/AVX functions
+type
+  /// cpuERMS is slightly slower than cpuAVX so is not available by default
+  TX64CpuFeatures = set of(cpuAVX, cpuAVX2 {$ifdef WITH_ERMS}, cpuERMS{$endif});
+var
+  /// internal flags used by FillCharFast - easier from asm that CpuFeatures
+  CPUIDX64: TX64CpuFeatures;
+procedure FillcharFast(var dst; cnt: PtrInt; value: byte);
+procedure MoveFast(const src; var dst; cnt: PtrInt);
+{$else}
+
 /// our fast version of FillChar()
 // - on Intel i386/x86_64, will use fast SSE2/ERMS instructions (if available),
 // or optimized X87 assembly implementation for older CPUs
 // - on non-Intel CPUs, it will fallback to the default RTL FillChar()
 // - note: Delphi x86_64 is far from efficient: even ERMS was wrongly
 // introduced in latest updates
-{$ifdef CPUX64}
-procedure FillcharFast(var dst; cnt: PtrInt; value: byte);
-{$else}
 var FillcharFast: procedure(var Dest; count: PtrInt; Value: byte);
-{$endif CPUX64}
 
 /// our fast version of move()
 // - on Delphi Intel i386/x86_64, will use fast SSE2 instructions (if available),
 // or optimized X87 assembly implementation for older CPUs
 // - on non-Intel CPUs, it will fallback to the default RTL Move()
-{$ifdef CPUX64}
-procedure MoveFast(const src; var dst; cnt: PtrInt);
-{$else}
 var MoveFast: procedure(const Source; var Dest; Count: PtrInt);
+
 {$endif CPUX64}
+{$endif ABSOLUTEPASCAL}
 
 /// an alternative Move() function tuned for small unaligned counts
 // - warning: expects Count>0 and Source/Dest not nil
@@ -2537,15 +2547,17 @@ function UrlEncode(const NameValuePairs: array of const): RawUTF8; overload;
 
 /// encode a JSON object UTF-8 buffer into URI parameters
 // - you can specify property names to ignore during the object decoding
+// - you can omit the leading query delimiter ('?') by setting IncludeQueryDelimiter=false
 // - warning: the ParametersJSON input buffer will be modified in-place
 function UrlEncodeJsonObject(const URIName: RawUTF8; ParametersJSON: PUTF8Char;
-  const PropNamesToIgnore: array of RawUTF8): RawUTF8; overload;
+  const PropNamesToIgnore: array of RawUTF8; IncludeQueryDelimiter: Boolean=true): RawUTF8; overload;
 
 /// encode a JSON object UTF-8 buffer into URI parameters
 // - you can specify property names to ignore during the object decoding
+// - you can omit the leading query delimiter ('?') by setting IncludeQueryDelimiter=false
 // - overloaded function which will make a copy of the input JSON before parsing
 function UrlEncodeJsonObject(const URIName, ParametersJSON: RawUTF8;
-  const PropNamesToIgnore: array of RawUTF8): RawUTF8; overload;
+  const PropNamesToIgnore: array of RawUTF8; IncludeQueryDelimiter: Boolean=true): RawUTF8; overload;
 
 /// decode a string compatible with URI encoding into its original value
 // - you can specify the decoding range (as in copy(s,i,len) function)
@@ -3447,18 +3459,26 @@ function IsRawUTF8DynArray(typeinfo: pointer): boolean;
 /// append one or several values to a local "array of const" variable
 procedure AddArrayOfConst(var Dest: TTVarRecDynArray; const Values: array of const);
 
+/// low-level efficient search of Value in Values[]
+// - CaseSensitive=false will use StrICmp() for A..Z / a..z equivalence
+function FindRawUTF8(Values: PRawUTF8; const Value: RawUTF8; ValuesCount: integer;
+  CaseSensitive: boolean): integer; overload;
+
 /// return the index of Value in Values[], -1 if not found
+// - CaseSensitive=false will use StrICmp() for A..Z / a..z equivalence
 function FindRawUTF8(const Values: TRawUTF8DynArray; const Value: RawUTF8;
   CaseSensitive: boolean=true): integer; overload;
+  {$ifdef HASINLINE}inline;{$endif}
 
 /// return the index of Value in Values[], -1 if not found
-// - can optionally call IdemPropNameU() for property matching
-function FindRawUTF8(const Values: TRawUTF8DynArray; ValuesCount: integer;
-  const Value: RawUTF8; SearchPropName: boolean): integer; overload;
-
-/// return the index of Value in Values[], -1 if not found
+// - CaseSensitive=false will use StrICmp() for A..Z / a..z equivalence
 function FindRawUTF8(const Values: array of RawUTF8; const Value: RawUTF8;
   CaseSensitive: boolean=true): integer; overload;
+
+/// return the index of Value in Values[], -1 if not found
+// - SearchPropName will optionally use IdemPropNameU() for property matching
+function FindRawUTF8(const Values: TRawUTF8DynArray; ValuesCount: integer;
+  const Value: RawUTF8; SearchPropName: boolean): integer; overload;
 
 /// return the index of Value in Values[], -1 if not found
 // - here name search would use fast IdemPropNameU() function
@@ -5849,10 +5869,12 @@ type
     FindCollisions: cardinal;
     {$endif}
     /// initialize the hash table for a given dynamic array storage
+    // - you can call this method several times, e.g. if aCaseInsensitive changed
     procedure Init(aDynArray: PDynArray; aHashElement: TDynArrayHashOne;
      aEventHash: TEventDynArrayHashOne; aHasher: THasher; aCompare: TDynArraySortCompare;
      aEventCompare: TEventDynArraySortCompare; aCaseInsensitive: boolean);
     /// initialize a known hash table for a given dynamic array storage
+    // - you can call this method several times, e.g. if aCaseInsensitive changed
     procedure InitSpecific(aDynArray: PDynArray; aKind: TDynArrayKind; aCaseInsensitive: boolean);
     /// allow custom hashing via a method event
     procedure SetEventHash(const event: TEventDynArrayHashOne);
@@ -6026,8 +6048,11 @@ type
     // - use internaly FindHashedForAdding method
     // - this version will set the field content with the unique value
     // - returns a pointer to the newly added element (to set other fields)
-    function AddUniqueName(const aName: RawUTF8;
-      const ExceptionMsg: RawUTF8; const ExceptionArgs: array of const): pointer;
+    function AddUniqueName(const aName: RawUTF8; const ExceptionMsg: RawUTF8;
+      const ExceptionArgs: array of const; aNewIndex: PInteger=nil): pointer; overload;
+    /// ensure a given element name is unique, then add it to the array
+    // - just a wrapper to AddUniqueName(aName,'',[],aNewIndex)
+    function AddUniqueName(const aName: RawUTF8; aNewIndex: PInteger=nil): pointer; overload;
     /// search for a given element name, make it unique, and add it to the array
     // - expected element layout is to have a RawUTF8 field at first position
     // - the aName is searched (using hashing) to be unique, and if not the case,
@@ -6093,6 +6118,7 @@ type
     // manual Scan() is called 64 times
     property HashCountTrigger: integer read fHash.CountTrigger write fHash.CountTrigger;
     /// access to the internal hash table
+    // - you can call e.g. Hasher.Clear to invalidate the whole hash table
     property Hasher: TDynArrayHasher read fHash;
   end;
 
@@ -7629,6 +7655,7 @@ function HashPointer(const Elem; Hasher: THasher): cardinal;
 var
   /// helper array to get the comparison function corresponding to a given
   // standard array type
+  // - e.g. as DYNARRAY_SORTFIRSTFIELD[CaseInSensitive,djRawUTF8]
   // - not to be used as such, but e.g. when inlining TDynArray methods
   DYNARRAY_SORTFIRSTFIELD: array[boolean,TDynArrayKind] of TDynArraySortCompare = (
     (nil, SortDynArrayBoolean, SortDynArrayByte, SortDynArrayWord,
@@ -7652,6 +7679,7 @@ var
 
   /// helper array to get the hashing function corresponding to a given
   // standard array type
+  // - e.g. as DYNARRAY_HASHFIRSTFIELD[CaseInSensitive,djRawUTF8]
   // - not to be used as such, but e.g. when inlining TDynArray methods
   DYNARRAY_HASHFIRSTFIELD: array[boolean,TDynArrayKind] of TDynArrayHashOne = (
     (nil, HashByte, HashByte, HashWord, HashInteger,
@@ -9411,315 +9439,236 @@ type
     property Safe: TSynLocker read fSafe;
   end;
 
+  /// possible values used by TRawUTF8List.Flags
+  TRawUTF8ListFlags = set of (
+    fObjectsOwned, fCaseSensitive, fNoDuplicate, fOnChangeTrigerred);
+
   /// TStringList-class optimized to work with our native UTF-8 string type
-  // - cross-compiler, from Delphi 6 and up, i.e is Unicode Ready for all
+  // - can optionally store associated some TObject instances
+  // - high-level methods of this class are thread-safe
+  // - if aNoDuplicate is defined, an internal hash table will perform IndexOf()
+  // in O(1) linear way
   TRawUTF8List = class
   protected
     fCount: PtrInt;
-    fList: TRawUTF8DynArray;
+    fValue: TRawUTF8DynArray;
+    fValues: TDynArrayHashed;
     fObjects: TObjectDynArray;
-    fObjectsOwned: boolean;
+    fFlags: TRawUTF8ListFlags;
     fNameValueSep: AnsiChar;
-    fCaseSensitive: boolean;
-    fOnChange, fOnChangeHidden: TNotifyEvent;
-    fOnChangeTrigerred: boolean;
-    fOnChangeLevel: PtrInt;
-    procedure Changed; virtual;
-    procedure OnChangeHidden(Sender: TObject);
-    procedure SetCapacity(const Value: PtrInt);
-    function GetCapacity: PtrInt;
-    procedure Put(Index: PtrInt; const Value: RawUTF8);
+    fOnChange, fOnChangeBackupForBeginUpdate: TNotifyEvent;
+    fOnChangeLevel: integer;
+    fSafe: TSynLocker;
     function GetCount: PtrInt; {$ifdef HASINLINE}inline;{$endif}
-    procedure PutObject(Index: PtrInt; const Value: TObject);
+    procedure SetCapacity(const capa: PtrInt);
+    function GetCapacity: PtrInt;
+    function Get(Index: PtrInt): RawUTF8; {$ifdef HASINLINE}inline;{$endif}
+    procedure Put(Index: PtrInt; const Value: RawUTF8);
+    function GetObject(Index: PtrInt): pointer; {$ifdef HASINLINE}inline;{$endif}
+    procedure PutObject(Index: PtrInt; Value: pointer);
     function GetName(Index: PtrInt): RawUTF8;
     function GetValue(const Name: RawUTF8): RawUTF8;
     procedure SetValue(const Name, Value: RawUTF8);
     function GetTextCRLF: RawUTF8;
     procedure SetTextCRLF(const Value: RawUTF8);
     procedure SetTextPtr(P,PEnd: PUTF8Char; const Delimiter: RawUTF8);
-    function GetListPtr: PPUtf8CharArray;
+    function GetTextPtr: PPUtf8CharArray; {$ifdef HASINLINE}inline;{$endif}
+    function GetNoDuplicate: boolean;     {$ifdef HASINLINE}inline;{$endif}
     function GetObjectPtr: PPointerArray; {$ifdef HASINLINE}inline;{$endif}
+    function GetCaseSensitive: boolean;   {$ifdef HASINLINE}inline;{$endif}
     procedure SetCaseSensitive(Value: boolean); virtual;
+    procedure Changed; virtual;
+    procedure InternalDelete(Index: PtrInt);
+    procedure OnChangeHidden(Sender: TObject);
   public
-    /// initialize the class instance
-    // - by default, any associated Objects[] are just weak references
-    // - also define CaseSensitive=true
-    // - you may supply aOwnObjects=true to force object instance management
-    constructor Create(aOwnObjects: boolean=false);
+    /// initialize the RawUTF8/Objects storage
+    // - by default, any associated Objects[] are just weak references;
+    // you may supply fOwnObjects flag to force object instance management
+    // - if you want the stored text items to be unique, set fNoDuplicate
+    // and then an internal hash table will be maintained for fast IndexOf()
+    // - you can unset fCaseSensitive to let the UTF-8 lookup be case-insensitive
+    constructor Create(aFlags: TRawUTF8ListFlags=[fCaseSensitive]); overload;
+    /// backward compatiliby overloaded constructor
+    constructor Create(aOwnObjects: boolean; aNoDuplicate: boolean=false;
+      aCaseSensitive: boolean=true); overload;
     /// finalize the internal objects stored
     // - if instance was created with aOwnObjects=true
     destructor Destroy; override;
-    /// get a stored RawUTF8 item
-    // - returns '' and raise no exception in case of out of range supplied index
-    function Get(Index: PtrInt): RawUTF8; {$ifdef HASINLINE}inline;{$endif}
-    /// get a stored Object item by index
-    // - returns nil and raise no exception in case of out of range supplied index
-    function GetObject(Index: PtrInt): TObject; {$ifdef HASINLINE}inline;{$endif}
-    /// get a stored Object item by name
-    // - returns nil and raise no exception in case of out of range supplied index
-    function GetObjectByName(const Name: RawUTF8): TObject;
+    /// get a stored Object item by its associated UTF-8 text
+    // - returns nil and raise no exception if aText doesn't exist
+    // - thread-safe method, unless returned TObject is deleted in the background
+    function GetObjectFrom(const aText: RawUTF8): pointer;
     /// store a new RawUTF8 item
-    // - returns -1 and raise no exception in case of self=nil
-    function Add(const aText: RawUTF8): PtrInt; {$ifdef HASINLINE}inline;{$endif}
-    /// store a new RawUTF8 item if not already in the list
-    // - returns -1 and raise no exception in case of self=nil
-    function AddIfNotExisting(const aText: RawUTF8; wasAdded: PBoolean=nil): PtrInt; virtual;
+    // - NoDuplicate=false always add the supplied value
+    // - if NoDuplicate=true and aText already exists, returns -1 unless
+    // aRaiseExceptionIfExisting is forced
+    // - thread-safe method, using an internal Hash Table to speedup IndexOf()
+    function Add(const aText: RawUTF8; aRaiseExceptionIfExisting: boolean=false): PtrInt; {$ifdef HASINLINE}inline;{$endif}
     /// store a new RawUTF8 item, and its associated TObject
-    // - returns -1 and raise no exception in case of self=nil
-    function AddObject(const aText: RawUTF8; aObject: TObject): PtrInt;
-    /// store a new RawUTF8 item if not already in the list, and its associated TObject
-    // - returns -1 and raise no exception in case of self=nil
-    function AddObjectIfNotExisting(const aText: RawUTF8; aObject: TObject;
-      wasAdded: PBoolean=nil): PtrInt; virtual;
+    // - NoDuplicate=false always add the supplied values
+    // - if NoDuplicate=true and aText already exists, returns -1 unless
+    // aRaiseExceptionIfExisting is forced - optionally freeing the supplied
+    // aObject if aFreeAndReturnExistingObject is set, in which the existing
+    // Objects[] is copied (see AddObjectUnique as a convenient wrapper around
+    // this behavior)
+    // - thread-safe method, using an internal Hash Table to speedup IndexOf()
+    function AddObject(const aText: RawUTF8; aObject: TObject;
+      aRaiseExceptionIfExisting: boolean=false; aFreeAndReturnExistingObject: PPointer=nil): PtrInt;
+    /// try to store a new RawUTF8 item and its associated TObject
+    // - if aText doesn't exist, will add the values
+    // - if aText exist, will call aObjectToAddOrFree.Free and set the value
+    // already stored in Objects[] into aObjectToAddOrFree - allowing dual
+    // commit thread-safe update of the list, e.g. after a previous unsuccessful
+    // call to GetObjectFrom(aText)
+    // - thread-safe method, using an internal Hash Table to speedup IndexOf()
+    // - in fact, this method is just a wrapper around
+    // ! AddObject(aText,aObjectToAddOrFree^,false,@aObjectToAddOrFree);
+    procedure AddObjectUnique(const aText: RawUTF8; aObjectToAddOrFree: PPointer);
+      {$ifdef HASINLINE}inline;{$endif}
     /// append a specified list to the current content
+    // - thread-safe method
     procedure AddRawUTF8List(List: TRawUTF8List);
     /// delete a stored RawUTF8 item, and its associated TObject
     // - raise no exception in case of out of range supplied index
-    procedure Delete(Index: PtrInt); overload; virtual;
+    // - this method is not thread-safe: use Safe.Lock/UnLock if needed
+    procedure Delete(Index: PtrInt); overload;
     /// delete a stored RawUTF8 item, and its associated TObject
     // - will search for the value using IndexOf(aText), and returns its index
     // - returns -1 if no entry was found and deleted
-    function Delete(const aText: RawUTF8): PtrInt; overload; virtual;
+    // - thread-safe method, using an internal Hash Table to speedup IndexOf()
+    function Delete(const aText: RawUTF8): PtrInt; overload;
     /// delete a stored RawUTF8 item, and its associated TObject, from
     // a given Name when stored as 'Name=Value' pairs
     // - raise no exception in case of out of range supplied index
+    // - thread-safe method, but not using the internal Hash Table
+    // - consider using TSynNameValue if you expect faster access
     function DeleteFromName(const Name: RawUTF8): PtrInt; virtual;
-    /// update Value from an existing Name=Value, then optinally delete the entry
-    procedure UpdateValue(const Name: RawUTF8; var Value: RawUTF8; ThenDelete: boolean);
+    /// find the index of a given Name when stored as 'Name=Value' pairs
+    // - search on Name is case-insensitive with 'Name=Value' pairs
+    // - this method is not thread-safe, and won't use the internal Hash Table
+    // - consider using TSynNameValue if you expect faster access
+    function IndexOfName(const Name: RawUTF8): PtrInt;
+    /// access to the Value of a given 'Name=Value' pair at a given position
+    // - this method is not thread-safe
+    // - consider using TSynNameValue if you expect faster access
+    function GetValueAt(Index: PtrInt): RawUTF8;
+    /// retrieve Value from an existing Name=Value, then optinally delete the entry
+    // - if Name is found, will fill Value with the stored content and return true
+    // - if Name is not found, Value is not modified, and false is returned
+    // - thread-safe method, but not using the internal Hash Table
+    // - consider using TSynNameValue if you expect faster access
+    function UpdateValue(const Name: RawUTF8; var Value: RawUTF8; ThenDelete: boolean): boolean;
     /// retrieve and delete the first RawUTF8 item in the list
     // - could be used as a FIFO
-    function PopFirst(out aText: RawUTF8; aObject: PObject=nil): boolean; virtual;
+    // - thread-safe method
+    function PopFirst(out aText: RawUTF8; aObject: PObject=nil): boolean;
     /// retrieve and delete the last RawUTF8 item in the list
     // - could be used as a FILO
-    function PopLast(out aText: RawUTF8; aObject: PObject=nil): boolean; virtual;
+    // - thread-safe method
+    function PopLast(out aText: RawUTF8; aObject: PObject=nil): boolean;
     /// erase all stored RawUTF8 items
     // - and corresponding objects (if aOwnObjects was true at constructor)
+    // - thread-safe method, also clearing the internal Hash Table
     procedure Clear; virtual;
     /// find a RawUTF8 item in the stored Strings[] list
     // - this search is case sensitive if CaseSensitive property is TRUE (which
     // is the default)
-    function IndexOf(const aText: RawUTF8): PtrInt; virtual;
-    /// find the index of a given Name when stored as 'Name=Value' pairs
-    // - search on Name is case-insensitive with 'Name=Value' pairs
-    function IndexOfName(const Name: RawUTF8): PtrInt;
+    // - this method is not thread-safe, but uses the internal Hash Table
+    function IndexOf(const aText: RawUTF8): PtrInt;
     /// find a TObject item index in the stored Objects[] list
+    // - this method is not thread-safe, and won't use the internal Hash Table
     function IndexOfObject(aObject: TObject): PtrInt;
     /// search for any RawUTF8 item containing some text
     // - uses PosEx() on the stored lines
+    // - this method is thread-safe, and won't use the internal Hash Table
     function Contains(const aText: RawUTF8; aFirstIndex: integer=0): PtrInt;
-    /// access to the Value of a given 'Name=Value' pair
-    function GetValueAt(Index: PtrInt): RawUTF8;
     /// retrieve the all lines, separated by the supplied delimiter
+    // - this method is thread-safe
     function GetText(const Delimiter: RawUTF8=#13#10): RawUTF8;
     /// the OnChange event will be raised only when EndUpdate will be called
+    // - this method will also call Safe.Lock for thread-safety
     procedure BeginUpdate;
     /// call the OnChange event if changes occured
+    // - this method will also call Safe.UnLock for thread-safety
     procedure EndUpdate;
     /// set all lines, separated by the supplied delimiter
+    // - this method is thread-safe
     procedure SetText(const aText: RawUTF8; const Delimiter: RawUTF8=#13#10);
     /// set all lines from an UTF-8 text file
     // - expect the file is explicitly an UTF-8 file
     // - will ignore any trailing UTF-8 BOM in the file content, but will not
     // expect one either
+    // - this method is thread-safe
     procedure LoadFromFile(const FileName: TFileName);
     /// write all lines into the supplied stream
+    // - this method is thread-safe
     procedure SaveToStream(Dest: TStream; const Delimiter: RawUTF8=#13#10);
     /// write all lines into a new file
+    // - this method is thread-safe
     procedure SaveToFile(const FileName: TFileName; const Delimiter: RawUTF8=#13#10);
     /// return the count of stored RawUTF8
+    // - reading this property is not thread-safe, since size may change
     property Count: PtrInt read GetCount;
-    /// set or retrive the current memory capacity of the RawUTF8 list
+    /// set or retrivee the current memory capacity of the RawUTF8 list
+    // - reading this property is not thread-safe, since size may change
     property Capacity: PtrInt read GetCapacity write SetCapacity;
+    /// set if IndexOf() shall be case sensitive or not
+    // - default is TRUE
+    // - matches fCaseSensitive in Flags
+    property CaseSensitive: boolean read GetCaseSensitive write SetCaseSensitive;
+    /// set if the list doesn't allow duplicated UTF-8 text
+    // - if true, an internal hash table is maintained for faster IndexOf()
+    // - matches fNoDuplicate in Flags
+    property NoDuplicate: boolean read GetNoDuplicate;
+    /// access to the low-level flags of this list
+    property Flags: TRawUTF8ListFlags read fFlags write fFlags;
     /// get or set a RawUTF8 item
     // - returns '' and raise no exception in case of out of range supplied index
     // - if you want to use it with the VCL, use UTF8ToString() function
+    // - reading this property is not thread-safe, since content may change
     property Strings[Index: PtrInt]: RawUTF8 read Get write Put; default;
     /// get or set a Object item
     // - returns nil and raise no exception in case of out of range supplied index
-    property Objects[Index: PtrInt]: TObject read GetObject write PutObject;
-    /// set if IndexOf() shall be case sensitive or not
-    // - default is TRUE
-    property CaseSensitive: boolean read fCaseSensitive write SetCaseSensitive;
+    // - reading this property is not thread-safe, since content may change
+    property Objects[Index: PtrInt]: pointer read GetObject write PutObject;
     /// retrieve the corresponding Name when stored as 'Name=Value' pairs
+    // - reading this property is not thread-safe, since content may change
+    // - consider using TSynNameValue if you expect faster access
     property Names[Index: PtrInt]: RawUTF8 read GetName;
     /// access to the corresponding 'Name=Value' pairs
     // - search on Name is case-insensitive with 'Name=Value' pairs
+    // - reading this property is thread-safe, but won't use the hash table
+    // - consider using TSynNameValue if you expect faster access
     property Values[const Name: RawUTF8]: RawUTF8 read GetValue write SetValue;
     /// the char separator between 'Name=Value' pairs
     // - equals '=' by default
+    // - consider using TSynNameValue if you expect faster access
     property NameValueSep: AnsiChar read fNameValueSep write fNameValueSep;
     /// set or retrieve all items as text lines
     // - lines are separated by #13#10 (CRLF) by default; use GetText and
     // SetText methods if you want to use another line delimiter (even a comma)
+    // - this property is thread-safe
     property Text: RawUTF8 read GetTextCRLF write SetTextCRLF;
     /// Event triggered when an entry is modified
     property OnChange: TNotifyEvent read fOnChange write fOnChange;
-    /// direct access to the memory of the RawUTF8 array
-    property ListPtr: PPUtf8CharArray read GetListPtr;
-    /// direct access to the memory of the Objects array
+    /// direct access to the memory of the TRawUTF8DynArray items
+    // - reading this property is not thread-safe, since content may change
+    property TextPtr: PPUtf8CharArray read GetTextPtr;
+    /// direct access to the memory of the TObjectDynArray items
+    // - reading this property is not thread-safe, since content may change
     property ObjectPtr: PPointerArray read GetObjectPtr;
-  end;
-
-  /// a TRawUTF8List with an associated lock for thread-safety
-  TRawUTF8ListLocked = class(TRawUTF8List)
-  protected
-    fSafe: TSynLocker;
-  public
-    /// initialize the class instance
-    constructor Create(aOwnObjects: boolean=false);
-    /// finalize the instance
-    // - and all internal objects stored, if was created with Create(true)
-    destructor Destroy; override;
-    /// thread-safe adding of an item to the list
-    // - will just call Add() within Safe.Lock/Unlock
-    // - you may use SafePop to handle a thread-safe FIFO
-    procedure SafePush(const aValue: RawUTF8);
-    /// thread-safe retrieving of an item to the list
-    // - returns TRUE and set aValue from the oldest SafePush() content
-    // - returns FALSE if there is no pending item in the list
-    // - you may have used SafePush before to handle a thread-safe FIFO
-    function SafePop(out aValue: RawUTF8): boolean;
-    /// thread-safe delete all items from the list
-    procedure SafeClear;
+    /// direct access to the TRawUTF8DynArray items dynamic array wrapper
+    property ValuesArray: TDynArrayHashed read fValues;
     /// access to the locking methods of this instance
     // - use Safe.Lock/TryLock with a try ... finally Safe.Unlock block
     property Safe: TSynLocker read fSafe;
   end;
 
-  /// a TRawUTF8List which will use an internal hash table for faster IndexOf()
-  // - purpose of this class is to allow faster access of a static list of RawUTF8
-  // values (e.g. service method names) which are somewhat fixed during run
-  // - uses a rather rough implementation: all values are re-hashed after change,
-  // just before IndexOf() call, or explicitly via the ReHash method
-  TRawUTF8ListHashed = class(TRawUTF8List)
-  protected
-    fHash: TDynArrayHashed;
-    fChanged: boolean;
-    procedure SetCaseSensitive(Value: boolean); override;
-    /// will set fChanged=true to force full re-hash after TRawUTF8List methods
-    procedure Changed; override;
-    procedure RehashOnChanged;
-  public
-    /// initialize the class instance
-    constructor Create(aOwnObjects: boolean=false);
-    /// find a RawUTF8 item in the stored Strings[] list
-    // - this overridden method will update the internal hash table (if needed),
-    // then use it to retrieve the corresponding matching index
-    // - if your purpose is to test if an item is existing, then add it on need,
-    // use rather the AddObjectIfNotExisting() method which would preserve
-    // the internal hash array, so would perform better
-    function IndexOf(const aText: RawUTF8): PtrInt; override;
-    /// store a new RawUTF8 item if not already in the list
-    // - returns -1 and raise no exception in case of self=nil
-    // - this overridden method will update and use the internal hash table,
-    // so is preferred to plain Add if you want faster insertion
-    // into the TRawUTF8ListHashed
-    function AddIfNotExisting(const aText: RawUTF8; wasAdded: PBoolean=nil): PtrInt; override;
-    /// store a new RawUTF8 item if not already in the list, and its associated TObject
-    // - returns -1 and raise no exception in case of self=nil
-    // - this overridden method will update and use the internal hash table,
-    // so is preferred to plain Add if you want faster insertion
-    // into the TRawUTF8ListHashed
-    function AddObjectIfNotExisting(const aText: RawUTF8; aObject: TObject;
-      wasAdded: PBoolean=nil): PtrInt; override;
-    /// delete a stored RawUTF8 item, and its associated TObject
-    // - returns -1 if no entry was found and deleted
-    // - this overridden method will update and use the internal hash table,
-    // so is preferred to plain Delete if you want faster insertion
-    // into the TRawUTF8ListHashed
-    function Delete(const aText: RawUTF8): PtrInt; override;
-    /// search in the low-level internal hashing table
-    function HashFind(aHashCode: cardinal): integer; {$ifdef HASINLINE}inline;{$endif}
-    /// ensure all items are hashed if necessay
-    // - could be executed after several Add/AddObject calls to ensure the hash
-    // table is computed and this instance ready for the next IndexOf() call
-    // - will hash all items only if fChanged or aForceRehash is true
-    // - returns true if stored information has been re-hashed
-    function ReHash(aForceRehash: boolean=false): boolean; virtual;
-    /// access to the low-level internal hashing table
-    property Hash: TDynArrayHashed read fHash;
-  end;
-
-  /// a TRawUTF8List with an internal hash, with thread-safe locking methods
-  // - by default, inherited methods are not protected by the mutex: you have
-  // to explicitely call Safe.Lock/UnLock to enter or leave the critical section,
-  // or use the methods overriden at this class level
-  TRawUTF8ListHashedLocked = class(TRawUTF8ListHashed)
-  protected
-    fSafe: TSynLocker;
-  public
-    /// initialize the class instance
-    constructor Create(aOwnObjects: boolean=false);
-    /// finalize the instance
-    // - and all internal objects stored, if was created with Create(true)
-    destructor Destroy; override;
-    /// access to the locking methods of this instance
-    // - use Safe.Lock/TryLock with a try ... finally Safe.Unlock block
-    property Safe: TSynLocker read fSafe;
-    /// add a RawUTF8 item in the stored Strings[] list
-    // - just a wrapper over Add() using Safe.Lock/Unlock
-    // - warning: this method WON'T update the internal hash array: use
-    // AddIfNotExisting/AddObjectIfNotExisting() methods instead
-    function LockedAdd(const aText: RawUTF8): PtrInt; virtual;
-    /// find a RawUTF8 item in the stored Strings[] list
-    // - just a wrapper over IndexOf() using Safe.Lock/Unlock
-    function IndexOf(const aText: RawUTF8): PtrInt; override;
-    /// find a RawUTF8 item in the stored Strings[] list
-    // - just a wrapper over GetObjectByName() using Safe.Lock/Unlock
-    // - warning: the object instance should remain in the list, so the caller
-    // should not make any Delete/LockedDeleteFromName otherwise a GPF may occur
-    function LockedGetObjectByName(const aText: RawUTF8): TObject; virtual;
-    /// add a RawUTF8 item in the internal storage
-    // - just a wrapper over AddIfNotExisting() using Safe.Lock/Unlock
-    function AddIfNotExisting(const aText: RawUTF8; wasAdded: PBoolean=nil): PtrInt; override;
-    /// add a RawUTF8 item in the internal storage, with an optional object
-    // - just a wrapper over AddObjectIfNotExisting() using Safe.Lock/Unlock
-    function AddObjectIfNotExisting(const aText: RawUTF8; aObject: TObject;
-      wasAdded: PBoolean=nil): PtrInt; override;
-    /// find and delete an RawUTF8 item in the stored Strings[] list
-    // - just a wrapper over inherited Delete(aText) using Safe.Lock/Unlock
-    function Delete(const aText: RawUTF8): PtrInt; override;
-    /// find and delete an RawUTF8 item from its Name=... in the stored Strings[] list
-    // - just a wrapper over inherited DeleteFromName() using Safe.Lock/Unlock
-    function DeleteFromName(const Name: RawUTF8): PtrInt; override;
-    /// retrieve and delete the first RawUTF8 item in the list
-    // - could be used as a FIFO
-    // - just a wrapper over inherited PopFirst() using Safe.Lock/Unlock
-    function PopFirst(out aText: RawUTF8; aObject: PObject=nil): boolean; override;
-    /// retrieve and delete the last RawUTF8 item in the list
-    // - could be used as a FILO
-    // - just a wrapper over inherited PopLast() using Safe.Lock/Unlock
-    function PopLast(out aText: RawUTF8; aObject: PObject=nil): boolean; override;
-    /// delete all RawUTF8 items in the list
-    // - just a wrapper over inherited Clear using Safe.Lock/Unlock
-    procedure Clear; override;
-    /// ensure all items are hashed if necessay
-    // - just a wrapper over inherited Rehash using Safe.Lock/Unlock
-    function ReHash(aForceRehash: boolean=false): boolean; override;
-  end;
-
-  /// this class stores TMethod callbacks with an associated UTF-8 string
-  // - event names will be hashed for O(1) fast access
-  TRawUTF8MethodList = class(TRawUTF8ListHashed)
-  protected
-    fEvents: TMethodDynArray;
-  public
-    /// delete a stored RawUTF8 item, and its associated event
-    // - raise no exception in case of out of range supplied index
-    procedure Delete(Index: PtrInt); override;
-    /// erase all stored RawUTF8 items and events
-    procedure Clear; override;
-    /// register a callback with its name
-    function AddEvent(const aName: RawUTF8; const aEvent: TMethod): PtrInt;
-    /// retrieve a callback from its index
-    // - return FALSE if not previously set via AddEvent()
-    // - return TRUE if found, and set aEvent to the corresponding callback
-    function GetEvent(aIndex: PtrInt; out aEvent: TMethod): boolean;
-    /// retrieve a callback from its hashed name
-    // - return FALSE if not found
-    // - return TRUE if found, and set aEvent to the corresponding callback
-    function GetEventByName(const aText: RawUTF8; out aEvent: TMethod): boolean;
-  end;
+  // some declarations used for backward compatibility only
+  TRawUTF8ListLocked = type TRawUTF8List;
+  TRawUTF8ListHashed = type TRawUTF8List;
+  TRawUTF8ListHashedLocked = type TRawUTF8ListHashed;
+  // deprecated TRawUTF8MethodList should be replaced by a TSynDictionary
 
   /// define the implemetation used by TAlgoCompress.Decompress()
   TAlgoCompressLoad = (aclNormal, aclSafeSlow, aclNoCrcFast);
@@ -11939,39 +11888,23 @@ function UInt2DigitsToShortFast(Value: byte): TShort4;
 // - this version is not optimized for speed, but for correctness
 function crc16(Data: PAnsiChar; Len: integer): cardinal;
 
-// our custom hash/checksum function, specialized for Text comparison
-// - it is a checksum algorithm, not a hash function: has less colision than
-// Adler32 for short strings, but more than xxhash32 or crc32/crc32c
-// - written in simple plain pascal, with no L1 CPU cache pollution
-// - overloaded version for direct binary content hashing
-// - crc32c() has less collision - but is faster only on a SSE4.2 x86_64 CPU;
-// some numbers on FPC/Linux64, with a SSE4.2 enabled CPU:
-// $ -- 8 bytes buffers
-// $ crc32c 8B in 12us i.e. 41,666,666/s, aver. 0us, 317.8 MB/s
-// $ xxhash32 8B in 10us i.e. 50,000,000/s, aver. 0us, 381.4 MB/s
-// $ hash32 8B in 9us i.e. 55,555,555/s, aver. 0us, 423.8 MB/s
-// $ -- 50 bytes buffers
-// $ crc32c 50B in 11us i.e. 45,454,545/s, aver. 0us, 2.1 GB/s
-// $ xxhash32 50B in 14us i.e. 35,714,285/s, aver. 0us, 1.6 GB/s
-// $ hash32 50B in 10us i.e. 50,000,000/s, aver. 0us, 2.3 GB/s
-// $ -- 100 bytes buffers
-// $ crc32c 100B in 12us i.e. 41,666,666/s, aver. 0us, 3.8 GB/s
-// $ xxhash32 100B in 19us i.e. 26,315,789/s, aver. 0us, 2.4 GB/s
-// $ hash32 100B in 13us i.e. 38,461,538/s, aver. 0us, 3.5 GB/s
-// $ -- 1000 bytes buffers
-// $ crc32c 0.9KB in 37us i.e. 13,513,513/s, aver. 0us, 12.5 GB/s
-// $ xxhash32 0.9KB in 96us i.e. 5,208,333/s, aver. 0us, 4.8 GB/s
-// $ hash32 0.9KB in 62us i.e. 8,064,516/s, aver. 0us, 7.5 GB/s
-// $ -- 10000 bytes buffers
-// $ crc32c 9.7KB in 282us i.e. 1,773,049/s, aver. 0us, 16.5 GB/s
-// $ xxhash32 9.7KB in 927us i.e. 539,374/s, aver. 1us, 5 GB/s
-// $ hash32 9.7KB in 487us i.e. 1,026,694/s, aver. 0us, 9.5 GB/s
+// our custom efficient 32-bit hash/checksum function
+// - a Fletcher-like checksum algorithm, not a hash function: has less colisions
+// than Adler32 for short strings, but more than xxhash32 or crc32/crc32c
+// - written in simple plain pascal, with no L1 CPU cache pollution, but we
+// also provide optimized x86/x64 assembly versions, since the algorithm is used
+// heavily e.g. for TDynArray binary serialization, TSQLRestStorageInMemory
+// binary persistence, or CompressSynLZ/StreamSynLZ/FileSynLZ
+// - some numbers on Linux x86_64:
+// $ 2500 hash32 in 707us i.e. 3536067/s or 7.3 GB/s
+// $ 2500 xxhash32 in 1.34ms i.e. 1861504/s or 3.8 GB/s
+// $ 2500 crc32c in 943us i.e. 2651113/s or 5.5 GB/s  (SSE4.2 disabled)
+// $ 2500 crc32c in 387us i.e. 6459948/s or 13.4 GB/s (SSE4.2 enabled)
 function Hash32(Data: PCardinalArray; Len: integer): cardinal; overload;
 
-// our custom hash/checsum function, specialized for Text comparison
-// - it is a checksum algorithm, not a hash function: has less colision than
-// Adler32 for short strings, but more than xxhash32 or crc32/crc32c
-// - is faster than CRC32 or Adler32, since uses DQWord (128-bit) aligned read
+// our custom efficient 32-bit hash/checksum function
+// - a Fletcher-like checksum algorithm, not a hash function: has less colisions
+// than Adler32 for short strings, but more than xxhash32 or crc32/crc32c
 // - overloaded function using RawByteString for binary content hashing,
 // whatever the codepage is
 function Hash32(const Text: RawByteString): cardinal; overload;
@@ -12381,15 +12314,6 @@ var
   /// the available CPU features, as recognized at program startup
   CpuFeatures: TIntelCpuFeatures;
 
-{$ifdef CPUX64}
-type
-  /// cpuERMS is slightly slower than cpuAVX so is not available by default
-  TX64CpuFeatures = set of(cpuAVX, cpuAVX2 {$ifdef WITH_ERMS}, cpuERMS{$endif});
-var
-  /// internal flags used by FillCharFast - easier from asm that CpuFeatures
-  CPUIDX64: TX64CpuFeatures;
-{$endif CPUX64}
-
 /// compute CRC32C checksum on the supplied buffer using SSE 4.2
 // - use Intel Streaming SIMD Extensions 4.2 hardware accelerated instruction
 // - SSE 4.2 shall be available on the processor (i.e. cfSSE42 in CpuFeatures)
@@ -12478,7 +12402,7 @@ function GetBitsCountPas(value: PtrInt): PtrInt;
 // - the PopCnt() intrinsic under FPC doesn't have any fallback on older CPUs,
 // and default implementation is 5 times slower than our GetBitsCountPas() on x64
 // - this redirected function will use fast SSE4.2 popcnt opcode, if available
-var GetBitsCountPtrInt: function(value: PtrInt): PtrInt;
+var GetBitsCountPtrInt: function(value: PtrInt): PtrInt = GetBitsCountPas;
 
 const
   /// constant array used by GetAllBits() function (when inlined)
@@ -17430,14 +17354,15 @@ function StreamSynLZComputeLen(P: PAnsiChar; Len, aMagic: cardinal): integer;
 // (if was appended to an existing data - e.g. a .mab at the end of a .exe)
 function StreamUnSynLZ(const Source: TFileName; Magic: cardinal): TMemoryStream; overload;
 
-/// compress a file content using the SynLZ algorithm a file content
+/// compress a file content using the SynLZ algorithm
 // - source file is split into 128 MB blocks for fast in-memory compression of
-// any file size
+// any file size, then SynLZ compressed and including a Hash32 checksum
+// - it is not compatible with StreamSynLZ format, which has no 128 MB chunking
 // - you should specify a Magic number to be used to identify the compressed
 // file format
 function FileSynLZ(const Source, Dest: TFileName; Magic: Cardinal): boolean;
 
-/// compress a file content using the SynLZ algorithm a file content
+/// uncompress a file previoulsy compressed via FileSynLZ(
 // - you should specify a Magic number to be used to identify the compressed
 // file format
 function FileUnSynLZ(const Source, Dest: TFileName; Magic: Cardinal): boolean;
@@ -29814,32 +29739,35 @@ begin
   Sum := t;
 end;
 
+function FindRawUTF8(Values: PRawUTF8; const Value: RawUTF8; ValuesCount: integer;
+  CaseSensitive: boolean): integer;
+begin
+  if Values<>nil then
+    if CaseSensitive then begin
+      for result := 0 to ValuesCount-1 do
+        if Values^=Value then
+          exit else
+          inc(Values);
+    end else
+      for result := 0 to ValuesCount-1 do
+        if StrIComp(pointer(Values^),pointer(Value))=0 then
+          exit else
+          inc(Values);
+  result := -1;
+end;
+
 function FindRawUTF8(const Values: TRawUTF8DynArray; const Value: RawUTF8;
   CaseSensitive: boolean): integer;
 begin
-  if CaseSensitive then begin
-    for result := 0 to length(Values)-1 do
-      if Values[result]=Value then
-        exit;
-  end else
-    for result := 0 to length(Values)-1 do
-      if UTF8IComp(pointer(Values[result]),pointer(Value))=0 then
-        exit;
-  result := -1;
+  result := FindRawUTF8(pointer(Values),Value,length(Values),CaseSensitive);
 end;
 
 function FindRawUTF8(const Values: array of RawUTF8; const Value: RawUTF8;
   CaseSensitive: boolean): integer;
 begin
-  if CaseSensitive then begin
-    for result := 0 to high(Values) do
-      if Values[result]=Value then
-        exit;
-  end else
-    for result := 0 to high(Values) do
-      if UTF8IComp(pointer(Values[result]),pointer(Value))=0 then
-        exit;
-  result := -1;
+  result := high(Values);
+  if result>=0 then
+    result := FindRawUTF8(@Values[0],Value,result,CaseSensitive);
 end;
 
 function FindRawUTF8(const Values: TRawUTF8DynArray; ValuesCount: integer;
@@ -34740,7 +34668,7 @@ begin
 end;
 
 function UrlEncodeJsonObject(const URIName: RawUTF8; ParametersJSON: PUTF8Char;
-  const PropNamesToIgnore: array of RawUTF8): RawUTF8;
+  const PropNamesToIgnore: array of RawUTF8; IncludeQueryDelimiter: Boolean): RawUTF8;
 var i,j: integer;
     sep: AnsiChar;
     Params: TNameValuePUTF8CharDynArray;
@@ -34762,11 +34690,13 @@ begin
             end;
           if NameLen=0 then
             continue;
-          Add(sep);
+          if IncludeQueryDelimiter then
+            Add(sep);
           AddNoJSONEscape(Name,NameLen);
           Add('=');
           AddString(UrlEncode(Value));
           sep := '&';
+          IncludeQueryDelimiter := true;
         end;
       end;
       SetText(result);
@@ -34776,12 +34706,12 @@ begin
 end;
 
 function UrlEncodeJsonObject(const URIName, ParametersJSON: RawUTF8;
-  const PropNamesToIgnore: array of RawUTF8): RawUTF8;
+  const PropNamesToIgnore: array of RawUTF8; IncludeQueryDelimiter: Boolean): RawUTF8;
 var temp: TSynTempBuffer;
 begin
   temp.Init(ParametersJSON);
   try
-    result := UrlEncodeJsonObject(URIName,temp.buf,PropNamesToIgnore);
+    result := UrlEncodeJsonObject(URIName,temp.buf,PropNamesToIgnore,IncludeQueryDelimiter);
   finally
     temp.Done;
   end;
@@ -35259,6 +35189,65 @@ begin
 end;
 
 function Hash32(Data: PCardinalArray; Len: integer): cardinal;
+{$ifdef CPUX64} {$ifdef FPC}nostackframe; assembler;
+asm {$else} asm .noframe {$endif} // rcx/rdi=Data edx/esi=Len
+        xor     eax, eax
+        xor     r9d, r9d
+        test    Data, Data
+        jz      @z
+        {$ifdef win64}
+        mov     r8, rdx
+        shr     r8, 4
+        {$else}
+        mov     edx, esi
+        shr     esi, 4
+        {$endif}
+        jz      @by4
+@by16:  add     eax, dword ptr[Data]
+        add     r9d, eax
+        add     eax, dword ptr[Data+4]
+        add     r9d, eax
+        add     eax, dword ptr[Data+8]
+        add     r9d, eax
+        add     eax, dword ptr[Data+12]
+        add     r9d, eax
+        add     Data, 16
+        {$ifdef win64}
+        dec     r8d
+        {$else}
+        dec     esi
+        {$endif}
+        jnz     @by16
+@by4:   mov     dh, dl
+        and     dl, 15
+        jz      @0
+        shr     dl, 2
+        jz      @rem
+@4:     add     eax, dword ptr[Data]
+        add     r9d, eax
+        add     Data, 4
+        dec     dl
+        jnz     @4
+@rem:   and     dh, 3
+        jz      @0
+        dec     dh
+        jz      @1
+        dec     dh
+        jz      @2
+        mov     ecx, dword ptr[Data]
+        and     ecx, $ffffff
+        jmp     @e
+@2:     movzx   ecx, word ptr[Data]
+        jmp     @e
+@1:     movzx   ecx, byte ptr[Data]
+@e:     add     eax, ecx
+@0:     add     r9d, eax
+        shl     r9d, 16
+        xor     eax, r9d
+@z:
+end;
+{$else}
+{$ifdef PUREPASCAL}
 var s1,s2: cardinal;
     i: integer;
 begin
@@ -35291,6 +35280,61 @@ begin
   end else
     result := 0;
 end;
+{$else}
+asm  // eax=Data edx=Len
+        push    esi
+        push    edi
+        mov     cl, dl
+        mov     ch, dl
+        xor     esi, esi
+        xor     edi, edi
+        test    eax, eax
+        jz      @z
+        shr     edx, 4
+        jz      @by4
+        nop  
+@by16:  add     esi, dword ptr[eax]
+        add     edi, esi
+        add     esi, dword ptr[eax+4]
+        add     edi, esi
+        add     esi, dword ptr[eax+8]
+        add     edi, esi
+        add     esi, dword ptr[eax+12]
+        add     edi, esi
+        add     eax, 16
+        dec     edx
+        jnz     @by16
+@by4:   and     cl, 15
+        jz      @0
+        shr     cl, 2
+        jz      @rem
+@4:     add     esi, dword ptr[eax]
+        add     edi, esi
+        add     eax, 4
+        dec     cl
+        jnz     @4
+@rem:   and     ch, 3
+        jz      @0
+        dec     ch
+        jz      @1
+        dec     ch
+        jz      @2
+        mov     eax, dword ptr[eax]
+        and     eax, $ffffff
+        jmp     @e
+@2:     movzx   eax, word ptr[eax]
+        jmp     @e
+@1:     movzx   eax, byte ptr[eax]
+@e:     add     esi, eax
+@0:     add     edi, esi
+        mov     eax, esi
+        shl     edi, 16
+        xor     eax, edi
+@z:     pop     edi
+        pop     esi
+end;
+{$endif PUREPASCAL}
+{$endif CPUX64}
 
 procedure OrMemory(Dest,Source: PByteArray; size: PtrInt);
 begin
@@ -35658,6 +35702,7 @@ asm .noframe // ecx=param, rdx=Registers (Linux: edi,rsi)
         mov     rbx, r10
 end;
 
+{$ifndef ABSOLUTEPASCAL}
 const
   CMP_RANGES = $44; // see https://msdn.microsoft.com/en-us/library/bb531425
   _UpperCopy255BufSSE42: array[0..31] of AnsiChar =
@@ -35716,6 +35761,77 @@ asm .noframe // rcx=dest, rdx=source, r8=len (Linux: rdi,rsi,rdx)
        dec     rdx
        jnz     @s
 end;
+
+{$ifdef HASAESNI}
+const
+  EQUAL_EACH = 8;   // see https://msdn.microsoft.com/en-us/library/bb531463
+  NEGATIVE_POLARITY = 16;
+
+function StrLenSSE42(S: pointer): PtrInt;
+{$ifdef FPC}nostackframe; assembler; asm {$else} asm .noframe {$endif FPC}
+        xor     rax, rax
+        mov     rdx, S
+        test    S, S
+        jz      @null
+        xor     rcx, rcx
+        pxor    xmm0, xmm0
+        pcmpistri xmm0, [rdx], EQUAL_EACH // result in ecx
+        jnz     @L
+        mov     eax, ecx
+@null:  ret
+{$ifdef FPC} align 16 {$else} .align 16 {$endif}
+@L:     add     rax, 16   // add before comparison flag
+        pcmpistri xmm0, [rdx + rax], EQUAL_EACH // result in ecx
+        jnz     @L
+        add     rax, rcx
+end;
+
+function StrCompSSE42(Str1, Str2: pointer): PtrInt;
+{$ifdef FPC}nostackframe; assembler; asm {$else}
+asm .noframe // rcx=Str1, rdx=Str2 (Linux: rdi,rsi)
+{$endif FPC}
+      {$ifdef win64}
+      mov       rax, rcx
+      test      rcx, rdx
+      {$else}
+      mov       rax, rdi
+      mov       rdx, rsi
+      test      rdi, rsi  // is one of Str1/Str2 nil ?
+      {$endif}
+      jz        @n
+@ok:  sub       rax, rdx
+      xor       rcx, rcx
+      movdqu    xmm0, dqword [rdx]
+      pcmpistri xmm0, dqword [rdx + rax], EQUAL_EACH + NEGATIVE_POLARITY // result in rcx
+      ja        @1
+      jc        @2
+      xor       rax, rax
+      ret
+{$ifdef FPC} align 16 {$else} .align 16 {$endif}
+@1:   add       rdx, 16
+      movdqu    xmm0, dqword [rdx]
+      pcmpistri xmm0, dqword [rdx + rax], EQUAL_EACH + NEGATIVE_POLARITY
+      ja        @1
+      jc        @2
+@0:   xor       rax, rax // Str1=Str2
+      ret
+@n:   cmp       rax, rdx
+      je        @0
+      test      rax, rax  // Str1='' ?
+      jz        @max
+      test      rdx, rdx  // Str2='' ?
+      jnz       @ok
+      mov       rax, 1
+      ret
+@max: dec       rax  // returns -1
+      ret
+@2:   add       rax, rdx
+      movzx     rax, byte ptr [rax + rcx]
+      movzx     rdx, byte ptr [rdx + rcx]
+      sub       rax, rdx
+end;
+{$endif HASAESNI}
+{$endif ABSOLUTEPASCAL}
 
 function crc32csse42(crc: cardinal; buf: PAnsiChar; len: cardinal): cardinal;
 {$ifdef FPC}nostackframe; assembler; asm {$else}
@@ -35807,75 +35923,6 @@ asm .noframe // rcx=S (Linux: rdi)
 @null:
 end;
 
-const
-  EQUAL_EACH = 8;   // see https://msdn.microsoft.com/en-us/library/bb531463
-  NEGATIVE_POLARITY = 16;
-
-{$ifdef HASAESNI}
-function StrLenSSE42(S: pointer): PtrInt;
-{$ifdef FPC}nostackframe; assembler; asm {$else} asm .noframe {$endif FPC}
-        xor     rax, rax
-        mov     rdx, S
-        test    S, S
-        jz      @null
-        xor     rcx, rcx
-        pxor    xmm0, xmm0
-        pcmpistri xmm0, [rdx], EQUAL_EACH // result in ecx
-        jnz     @L
-        mov     eax, ecx
-@null:  ret
-{$ifdef FPC} align 16 {$else} .align 16 {$endif}
-@L:     add     rax, 16   // add before comparison flag
-        pcmpistri xmm0, [rdx + rax], EQUAL_EACH // result in ecx
-        jnz     @L
-        add     rax, rcx
-end;
-
-function StrCompSSE42(Str1, Str2: pointer): PtrInt;
-{$ifdef FPC}nostackframe; assembler; asm {$else}
-asm .noframe // rcx=Str1, rdx=Str2 (Linux: rdi,rsi)
-{$endif FPC}
-      {$ifdef win64}
-      mov       rax, rcx
-      test      rcx, rdx
-      {$else}
-      mov       rax, rdi
-      mov       rdx, rsi
-      test      rdi, rsi  // is one of Str1/Str2 nil ?
-      {$endif}
-      jz        @n
-@ok:  sub       rax, rdx
-      xor       rcx, rcx
-      movdqu    xmm0, dqword [rdx]
-      pcmpistri xmm0, dqword [rdx + rax], EQUAL_EACH + NEGATIVE_POLARITY // result in rcx
-      ja        @1
-      jc        @2
-      xor       rax, rax
-      ret
-{$ifdef FPC} align 16 {$else} .align 16 {$endif}
-@1:   add       rdx, 16
-      movdqu    xmm0, dqword [rdx]
-      pcmpistri xmm0, dqword [rdx + rax], EQUAL_EACH + NEGATIVE_POLARITY
-      ja        @1
-      jc        @2
-@0:   xor       rax, rax // Str1=Str2
-      ret
-@n:   cmp       rax, rdx
-      je        @0
-      test      rax, rax  // Str1='' ?
-      jz        @max
-      test      rdx, rdx  // Str2='' ?
-      jnz       @ok
-      mov       rax, 1
-      ret
-@max: dec       rax  // returns -1
-      ret
-@2:   add       rax, rdx
-      movzx     rax, byte ptr [rax + rcx]
-      movzx     rdx, byte ptr [rdx + rcx]
-      sub       rax, rdx
-end;
-{$endif HASAESNI}
 {$endif CPU64}
 {$endif CPUINTEL}
 
@@ -36107,9 +36154,9 @@ asm // eax=crc, edx=buf, ecx=len
         jz      @0
         test    edx, edx
         jz      @0
-@3:     test    edx, 3
-        jz      @8 // align to 4 bytes boundary
-        {$ifdef FPC_OR_UNICODE}
+        jmp     @align
+        db      $8D, $0B4, $26, $00, $00, $00, $00 // manual @by8 align 16
+@a:     {$ifdef FPC}
         crc32   eax, byte ptr[edx]
         {$else}
         db      $F2, $0F, $38, $F0, $02
@@ -36117,12 +36164,38 @@ asm // eax=crc, edx=buf, ecx=len
         inc     edx
         dec     ecx
         jz      @0
-        test    edx, 3
-        jnz     @3
-@8:     push    ecx
+@align: test    dl, 3
+        jnz     @a
+        push    ecx
         shr     ecx, 3
+        jnz     @by8
+@rem:   pop     ecx
+        test    cl, 4
+        jz      @4
+        {$ifdef FPC}
+        crc32   eax, dword ptr[edx]
+        {$else}
+        db      $F2, $0F, $38, $F1, $02
+        {$endif}
+        add     edx, 4
+@4:     test    cl, 2
         jz      @2
-@1:     {$ifdef FPC_OR_UNICODE}
+        {$ifdef FPC}
+        crc32   eax, word ptr[edx]
+        {$else}
+        db      $66, $F2, $0F, $38, $F1, $02
+        {$endif}
+        add     edx, 2
+@2:     test    cl, 1
+        jz      @0
+        {$ifdef FPC}
+        crc32   eax, byte ptr[edx]
+        {$else}
+        db      $F2, $0F, $38, $F0, $02
+        {$endif}
+@0:     not     eax
+        ret
+@by8:   {$ifdef FPC}
         crc32   eax, dword ptr[edx]
         crc32   eax, dword ptr[edx + 4]
         {$else}
@@ -36131,38 +36204,8 @@ asm // eax=crc, edx=buf, ecx=len
         {$endif}
         add     edx, 8
         dec     ecx
-        jnz     @1
-@2:     pop     ecx
-        and     ecx, 7
-        jz      @0
-        cmp     ecx, 4
-        jb      @4
-        {$ifdef FPC_OR_UNICODE}
-        crc32   eax, dword ptr[edx]
-        {$else}
-        db      $F2, $0F, $38, $F1, $02
-        {$endif}
-        add     edx, 4
-        sub     ecx, 4
-        jz      @0
-@4:     {$ifdef FPC_OR_UNICODE}
-        crc32   eax, byte ptr[edx]
-        dec     ecx
-        jz      @0
-        crc32   eax, byte ptr[edx + 1]
-        dec     ecx
-        jz      @0
-        crc32   eax, byte ptr[edx + 2]
-        {$else}
-        db      $F2, $0F, $38, $F0, $02
-        dec     ecx
-        jz      @0
-        db      $F2, $0F, $38, $F0, $42, $01
-        dec     ecx
-        jz      @0
-        db      $F2, $0F, $38, $F0, $42, $02
-        {$endif}
-@0:     not     eax
+        jnz     @by8
+        jmp     @rem
 end;
 {$endif CPUX86}
 
@@ -36494,6 +36537,7 @@ end;
 {$endif CPUX86}
 {$endif CPUX64}
 
+{$ifndef ABSOLUTEPASCAL}
 {$ifdef CPUX64}
 const
   // non-temporal writes should bypass the cache when the size is bigger than
@@ -36587,7 +36631,7 @@ asm {$else} asm .noframe {$endif} // rcx/rdi=src rdx/rsi=dst r8/rdx=cnt
         cmp     rax, 256  // vzeroupper penaly for cnt>255
         jb      @fsse2
         test    byte ptr[rip+CPUIDX64], 1 shl cpuAVX
-        jnz      @fwdavx
+        jnz     @fwdavx
         {$endif FPC}
 @fsse2: movdqu  xmm2, oword ptr[src]  // first 16
         lea     src, [src + rax - 16]
@@ -36855,6 +36899,7 @@ asm {$else} asm .noframe {$endif} // rcx/rdi=dst rdx/rsi=cnt r8b/dl=val
 {$endif FPC}
 end;
 {$endif CPUX64}
+{$endif ABSOLUTEPASCAL}
 
 procedure SymmetricEncrypt(key: cardinal; var data: RawByteString);
 var i,len: integer;
@@ -38831,11 +38876,9 @@ end;
 {$endif}
 
 {$ifdef CPUINTEL} /// NIST SP 800-90A compliant RDRAND Intel x86/x64 opcode
-function RdRand32: cardinal;
-{$ifdef CPU64}{$ifdef FPC}nostackframe; assembler; asm{$else}
-asm .noframe {$endif FPC} {$else}
-{$ifdef FPC}nostackframe; assembler;{$endif} asm
-{$endif}
+function RdRand32: cardinal; {$ifdef CPU64}
+{$ifdef FPC}nostackframe; assembler; asm{$else} asm .noframe {$endif FPC} {$else}
+{$ifdef FPC}nostackframe; assembler;{$endif} asm {$endif}
   // rdrand eax: same opcodes for x86 and x64
   db $0f, $c7, $f0
   // returns in eax, ignore carry flag (eax=0 won't hurt)
@@ -44684,22 +44727,19 @@ end;
 { TJSONRecordTextDefinition }
 
 var
-  JSONCustomParserCache: TRawUTF8ListHashed;
+  JSONCustomParserCache: TRawUTF8List;
 
 class function TJSONRecordTextDefinition.FromCache(aTypeInfo: pointer;
   const aDefinition: RawUTF8): TJSONRecordTextDefinition;
-var i: integer;
-    added: boolean;
 begin
   if JSONCustomParserCache=nil then
-    GarbageCollectorFreeAndNil(JSONCustomParserCache,TRawUTF8ListHashed.Create(True));
-  i := JSONCustomParserCache.AddObjectIfNotExisting(aDefinition,nil,@added);
-  if not added then begin
-    result := TJSONRecordTextDefinition(JSONCustomParserCache.fObjects[i]);
+    GarbageCollectorFreeAndNil(JSONCustomParserCache,
+      TRawUTF8List.Create([fObjectsOwned,fNoDuplicate,fCaseSensitive]));
+  result := JSONCustomParserCache.GetObjectFrom(aDefinition);
+  if result<>nil then
     exit;
-  end;
   result := TJSONRecordTextDefinition.Create(aTypeInfo,aDefinition);
-  JSONCustomParserCache.fObjects[i] := result;
+  JSONCustomParserCache.AddObjectUnique(aDefinition,@result);
 end;
 
 constructor TJSONRecordTextDefinition.Create(aRecordTypeInfo: pointer;
@@ -51175,8 +51215,7 @@ end;
 
 function TDynArrayLoadFrom.CheckHash: boolean;
 begin
-  result := (Position<>nil) and
-     (Hash32(@Hash[1],Position-PAnsiChar(@Hash[1]))=Hash[0]);
+  result := (Position<>nil) and (Hash32(@Hash[1],Position-PAnsiChar(@Hash[1]))=Hash[0]);
 end;
 
 
@@ -51399,8 +51438,8 @@ begin
 end;
 
 const // primes reduce memory consumption and enhance distribution
-  _PRIMES: array[0..38{$ifndef CPU32DELPHI}+13{$endif}] of integer = (
-    {$ifndef CPU32DELPHI} 251, 499, 797, 1259, 2011, 3203, 5087, 8089,
+  _PRIMES: array[0..38{$ifndef CPU32DELPHI}+15{$endif}] of integer = (
+    {$ifndef CPU32DELPHI} 31, 127, 251, 499, 797, 1259, 2011, 3203, 5087, 8089,
     12853, 20399, 81649, 129607, 205759, {$endif}
     // following HASH_PO2=2^18=262144 for Delphi Win32
     326617, 411527, 518509, 653267, 823117, 1037059, 1306601, 1646237,
@@ -52072,7 +52111,7 @@ function TDynArrayHashed.FindHashedForAdding(const Elem; out wasAdded: boolean;
   aHashCode: cardinal; noAddEntry: boolean): integer;
 begin
   result := fHash.FindBeforeAdd(@Elem,wasAdded,aHashCode);
-  if wasAdded then
+  if wasAdded and not noAddEntry then
     SetCount(result+1); // reserve space for a void element in array
 end;
 
@@ -52097,13 +52136,20 @@ begin
   PRawUTF8(result)^ := aName; // store unique name at 1st elem position
 end;
 
+function TDynArrayHashed.AddUniqueName(const aName: RawUTF8; aNewIndex: PInteger): pointer;
+begin
+  result := AddUniqueName(aName,'',[],aNewIndex);
+end;
+
 function TDynArrayHashed.AddUniqueName(const aName: RawUTF8;
-  const ExceptionMsg: RawUTF8; const ExceptionArgs: array of const): pointer;
+  const ExceptionMsg: RawUTF8; const ExceptionArgs: array of const; aNewIndex: PInteger): pointer;
 var ndx: integer;
     added: boolean;
 begin
   ndx := FindHashedForAdding(aName,added);
   if added then begin
+    if aNewIndex<>nil then
+      aNewIndex^ := ndx;
     result := PAnsiChar(Value^)+cardinal(ndx)*ElemSize;
     PRawUTF8(result)^ := aName; // store unique name at 1st elem position
   end else
@@ -53740,9 +53786,9 @@ begin
     if Value.InheritsFrom(TRawUTF8List) then
     with TRawUTF8List(Value) do begin
       self.Add('[');
-      for i := 0 to Count-1 do begin
+      for i := 0 to fCount-1 do begin
         self.Add('"');
-        self.AddJSONEscape(pointer(fList[i]));
+        self.AddJSONEscape(pointer(fValue[i]));
         self.Add('"',',');
       end;
       self.CancelLastComma;
@@ -59517,181 +59563,261 @@ end;
 
 { TRawUTF8List }
 
-function TRawUTF8List.Add(const aText: RawUTF8): PtrInt;
-var capacity: PtrInt;
+constructor TRawUTF8List.Create(aOwnObjects, aNoDuplicate, aCaseSensitive: boolean);
 begin
-  if self=nil then
-    result := -1 else
-    if fObjects=nil then begin
-      capacity := length(fList);
-      result := fCount;
-      if result>=capacity then
-        SetLength(fList,NextGrow(capacity));
-      fList[result] := aText;
-      inc(fCount);
-      Changed;
-    end else
-    result := AddObject(aText,nil);
+  if aOwnObjects then
+    include(fFlags,fObjectsOwned);
+  if aNoDuplicate then
+    include(fFlags,fNoDuplicate);
+  if aCaseSensitive then
+    include(fFlags,fCaseSensitive);
+  Create(fFlags);
 end;
 
-function TRawUTF8List.AddIfNotExisting(const aText: RawUTF8; wasAdded: PBoolean): PtrInt;
+constructor TRawUTF8List.Create(aFlags: TRawUTF8ListFlags);
 begin
-  result := IndexOf(aText);
-  if result<0 then begin
-    result := Add(aText);
-    if wasAdded<>nil then
-      wasAdded^ := true;
-  end else
-    if wasAdded<>nil then
-      wasAdded^ := false;
+  fNameValueSep := '=';
+  fFlags := aFlags;
+  fValues.InitSpecific(TypeInfo(TRawUTF8DynArray),fValue,djRawUTF8,@fCount,
+    not (fCaseSensitive in aFlags));
+  fSafe.Init;
 end;
 
-function TRawUTF8List.AddObjectIfNotExisting(const aText: RawUTF8; aObject: TObject;
-  wasAdded: PBoolean): PtrInt;
+destructor TRawUTF8List.Destroy;
 begin
-  result := IndexOf(aText);
-  if result<0 then begin
-    result := AddObject(aText,aObject);
-    if wasAdded<>nil then
-      wasAdded^ := true;
-  end else
-    if wasAdded<>nil then
-      wasAdded^ := false;
+  SetCapacity(0);
+  inherited;
+  fSafe.Done;
 end;
 
-function TRawUTF8List.AddObject(const aText: RawUTF8; aObject: TObject): PtrInt;
-var capacity: PtrInt;
+procedure TRawUTF8List.SetCaseSensitive(Value: boolean);
 begin
-  if self=nil then begin
-    result := -1;
+  if (self=nil) or (fCaseSensitive in fFlags=Value) then
     exit;
+  fSafe.Lock;
+  try
+    if Value then
+      include(fFlags,fCaseSensitive) else
+      exclude(fFlags,fCaseSensitive);
+    fValues.Hasher.InitSpecific(@fValues,djRawUTF8,not Value);
+    Changed;
+  finally
+    fSafe.UnLock;
   end;
-  capacity := length(fList);
-  result := fCount;
-  if result>=capacity then begin
-    capacity := NextGrow(capacity);
-    SetLength(fList,capacity);
-    if (fObjects<>nil) or (aObject<>nil) then
-      SetLength(fObjects,capacity);
-  end else
-    if (aObject<>nil) and (fObjects=nil) then
-      SetLength(fObjects,capacity); // first time we got aObject<>nil
-  fList[result] := aText;
-  if aObject<>nil then
-    fObjects[result] := aObject;
-  inc(fCount);
-  Changed;
+end;
+
+procedure TRawUTF8List.SetCapacity(const capa: PtrInt);
+begin
+  if self<>nil then begin
+    fSafe.Lock;
+    try
+      if capa<=0 then begin // clear
+        if fObjects<>nil then begin
+          if fObjectsOwned in fFlags then
+            RawObjectsClear(pointer(fObjects),fCount);
+          fObjects := nil;
+        end;
+        fValues.Clear;
+        if fNoDuplicate in fFlags then
+          fValues.ReHash;
+        Changed;
+      end else begin // resize
+        if capa<fCount then begin // resize down
+          if fObjects<>nil then begin
+            if fObjectsOwned in fFlags then
+              RawObjectsClear(@fObjects[capa],fCount-capa-1);
+            SetLength(fObjects,capa);
+          end;
+          fValues.Count := capa;
+          if fNoDuplicate in fFlags then
+            fValues.ReHash;
+          Changed;
+        end;
+        if capa>length(fValue) then begin // resize up
+          SetLength(fValue,capa);
+          if fObjects<>nil then
+            SetLength(fObjects,capa);
+        end;
+      end;
+    finally
+      fSafe.UnLock;
+    end;
+  end;
+end;
+
+function TRawUTF8List.Add(const aText: RawUTF8; aRaiseExceptionIfExisting: boolean): PtrInt;
+begin
+  result := AddObject(aText,nil,aRaiseExceptionIfExisting);
+end;
+
+function TRawUTF8List.AddObject(const aText: RawUTF8; aObject: TObject;
+  aRaiseExceptionIfExisting: boolean; aFreeAndReturnExistingObject: PPointer): PtrInt;
+var added: boolean;
+    obj: TObject;
+begin
+  result := -1;
+  if self=nil then
+    exit;
+  fSafe.Lock;
+  try
+    if fNoDuplicate in fFlags then begin
+      result := fValues.FindHashedForAdding(aText,added,{noadd=}true);
+      if not added then begin
+        obj := GetObject(result);
+        if (obj=aObject) and (obj<>nil) then
+          exit; // found identical aText/aObject -> behave as if added
+        if aFreeAndReturnExistingObject<>nil then begin
+          aObject.Free;
+          aFreeAndReturnExistingObject^ := obj;
+        end;
+        if aRaiseExceptionIfExisting then
+          raise ESynException.CreateUTF8('%.Add duplicate [%]',[self,aText]);
+        result := -1;
+        exit;
+      end;
+    end;
+    result := fValues.Add(aText);
+    if (fObjects<>nil) or (aObject<>nil) then begin
+      if result>=length(fObjects) then
+        SetLength(fObjects,length(fValue)); // same capacity
+      if aObject<>nil then
+        fObjects[result] := aObject;
+    end;
+    Changed;
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+procedure TRawUTF8List.AddObjectUnique(const aText: RawUTF8;
+  aObjectToAddOrFree: PPointer);
+begin
+  AddObject(aText,aObjectToAddOrFree^,{raiseexc=}false,
+    {freeandreturnexisting=}aObjectToAddOrFree);
 end;
 
 procedure TRawUTF8List.AddRawUTF8List(List: TRawUTF8List);
 var i: PtrInt;
 begin
   if List<>nil then begin
-    BeginUpdate;
-    if List.fObjects=nil then
+    BeginUpdate; // includes Safe.Lock
+    try
       for i := 0 to List.fCount-1 do
-        Add(List.fList[i]) else
-      for i := 0 to List.fCount-1 do
-        AddObject(List.fList[i],List.fObjects[i]);
-    EndUpdate;
+        AddObject(List.fValue[i],List.GetObject(i));
+    finally
+      EndUpdate;
+    end;
   end;
 end;
 
 procedure TRawUTF8List.BeginUpdate;
 begin
-  inc(fOnChangeLevel);
-  if fOnChangeLevel>1 then
+  if InterLockedIncrement(fOnChangeLevel)>1 then
     exit;
-  fOnChangeHidden := fOnChange;
+  fSafe.Lock;
+  fOnChangeBackupForBeginUpdate := fOnChange;
   fOnChange := OnChangeHidden;
-  fOnChangeTrigerred := false;
-end;
-
-procedure TRawUTF8List.Changed;
-begin
-  if (self<>nil) and Assigned(fOnChange) then
-    fOnChange(self);
-end;
-
-procedure TRawUTF8List.Clear;
-begin
-  Capacity := 0;
-  Changed;
-end;
-
-constructor TRawUTF8List.Create(aOwnObjects: boolean);
-begin
-  fNameValueSep := '=';
-  fObjectsOwned := aOwnObjects;
-  fCaseSensitive := true;
-end;
-
-destructor TRawUTF8List.Destroy;
-begin
-  Capacity := 0;
-  inherited;
-end;
-
-procedure TRawUTF8List.Delete(Index: PtrInt);
-begin
-  if (self=nil) or (PtrUInt(Index)>=PtrUInt(fCount)) then
-    exit;
-  // release string/object instances
-  fList[Index] := '';
-  if (fObjects<>nil) and fObjectsOwned then
-    FreeAndNil(fObjects[Index]);
-  // swap the string/object arrays
-  dec(fCount);
-  if Index<fCount then begin
-    MoveFast(fList[Index+1],fList[Index],(fCount-Index)*SizeOf(fList[0]));
-    PPointer(@fList[fCount])^ := nil; // avoid GPF
-    if fObjects<>nil then begin
-      MoveFast(fObjects[Index+1],fObjects[Index],(fCount-Index)*SizeOf(fObjects[0]));
-      fObjects[fCount] := nil; // avoid GPF if fObjectsOwned is set
-    end;
-  end;
-  Changed;
-end;
-
-function TRawUTF8List.Delete(const aText: RawUTF8): PtrInt;
-begin
-  Result := IndexOf(aText);
-  if Result>=0 then
-    Delete(Result);
-end;
-
-function TRawUTF8List.DeleteFromName(const Name: RawUTF8): PtrInt;
-begin
-  Result := IndexOfName(Name);
-  if Result>=0 then
-    Delete(Result);
+  exclude(fFlags,fOnChangeTrigerred);
 end;
 
 procedure TRawUTF8List.EndUpdate;
 begin
-  if fOnChangeLevel<=0 then
-    exit;
-  dec(fOnChangeLevel);
-  if fOnChangeLevel>0 then
+  if (fOnChangeLevel<=0) or (InterLockedDecrement(fOnChangeLevel)>0) then
     exit; // allows nested BeginUpdate..EndUpdate calls
-  fOnChange := fOnChangeHidden;
-  if fOnChangeTrigerred and Assigned(fOnChange) then
-    fOnChange(self);
-  fOnChangeTrigerred := false;
+  fOnChange := fOnChangeBackupForBeginUpdate;
+  if (fOnChangeTrigerred in fFlags) and Assigned(fOnChange) then
+    Changed;
+  exclude(fFlags,fOnChangeTrigerred);
+  fSafe.UnLock;
+end;
+
+procedure TRawUTF8List.Changed;
+begin
+  if Assigned(fOnChange) then
+    try
+      fOnChange(self);
+    except // ignore any exception in user code (may not trigger fSafe.UnLock)
+    end;
+end;
+
+procedure TRawUTF8List.Clear;
+begin
+  SetCapacity(0); // will also call Changed
+end;
+
+procedure TRawUTF8List.InternalDelete(Index: PtrInt);
+begin // caller ensured Index is correct
+  fValues.Delete(Index); // includes dec(fCount)
+  if PtrUInt(Index)<PtrUInt(length(fObjects)) then begin
+    if fObjectsOwned in fFlags then
+      fObjects[Index].Free;
+    if fCount>Index then
+      MoveFast(fObjects[Index+1],fObjects[Index],(fCount-Index)*SizeOf(pointer));
+    fObjects[fCount] := nil;
+  end;
+  Changed;
+end;
+
+procedure TRawUTF8List.Delete(Index: PtrInt);
+begin
+  if (self<>nil) and (PtrUInt(Index)<PtrUInt(fCount)) then
+    if fNoDuplicate in fFlags then // force update the hash table
+      Delete(fValue[Index]) else
+      InternalDelete(Index);
+end;
+
+function TRawUTF8List.Delete(const aText: RawUTF8): PtrInt;
+begin
+  fSafe.Lock;
+  try
+    if fNoDuplicate in fFlags then
+      result := fValues.FindHashedAndDelete(aText,nil,{nodelete=}true) else
+      result := FindRawUTF8(pointer(fValue),aText,fCount,fCaseSensitive in fFlags);
+    if result>=0 then
+      InternalDelete(result);
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+function TRawUTF8List.DeleteFromName(const Name: RawUTF8): PtrInt;
+begin
+  fSafe.Lock;
+  try
+    result := IndexOfName(Name);
+    Delete(result);
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+function TRawUTF8List.IndexOf(const aText: RawUTF8): PtrInt;
+begin
+  if self<>nil then begin
+    fSafe.Lock;
+    try
+      if fNoDuplicate in fFlags then
+        result := fValues.FindHashed(aText) else
+        result := FindRawUTF8(pointer(fValue),aText,fCount,fCaseSensitive in fFlags);
+    finally
+      fSafe.UnLock;
+    end;
+  end else
+    result := -1;
 end;
 
 function TRawUTF8List.Get(Index: PtrInt): RawUTF8;
 begin
   if (self=nil) or (PtrUInt(Index)>=PtrUInt(fCount)) then
     result := '' else
-    result := fList[Index];
+    result := fValue[Index];
 end;
 
 function TRawUTF8List.GetCapacity: PtrInt;
 begin
   if self=nil then
     result := 0 else
-    result := length(fList);
+    result := length(fValue);
 end;
 
 function TRawUTF8List.GetCount: PtrInt;
@@ -59701,11 +59827,11 @@ begin
     result := fCount;
 end;
 
-function TRawUTF8List.GetListPtr: PPUtf8CharArray;
+function TRawUTF8List.GetTextPtr: PPUtf8CharArray;
 begin
   if self=nil then
     result := nil else
-    result := pointer(fList);
+    result := pointer(fValue);
 end;
 
 function TRawUTF8List.GetObjectPtr: PPointerArray;
@@ -59726,28 +59852,26 @@ begin
     SetLength(result,Index-1);
 end;
 
-function TRawUTF8List.GetObject(Index: PtrInt): TObject;
+function TRawUTF8List.GetObject(Index: PtrInt): pointer;
 begin
-  if (self<>nil) and (PtrUInt(Index)<PtrUInt(fCount)) and (fObjects<>nil) then
+  if (self<>nil) and (fObjects<>nil) and (PtrUInt(Index)<PtrUInt(fCount)) then
     result := fObjects[Index] else
     result := nil;
 end;
 
-function TRawUTF8List.GetObjectByName(const Name: RawUTF8): TObject;
+function TRawUTF8List.GetObjectFrom(const aText: RawUTF8): pointer;
 var ndx: PtrUInt;
 begin
+  result := nil;
   if (self<>nil) and (fObjects<>nil) then begin
-    ndx := IndexOf(Name);
-    if ndx<PtrUInt(fCount) then begin
-      result := fObjects[ndx];
-      exit;
-    end else begin
-      result := nil;
-      exit;
+    fSafe.Lock;
+    try
+      ndx := IndexOf(aText);
+      if ndx<PtrUInt(fCount) then
+        result := fObjects[ndx];
+    finally
+      fSafe.UnLock;
     end;
-  end else begin
-    result := nil;
-    exit;
   end;
 end;
 
@@ -59758,49 +59882,59 @@ begin
   result := '';
   if (self=nil) or (fCount=0) then
     exit;
-  DelimLen := length(Delimiter);
-  Len := DelimLen*(fCount-1);
-  for i := 0 to fCount-1 do
-    inc(Len,length(fList[i]));
-  FastSetString(result,nil,len);
-  P := pointer(result);
-  i := 0;
-  repeat
-    Len := length(fList[i]);
-    if Len>0 then begin
-      MoveFast(pointer(fList[i])^,P^,Len);
-      inc(P,Len);
-    end;
-    inc(i);
-    if i>=fCount then
-      Break;
-    if DelimLen>0 then begin
-      MoveSmall(pointer(Delimiter),P,DelimLen);
-      inc(P,DelimLen);
-    end;
-  until false;
+  fSafe.Lock;
+  try
+    DelimLen := length(Delimiter);
+    Len := DelimLen*(fCount-1);
+    for i := 0 to fCount-1 do
+      inc(Len,length(fValue[i]));
+    FastSetString(result,nil,len);
+    P := pointer(result);
+    i := 0;
+    repeat
+      Len := length(fValue[i]);
+      if Len>0 then begin
+        MoveFast(pointer(fValue[i])^,P^,Len);
+        inc(P,Len);
+      end;
+      inc(i);
+      if i>=fCount then
+        Break;
+      if DelimLen>0 then begin
+        MoveSmall(pointer(Delimiter),P,DelimLen);
+        inc(P,DelimLen);
+      end;
+    until false;
+  finally
+    fSafe.UnLock;
+  end;
 end;
 
 procedure TRawUTF8List.SaveToStream(Dest: TStream; const Delimiter: RawUTF8);
 var W: TTextWriter;
-    i: integer;
+    i: PtrInt;
     temp: TTextWriterStackBuffer;
 begin
   if (self=nil) or (fCount=0) then
     exit;
-  W := TTextWriter.Create(Dest,@temp,SizeOf(temp));
+  fSafe.Lock;
   try
-    i := 0;
-    repeat
-      W.AddString(fList[i]);
-      inc(i);
-      if i>=fCount then
-        Break;
-      W.AddString(Delimiter);
-    until false;
-    W.FlushFinal;
+    W := TTextWriter.Create(Dest,@temp,SizeOf(temp));
+    try
+      i := 0;
+      repeat
+        W.AddString(fValue[i]);
+        inc(i);
+        if i>=fCount then
+          Break;
+        W.AddString(Delimiter);
+      until false;
+      W.FlushFinal;
+    finally
+      W.Free;
+    end;
   finally
-    W.Free;
+    fSafe.UnLock;
   end;
 end;
 
@@ -59822,7 +59956,12 @@ end;
 
 function TRawUTF8List.GetValue(const Name: RawUTF8): RawUTF8;
 begin
-  Result := GetValueAt(IndexOfName(Name));
+  fSafe.Lock;
+  try
+    result := GetValueAt(IndexOfName(Name));
+  finally
+    fSafe.UnLock;
+  end;
 end;
 
 function TRawUTF8List.GetValueAt(Index: PtrInt): RawUTF8;
@@ -59838,27 +59977,13 @@ begin
     result := copy(result,Index+1,maxInt);
 end;
 
-function TRawUTF8List.IndexOf(const aText: RawUTF8): PtrInt;
-begin
-  if self<>nil then
-    if fCaseSensitive then begin
-      for result := 0 to fCount-1 do
-        if fList[result]=aText then
-          exit;
-    end else
-      for result := 0 to fCount-1 do
-        if UTF8IComp(pointer(fList[result]),pointer(aText))=0 then
-          exit;
-  result := -1;
-end;
-
 function TRawUTF8List.IndexOfName(const Name: RawUTF8): PtrInt;
 var UpperName: array[byte] of AnsiChar;
 begin
   if self<>nil then begin
     PWord(UpperCopy255(UpperName,Name))^ := ord(NameValueSep);
     for result := 0 to fCount-1 do
-      if IdemPChar(Pointer(fList[result]),UpperName) then
+      if IdemPChar(Pointer(fValue[result]),UpperName) then
         exit;
   end;
   result := -1;
@@ -59875,7 +60000,7 @@ function TRawUTF8List.Contains(const aText: RawUTF8; aFirstIndex: integer): PtrI
 begin
   if self<>nil then
     for result := aFirstIndex to fCount-1 do
-      if PosEx(aText,fList[result])>0 then
+      if PosEx(aText,fValue[result])>0 then
         exit;
   result := -1;
 end;
@@ -59883,57 +60008,28 @@ end;
 procedure TRawUTF8List.OnChangeHidden(Sender: TObject);
 begin
   if self<>nil then
-    fOnChangeTrigerred := true;
+    include(fFlags,fOnChangeTrigerred);
 end;
 
 procedure TRawUTF8List.Put(Index: PtrInt; const Value: RawUTF8);
 begin
   if (self<>nil) and (PtrUInt(Index)<PtrUInt(fCount)) then begin
-    fList[Index] := Value;
+    fValue[Index] := Value;
     Changed;
   end;
 end;
 
-procedure TRawUTF8List.PutObject(Index: PtrInt; const Value: TObject);
+procedure TRawUTF8List.PutObject(Index: PtrInt; Value: pointer);
 begin
   if (self<>nil) and (PtrUInt(Index)<PtrUInt(fCount)) then begin
     if fObjects=nil then
-      SetLength(fObjects,Length(fList));
+      SetLength(fObjects,Length(fValue));
     fObjects[Index] := Value;
     Changed;
   end;
 end;
 
-procedure TRawUTF8List.SetCapacity(const Value: PtrInt);
-var i: integer;
-begin
-  if self<>nil then begin
-    if Value<=0 then begin
-      fList := nil;
-      if fObjects<>nil then begin
-        if fObjectsOwned then
-          for i := 0 to fCount-1 do
-            fObjects[i].Free;
-        fObjects := nil;
-      end;
-      fCount := 0;
-    end else begin
-      if Value<fCount then begin
-        if (fObjects<>nil) and fObjectsOwned then
-          for i := Value to fCount-1 do
-            FreeAndNil(fObjects[i]);
-        fCount := Value;
-      end;
-      if Value>length(fList) then begin // increase capacity
-        SetLength(fList,Value);
-        if pointer(fObjects)<>nil then
-          SetLength(fObjects,Value);
-      end;
-    end;
-  end;
-end;
-
-procedure TRawUTF8List.SetText(const aText, Delimiter: RawUTF8);
+procedure TRawUTF8List.SetText(const aText: RawUTF8; const Delimiter: RawUTF8);
 begin
   SetTextPtr(pointer(aText),PUTF8Char(pointer(aText))+length(aText),Delimiter);
 end;
@@ -59965,26 +60061,29 @@ var DelimLen: PtrInt;
     Line: RawUTF8;
 begin
   DelimLen := length(Delimiter);
-  BeginUpdate;
-  Clear;
-  if (P<>nil) and (DelimLen>0) and (P<PEnd) then begin
-    DelimFirst := Delimiter[1];
-    DelimNext := PUTF8Char(pointer(Delimiter))+1;
-    repeat
-      PBeg := P;
-      while P<PEnd do begin
-        if (P^=DelimFirst) and CompareMemSmall(P+1,DelimNext,DelimLen-1) then
+  BeginUpdate; // also makes fSafe.Lock
+  try
+    Clear;
+    if (P<>nil) and (DelimLen>0) and (P<PEnd) then begin
+      DelimFirst := Delimiter[1];
+      DelimNext := PUTF8Char(pointer(Delimiter))+1;
+      repeat
+        PBeg := P;
+        while P<PEnd do begin
+          if (P^=DelimFirst) and CompareMemSmall(P+1,DelimNext,DelimLen-1) then
+            break;
+          inc(P);
+        end;
+        FastSetString(Line,PBeg,P-PBeg);
+        AddObject(Line,nil);
+        if P>=PEnd then
           break;
-        inc(P);
-      end;
-      FastSetString(Line,PBeg,P-PBeg);
-      AddObject(Line,nil);
-      if P>=PEnd then
-        break;
-      inc(P,DelimLen);
-    until P>=PEnd;
+        inc(P,DelimLen);
+      until P>=PEnd;
+    end;
+  finally
+    EndUpdate;
   end;
-  EndUpdate;
 end;
 
 procedure TRawUTF8List.SetTextCRLF(const Value: RawUTF8);
@@ -59994,109 +60093,93 @@ end;
 
 procedure TRawUTF8List.SetValue(const Name, Value: RawUTF8);
 var i: PtrInt;
+    txt: RawUTF8;
 begin
-  i := IndexOfName(Name);
-  if i<0 then
-    Add(Name+RawUTF8(NameValueSep)+Value) else
-    fList[i] := Name+RawUTF8(NameValueSep)+Value;
+  txt := Name+RawUTF8(NameValueSep)+Value;
+  fSafe.Lock;
+  try
+    i := IndexOfName(Name);
+    if i<0 then
+      AddObject(txt,nil) else
+    if fValue[i]<>txt then begin
+      fValue[i] := txt;
+      if fNoDuplicate in fFlags then
+        fValues.Hasher.Clear; // invalidate internal hash table
+      Changed;
+    end;
+  finally
+    fSafe.UnLock;
+  end;
 end;
 
-procedure TRawUTF8List.SetCaseSensitive(Value: boolean);
+function TRawUTF8List.GetCaseSensitive: boolean;
 begin
-  fCaseSensitive := Value;
+  result := (self<>nil) and (fCaseSensitive in fFlags);
 end;
 
-procedure TRawUTF8List.UpdateValue(const Name: RawUTF8; var Value: RawUTF8;
-  ThenDelete: boolean);
+function TRawUTF8List.GetNoDuplicate: boolean;
+begin
+  result := (self<>nil) and (fNoDuplicate in fFlags);
+end;
+
+function TRawUTF8List.UpdateValue(const Name: RawUTF8; var Value: RawUTF8;
+  ThenDelete: boolean): boolean;
 var i: PtrInt;
 begin
-  i := IndexOfName(Name);
-  if i>=0 then begin
-    Value := GetValueAt(i); // update value
-    if ThenDelete then
-      Delete(i); // optionally delete
+  result := false;
+  fSafe.Lock;
+  try
+    i := IndexOfName(Name);
+    if i>=0 then begin
+      Value := GetValueAt(i); // copy value
+      if ThenDelete then
+        Delete(i); // optionally delete
+      result := true;
+    end;
+  finally
+    fSafe.UnLock;
   end;
 end;
 
 function TRawUTF8List.PopFirst(out aText: RawUTF8; aObject: PObject): boolean;
 begin
-  result := fCount>0;
-  if not result then
+  result := false;
+  if fCount=0 then
     exit;
-  aText := fList[0];
-  if aObject<>nil then
-    if fObjects<>nil then
-      aObject^ := fObjects[0] else
-      aObject^ := nil;
-  Delete(0);
+  fSafe.Lock;
+  try
+    if fCount>0 then begin
+      aText := fValue[0];
+      if aObject<>nil then
+        if fObjects<>nil then
+          aObject^ := fObjects[0] else
+          aObject^ := nil;
+      Delete(0);
+      result := true;
+    end;
+  finally
+    fSafe.UnLock;
+  end;
 end;
 
 function TRawUTF8List.PopLast(out aText: RawUTF8; aObject: PObject): boolean;
-var ndx: integer;
-begin
-  result := fCount>0;
-  if not result then
-    exit;
-  ndx := fCount-1;
-  aText := fList[ndx];
-  if aObject<>nil then
-    if fObjects<>nil then
-      aObject^ := fObjects[ndx] else
-      aObject^ := nil;
-  Delete(ndx);
-end;
-
-
-{ TRawUTF8ListLocked }
-
-constructor TRawUTF8ListLocked.Create(aOwnObjects: boolean);
-begin
-  inherited Create(aOwnObjects);
-  fSafe.Init;
-end;
-
-destructor TRawUTF8ListLocked.Destroy;
-begin
-  inherited;
-  fSafe.Done;
-end;
-
-procedure TRawUTF8ListLocked.SafePush(const aValue: RawUTF8);
-begin
-  if self=nil then
-    exit;
-  fSafe.Lock;
-  try
-    Add(aValue);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListLocked.SafePop(out aValue: RawUTF8): boolean;
+var last: PtrInt;
 begin
   result := false;
-  if (self=nil) or (fCount=0) then
+  if fCount=0 then
     exit;
   fSafe.Lock;
   try
-    if fCount=0 then
-      exit;
-    aValue := fList[0];
-    Delete(0);
-    result := true;
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-procedure TRawUTF8ListLocked.SafeClear;
-begin
-  if self=nil then
-    exit;
-  fSafe.Lock;
-  try
-    Clear;
+    last := fCount-1;
+    if last>=0 then begin
+      aText := fValue[last];
+      if aObject<>nil then
+        if fObjects<>nil then
+          aObject^ := fObjects[last] else
+          aObject^ := nil;
+      Delete(last);
+      result := true;
+    end;
   finally
     fSafe.UnLock;
   end;
@@ -60367,297 +60450,6 @@ begin
     Clear;
   finally
     Safe.UnLock;
-  end;
-end;
-
-
-{ TRawUTF8ListHashed }
-
-{$ifdef PUREPASCAL}
-function SortDynArrayAnsiStringHashOnly(const A,B): integer;
-begin
-  if RawByteString(A)=RawByteString(B) then // faster than StrCmp
-    result := 0 else
-    result := 1; // fake comparison, but fHash only use equality
-end;
-{$endif}
-
-var
-  DYNARRAY_SORTFIRSTFIELDHASHONLY: array[boolean] of TDynArraySortCompare = (
-    SortDynArrayAnsiStringI,
-    {$ifdef PUREPASCAL}SortDynArrayAnsiStringHashOnly
-    {$else}SortDynArrayAnsiString{$endif});
-
-constructor TRawUTF8ListHashed.Create(aOwnObjects: boolean);
-begin
-  inherited Create(aOwnObjects);
-  fHash.Init(TypeInfo(TRawUTF8DynArray),fList,@HashAnsiString,
-    DYNARRAY_SORTFIRSTFIELDHASHONLY[true],nil,@fCount);
-end;
-
-procedure TRawUTF8ListHashed.Changed;
-begin
-  fChanged := true;
-  inherited;
-end;
-
-procedure TRawUTF8ListHashed.SetCaseSensitive(Value: boolean);
-begin
-  if fCaseSensitive=Value then
-    exit;
-  inherited;
-  fHash.fHash.HashElement := DYNARRAY_HASHFIRSTFIELD[not Value,djRawUTF8];
-  fHash.fHash.Compare :=  DYNARRAY_SORTFIRSTFIELDHASHONLY[Value];
-  fHash.fHash.Clear;
-  if not fChanged then
-    fChanged := Count>0; // force re-hash next IndexOf() call
-end;
-
-procedure TRawUTF8ListHashed.RehashOnChanged;
-var collisions: integer;
-begin // rough but safe if user called non-hash-aware methods
-  collisions := fHash.Rehash({forced=}true);
-  if collisions<>0 then
-    raise ESynException.CreateUTF8('%.Rehash collisions=%',[self,collisions]);
-  fChanged := false;
-end;
-
-function TRawUTF8ListHashed.IndexOf(const aText: RawUTF8): PtrInt;
-begin
-  if fChanged then
-    RehashOnChanged;
-  result := fHash.FindHashed(aText);
-end;
-
-function TRawUTF8ListHashed.Delete(const aText: RawUTF8): PtrInt;
-begin
-  if fChanged then
-    RehashOnChanged;
-  result := fHash.FindHashedAndDelete(aText);
-end;
-
-function TRawUTF8ListHashed.AddIfNotExisting(const aText: RawUTF8;
-  wasAdded: PBoolean): PtrInt;
-var added: boolean;
-begin
-  if fChanged then
-    RehashOnChanged;
-  result := fHash.FindHashedForAdding(aText,added);
-  if added then begin
-    fList[result] := aText;
-    if (fObjects<>nil) and (length(fObjects)<>length(fList)) then
-      SetLength(fObjects,length(fList));
-  end;
-  if wasAdded<>nil then
-    wasAdded^ := added;
-end;
-
-function TRawUTF8ListHashed.AddObjectIfNotExisting(
-  const aText: RawUTF8; aObject: TObject; wasAdded: PBoolean): PtrInt;
-var added: boolean;
-begin
-  if fChanged then
-    RehashOnChanged;
-  result := fHash.FindHashedForAdding(aText,added);
-  if added then begin
-    fList[result] := aText;
-    if length(fObjects)<>length(fList) then
-      SetLength(fObjects,length(fList));
-    fObjects[result] := aObject;
-  end;
-  if wasAdded<>nil then
-    wasAdded^ := added;
-end;
-
-function TRawUTF8ListHashed.HashFind(aHashCode: cardinal): integer;
-begin
-  result := fHash.fHash.Find(aHashCode,{foradd=}false);
-end;
-
-function TRawUTF8ListHashed.ReHash(aForceRehash: boolean): boolean;
-begin
-  result := fChanged or aForceRehash;
-  if result then begin
-    fChanged := false;
-    RehashOnChanged;
-  end;
-end;
-
-
-{ TRawUTF8ListHashedLocked }
-
-constructor TRawUTF8ListHashedLocked.Create(aOwnObjects: boolean);
-begin
-  inherited Create(aOwnObjects);
-  fSafe.Init;
-end;
-
-destructor TRawUTF8ListHashedLocked.Destroy;
-begin
-  fSafe.Done;
-  inherited;
-end;
-
-function TRawUTF8ListHashedLocked.LockedAdd(const aText: RawUTF8): PtrInt;
-begin
-  fSafe.Lock;
-  try
-    result := inherited Add(aText);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.IndexOf(const aText: RawUTF8): PtrInt;
-begin
-  fSafe.Lock;
-  try
-    result := inherited IndexOf(aText);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.LockedGetObjectByName(const aText: RawUTF8): TObject;
-begin
-  fSafe.Lock;
-  try
-    result := inherited GetObjectByName(aText);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.AddIfNotExisting(const aText: RawUTF8;
-  wasAdded: PBoolean): PtrInt;
-begin
-  fSafe.Lock;
-  try
-    result := inherited AddIfNotExisting(aText,wasAdded);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.AddObjectIfNotExisting(const aText: RawUTF8;
-  aObject: TObject; wasAdded: PBoolean): PtrInt;
-begin
-  fSafe.Lock;
-  try
-    result := inherited AddObjectIfNotExisting(aText,aObject,wasAdded);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.Delete(const aText: RawUTF8): PtrInt;
-begin
-  fSafe.Lock;
-  try
-    result := inherited IndexOf(aText);
-    if result>=0 then
-      inherited Delete(result);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.DeleteFromName(const Name: RawUTF8): PtrInt;
-begin
-  fSafe.Lock;
-  try
-    result := inherited IndexOfName(Name);
-    if result>=0 then
-      inherited Delete(result);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.PopFirst(out aText: RawUTF8; aObject: PObject): boolean;
-begin
-  fSafe.Lock;
-  try
-    result := inherited PopFirst(aText,aObject);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.PopLast(out aText: RawUTF8; aObject: PObject): boolean;
-begin
-  fSafe.Lock;
-  try
-    result := inherited PopLast(aText,aObject);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-procedure TRawUTF8ListHashedLocked.Clear;
-begin
-  fSafe.Lock;
-  try
-    inherited Clear;
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-function TRawUTF8ListHashedLocked.ReHash(aForceRehash: boolean): boolean;
-begin
-  fSafe.Lock;
-  try
-    result := inherited Rehash(aForceRehash);
-  finally
-    fSafe.UnLock;
-  end;
-end;
-
-
-{ TRawUTF8MethodList }
-
-function TRawUTF8MethodList.AddEvent(const aName: RawUTF8;
-  const aEvent: TMethod): PtrInt;
-begin
-  result := Add(aName);
-  if result>=length(fEvents) then
-    SetLength(fEvents,result+256);
-  fEvents[result] := aEvent;
-end;
-
-procedure TRawUTF8MethodList.Clear;
-begin
-  inherited Clear;
-  fEvents := nil;
-end;
-
-procedure TRawUTF8MethodList.Delete(Index: PtrInt);
-begin
-  inherited Delete(Index);
-  if Index<length(fEvents) then
-    MoveFast(fEvents[Index+1],fEvents[Index],(length(fEvents)-Index)*SizeOf(TMethod));
-end;
-
-function TRawUTF8MethodList.GetEvent(aIndex: PtrInt;
-  out aEvent: TMethod): boolean;
-begin
-  result := aIndex<length(fEvents);
-  if result then
-    aEvent := fEvents[aIndex];
-end;
-
-function TRawUTF8MethodList.GetEventByName(const aText: RawUTF8;
-  out aEvent: TMethod): boolean;
-var i: integer;
-begin
-  result := false;
-  if self=nil then
-    exit;
-  i := IndexOf(aText);
-  if (i>=0) and (i<length(fEvents)) then begin
-    result := true;
-    aEvent := fEvents[i];
   end;
 end;
 
@@ -62064,13 +61856,18 @@ var i: integer;
 begin
   if List=nil then
     WriteVarUInt32(0) else begin
-    WriteRawUTF8DynArray(List.fList,List.Count);
-    if List.fObjects=nil then
-      StoreObjectsAsVarUInt32 := false; // no Objects[] values
-    Write(@StoreObjectsAsVarUInt32,1);
-    if StoreObjectsAsVarUInt32 then
-      for i := 0 to List.fCount-1 do
-        WriteVarUInt32(PtrUInt(List.fObjects[i]));
+    List.Safe.Lock;
+    try
+      WriteRawUTF8DynArray(List.fValue,List.Count);
+      if List.fObjects=nil then
+        StoreObjectsAsVarUInt32 := false; // no Objects[] values
+      Write(@StoreObjectsAsVarUInt32,1);
+      if StoreObjectsAsVarUInt32 then
+        for i := 0 to List.fCount-1 do
+          WriteVarUInt32(PtrUInt(List.fObjects[i]));
+    finally
+      List.Safe.UnLock;
+    end;
   end;
 end;
 
@@ -62840,24 +62637,23 @@ function TFileBufferReader.ReadRawUTF8List(List: TRawUTF8List): boolean;
 var i: integer;
     StoreObjectsAsVarUInt32: Boolean;
 begin
-  if (fMap.fBuf<>nil) and (List<>nil) then
-  with List do begin
-    BeginUpdate;
+  if (fMap.fBuf<>nil) and (List<>nil) then begin
+    List.BeginUpdate;
     try
-      Capacity := 0; // finalize both fObjects[] and fList[]
-      fCount := ReadVarRawUTF8DynArray(List.fList);
+      List.Clear; // finalize both fObjects[] and fList[]
+      List.fCount := ReadVarRawUTF8DynArray(List.fValue);
       result := true;
-      if fCount=0 then
+      if List.fCount=0 then
         exit;
       Read(@StoreObjectsAsVarUInt32,1);
       if StoreObjectsAsVarUInt32 then begin
-        fObjectsOwned := false; // Int32 here, not instances
-        SetLength(fObjects,Capacity);
-        for i := 0 to fCount-1 do
-          fObjects[i] := TObject(ReadVarUInt32);
+        exclude(List.fFlags,fObjectsOwned); // Int32 here, not instances
+        SetLength(List.fObjects,length(List.fValue));
+        for i := 0 to List.fCount-1 do
+          List.fObjects[i] := TObject(ReadVarUInt32);
       end;
     finally
-      EndUpdate;
+      List.EndUpdate;
     end;
   end else
     result := false;
@@ -64903,6 +64699,15 @@ begin
 end;
 
 {$ifdef CPUINTEL}
+function IsXmmYmmOSEnabled: boolean; assembler;
+asm // see https://software.intel.com/en-us/blogs/2011/04/14/is-avx-enabled
+        xor     ecx, ecx  // specify control register XCR0 = XFEATURE_ENABLED_MASK
+        db  $0f, $01, $d0 // XGETBV reads XCR (extended control register) into EDX:EAX
+        and     eax, 6    // check OS has enabled both XMM (bit 1) and YMM (bit 2)
+        cmp     al, 6
+        sete    al
+end;
+
 procedure TestIntelCpuFeatures;
 var regs: TRegisters;
     c: cardinal;
@@ -64921,17 +64726,22 @@ begin
   // may be needed on Darwin x64 (as reported by alf)
   Exclude(CpuFeatures, cfSSE42);
   Exclude(CpuFeatures, cfAESNI);
-  {$endif}
+  {$endif DISABLE_SSE42}
+  if not(cfOSXS in CpuFeatures) or not IsXmmYmmOSEnabled then
+    CpuFeatures := CpuFeatures-[cfAVX,cfAVX2,cfFMA];
+  {$ifndef ABSOLUTEPASCAL}
   {$ifdef CPUX64}
   {$ifdef WITH_ERMS}
   if cfERMS in CpuFeatures then // actually slower than our AVX code -> disabled
     include(CPUIDX64,cpuERMS);
   {$endif WITH_ERMS}
-  if cfAVX in CpuFeatures then
+  if cfAVX in CpuFeatures then begin
     include(CPUIDX64,cpuAVX);
-  if cfAVX2 in CpuFeatures then
-    include(CPUIDX64,cpuAVX2);
+    if cfAVX2 in CpuFeatures then
+      include(CPUIDX64,cpuAVX2);
+  end;
   {$endif CPUX64}
+  {$endif ABSOLUTEPASCAL}
   // validate accuracy of most used HW opcodes
   if cfRAND in CpuFeatures then
     try
@@ -65089,7 +64899,6 @@ begin
   end;
   UpperCopy255Buf := @UpperCopy255BufPas;
   DefaultHasher := @xxHash32; // faster than crc32cfast for small content
-  GetBitsCountPtrInt := @GetBitsCountPas;
   {$ifndef ABSOLUTEPASCAL}
   {$ifdef CPUINTEL}
   {$ifdef FPC} // done in InitRedirectCode for Delphi
@@ -65205,7 +65014,7 @@ initialization
   TTextWriter.RegisterCustomJSONSerializerFromText([
     TypeInfo(TFindFilesDynArray),
      'Name:string Attr:Integer Size:Int64 Timestamp:TDateTime']);
-  // some type definition assertions
+  // some paranoid cross-platform/cross-compiler assertions
   {$ifndef NOVARIANTS}
   Assert(SizeOf(TDocVariantData)=SizeOf(TVarData));
   DocVariantType := TDocVariant(SynRegisterCustomVariantType(TDocVariant));
@@ -65224,8 +65033,8 @@ initialization
   {$ifdef MSWINDOWS}
   {$ifndef CPU64}
   Assert(SizeOf(TFileTime)=SizeOf(Int64)); // see e.g. FileTimeToInt64
-  {$endif}
-  {$endif}
+  {$endif CPU64}
+  {$endif MSWINDOWS}
 
 finalization
   GarbageCollectorFree;

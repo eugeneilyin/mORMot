@@ -3939,6 +3939,7 @@ var i,j: integer;
     Timer: TPrecisionTimer;
     c1,c2: cardinal;
     crc1,crc2: THash128;
+    crcs: THash512Rec;
     digest: THash256;
     tmp: RawByteString;
     hmac32: THMAC_CRC32C;
@@ -3983,6 +3984,19 @@ begin
   check(not IsZero(crc1));
   check(IsEqual(crc1,crc2));
   {$endif}
+  for i := 0 to high(crcs.b) do
+    crcs.b[i] := i;
+  for j := 1 to 4 do begin
+    FillZero(crc2);
+    crcblockreference(@crc2,@crcs.h0);
+    if j>1 then crcblockreference(@crc2,@crcs.h1);
+    if j>2 then crcblockreference(@crc2,@crcs.h2);
+    if j>3 then crcblockreference(@crc2,@crcs.h3);
+    FillZero(crc1);
+    crcblocks(@crc1,@crcs.h0,j);
+    check(not IsZero(crc1));
+    check(IsEqual(crc1,crc2),'crcblocks4');
+  end;
   for i := 0 to 50000 do begin
     FillZero(crc1);
     crcblock(@crc1,@digest);
@@ -6947,6 +6961,36 @@ begin
   Check(ni = 10);
   Check(nt = 'toto');
   {$endif}
+  JSONToVariant(v,nil);
+  Check(vd.VType=varEmpty);
+  JSONToVariant(v,'');
+  Check(vd.VType=varEmpty);
+  JSONToVariant(v,'null');
+  Check(vd.VType=varNull);
+  JSONToVariant(v,'false');
+  Check(not boolean(v));
+  JSONToVariant(v,'true');
+  Check(boolean(v));
+  JSONToVariant(v,'0');
+  Check(vd.VType=varInteger);
+  JSONToVariant(v,'123456789012345678');
+  Check(vd.VType=varInt64);
+  Check(v=123456789012345678);
+  JSONToVariant(v,'123.1234');
+  Check(vd.VType=varCurrency);
+  CheckSame(v,123.1234);
+  JSONToVariant(v,'-1E-300',[],true);
+  Check(vd.VType=varDouble);
+  CheckSame(v,-1e-300);
+  JSONToVariant(v,'[]');
+  Check(V._kind=ord(dvArray));
+  Check(V._count=0);
+  JSONToVariant(v,'{}');
+  Check(V._kind=ord(dvObject));
+  Check(V._count=0);
+  v := JSONToVariant('"toto\r\ntoto"');
+  Check(vd.VType=varString);
+  Check(v='toto'#$D#$A'toto');
 end;
 
 type
@@ -12181,7 +12225,7 @@ begin
   Check(clo+chi=2000);
   Check(dlo+dhi=4000);
   Check(elo+ehi=4000);
-  CheckUTF8((clo>=945) and (clo<=1055),'Random32 distribution clo=%',[clo]);
+  CheckUTF8((clo>=900) and (clo<=1100),'Random32 distribution clo=%',[clo]);
   CheckUTF8((dlo>=1900) and (dlo<=2100),'RandomDouble distribution dlo=%',[dlo]);
   CheckUTF8((elo>=1900) and (elo<=2100),'RandomExt distribution elo=%',[elo]);
   s1 := TAESPRNG.Main.FillRandom(100);

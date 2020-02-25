@@ -9829,7 +9829,7 @@ type
     // - very fast, thanks to the use of a dynamic array with one entry by table
     fLocks: TSQLLocksDynArray;
     /// for fastest SQL Table name lookup via O(log(n)) binary search
-    fSortedTablesName: TRawUTF8DynArray;
+    fSortedTablesNameUpper: TRawUTF8DynArray;
     fSortedTablesNameIndex: TIntegerDynArray;
     /// will contain the registered virtual table modules
     fVirtualTableModule: array of TSQLVirtualTableClass;
@@ -34277,7 +34277,7 @@ begin
       Props.Props.SetCustomCollationForAll(t,fCustomCollationForAll[t]);
   fTableProps[aIndex] := Props;
   aTableName := Props.Props.SQLTableName;
-  fSortedTablesName[aIndex] := aTableName;
+  UpperCaseCopy(aTableName,fSortedTablesNameUpper[aIndex]);
   fSortedTablesNameIndex[aIndex] := aIndex;
   fields := Props.Props.Fields;
   for f := 0 to fields.Count-1 do
@@ -34354,12 +34354,12 @@ begin
   inc(fTablesMax);
   n := fTablesMax+1;
   SetLength(fTables,n);
-  SetLength(fSortedTablesName,n);
+  SetLength(fSortedTablesNameUpper,n);
   SetLength(fSortedTablesNameIndex,n);
   SetLength(fTableProps,n);
   fTables[fTablesMax] := aTable;
   SetTableProps(fTablesMax);
-  QuickSortRawUTF8(fSortedTablesName,fTablesMax+1,@fSortedTablesNameIndex,@StrIComp);
+  QuickSortRawUTF8(fSortedTablesNameUpper,fTablesMax+1,@fSortedTablesNameIndex);
   if aTableIndexCreated<>nil then
     aTableIndexCreated^ := fTablesMax;
   result := true;
@@ -34397,7 +34397,7 @@ begin
   fActions := CloneFrom.fActions;
   fEvents := CloneFrom.fEvents;
   fRestOwner := CloneFrom.fRestOwner;
-  fSortedTablesName := CloneFrom.fSortedTablesName;
+  fSortedTablesNameUpper := CloneFrom.fSortedTablesNameUpper;
   fSortedTablesNameIndex := CloneFrom.fSortedTablesNameIndex;
   fRecordReferences := CloneFrom.fRecordReferences;
   fVirtualTableModule := CloneFrom.fVirtualTableModule;
@@ -34469,13 +34469,13 @@ begin
   for i := 0 to N-1 do
     // first register for JSONToObject() and for TSQLPropInfoRTTITID.Create()
     TJSONSerializer.RegisterClassForJSON(Tables[i]);
-  SetLength(fSortedTablesName,N);
+  SetLength(fSortedTablesNameUpper,N);
   SetLength(fSortedTablesNameIndex,N);
   SetLength(fTableProps,N);
   // initialize internal properties
   for i := 0 to fTablesMax do
     SetTableProps(i);
-  QuickSortRawUTF8(fSortedTablesName,fTablesMax+1,@fSortedTablesNameIndex,@StrIComp);
+  QuickSortRawUTF8(fSortedTablesNameUpper,fTablesMax+1,@fSortedTablesNameIndex);
   // set the optional Root URI path of this Model
   if aRoot<>'' then
     SetRoot(aRoot);
@@ -34667,9 +34667,8 @@ end;
 function TSQLModel.GetTableIndex(const SQLTableName: RawUTF8): integer;
 begin
   if (self<>nil) and (SQLTableName<>'') then begin
-    // fast O(log(n)) binary search
-    result := FastFindPUTF8CharSorted(
-      pointer(fSortedTablesName),fTablesMax,pointer(SQLTableName),@StrIComp);
+    result := FastFindUpperPUTF8CharSorted( // O(log(n)) binary search
+      pointer(fSortedTablesNameUpper),fTablesMax,pointer(SQLTableName),length(SQLTableName));
     if result>=0 then
       result := fSortedTablesNameIndex[result];
   end else
@@ -34679,9 +34678,8 @@ end;
 function TSQLModel.GetTableIndexPtr(SQLTableName: PUTF8Char): integer;
 begin
   if (self<>nil) and (SQLTableName<>nil) then begin
-    // fast O(log(n)) binary search
-    result := FastFindPUTF8CharSorted(
-      pointer(fSortedTablesName),fTablesMax,SQLTableName,@StrIComp);
+    result := FastFindUpperPUTF8CharSorted( // O(log(n)) binary search
+      pointer(fSortedTablesNameUpper),fTablesMax,SQLTableName,StrLen(SQLTableName));
     if result>=0 then
       result := fSortedTablesNameIndex[result];
   end else

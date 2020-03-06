@@ -47,9 +47,8 @@ unit SynSQLite3Static;
   ***** END LICENSE BLOCK *****
 
 
-
-    Statically linked SQLite3 3.25.2 engine
-   *****************************************
+    Statically linked SQLite3 3.31.0 engine with optional AES encryption
+   **********************************************************************
 
   To be declared in your project uses clause:  will fill SynSQlite3.sqlite3
   global variable with all statically linked .obj API entries.
@@ -75,21 +74,6 @@ unit SynSQLite3Static;
     sudo dpkg -i libsqlite3-0_3.8.7.4-1_i386.deb
   - for a 64 bit system, you need to download and install both packages, e.g.
     sudo dpkg -i libsqlite3-0_3.8.2-1ubuntu2_amd64.deb libsqlite3-0_3.8.2-1ubuntu2_i386.deb
-
-  Version 1.18
-  - initial revision, extracted from SynSQLite3.pas unit
-  - updated SQLite3 engine to latest version 3.31.0
-  - now all sqlite3_*() API calls are accessible via sqlite3.*()
-  - our custom file encryption is now called via sqlite3.key() - i.e. official
-    SQLite Encryption Extension (SEE) sqlite3_key() API - and works for database
-    files of any size without touching the main sqlite.c amalgamation file
-  - Memory-Mapped I/O support - see http://www.sqlite.org/mmap.html
-  - added sqlite3.backup_*() Online Backup API functions
-  - added missing function sqlite3_column_text16() - fixed ticket [25d8d1f47a]
-  - added sqlite3.db_config() support
-  - enabled FTS5 and RBU support
-  - added FPC cross-platform support, statically linked for Win32/Win64
-
 }
 
 (* WARNING: with current 3.29+ version, the following sqlite3.c patch is needed:
@@ -247,10 +231,20 @@ implementation
       {$ifndef FPC_CROSSCOMPILING}
         {$linklib gcc.a}
       {$endif}
+      {$ifdef CPUAARCH64}
+        {$ifdef ANDROID}
+          {$L .\static\aarch64-android\libsqlite3.a}
+          {$L .\static\aarch64-android\libgcc.a}
+        {$else}
+          {$L .\static\aarch64-linux\libsqlite3.a}
+          {$L .\static\aarch64-linux\libgcc.a}
+        {$endif}
+        const _PREFIX = '';
+      {$endif}
       {$ifdef CPUARM}
         {$ifdef ANDROID}
-          {$L static\arm-android\sqlite3.o}
-          {$L libgcc.a}
+          {$L .\static\arm-android\libsqlite3.a}
+          {$L .\static\arm-android\libgcc.a}
         {$else}
           {$L static\arm-linux\sqlite3.o}
           {$ifdef FPC_CROSSCOMPILING}
@@ -297,19 +291,19 @@ end;
 
 {$ifdef DARWIN}
 
-function moddi3(num,den:int64):int64; cdecl; [public, alias: '___moddi3'];
+function moddi3(num,den:int64):int64; cdecl; public alias: '___moddi3';
 begin
  result := num mod den;
 end;
-function umoddi3(num,den:uint64):uint64; cdecl; [public, alias: '___umoddi3'];
+function umoddi3(num,den:uint64):uint64; cdecl; public alias: '___umoddi3';
 begin
  result := num mod den;
 end;
-function divdi3(num,den:int64):int64; cdecl; [public, alias: '___divdi3'];
+function divdi3(num,den:int64):int64; cdecl; public alias: '___divdi3';
 begin
  result := num div den;
 end;
-function udivdi3(num,den:uint64):uint64; cdecl; [public, alias: '___udivdi3'];
+function udivdi3(num,den:uint64):uint64; cdecl; public alias: '___udivdi3';
 begin
  result := num div den;
 end;
@@ -317,20 +311,20 @@ end;
 {$endif DARWIN}
 
 {$ifdef ANDROID}
-
-function bswapsi2(num:uint32):uint32; cdecl; [public, alias: '__bswapsi2'];
+{$ifdef CPUARM}
+function bswapsi2(num:uint32):uint32; cdecl; public alias: '__bswapsi2';
 asm
   rev r0, r0	// reverse bytes in parameter and put into result register
   bx  lr
 end;
-function bswapdi2(num:uint64):uint64; cdecl; [public, alias: '__bswapdi2'];
+function bswapdi2(num:uint64):uint64; cdecl; public alias: '__bswapdi2';
 asm
   rev r2, r0  // r2 = rev(r0)
   rev r0, r1  // r0 = rev(r1)
   mov r1, r2  // r1 = r2 = rev(r0)
   bx  lr
 end;
-
+{$endif}
 {$endif ANDROID}
 
 {$else FPC}

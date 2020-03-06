@@ -44,65 +44,6 @@ unit SynSelfTests;
 
   ***** END LICENSE BLOCK *****
 
-  Version 1.8
-  - first public release, corresponding to SQLite3 Framework 1.8
-  - includes Unitary Testing class and functions
-
-  Version 1.9
-  - test multi-threaded AES encryption/decryption of 4 MB blocks
-  - added crc32 tests
-
-  Version 1.11
-  - added some more regression tests in TTestCompression.ZipFormat
-
-  Version 1.12
-  - handle producer version change in TTestSynopsePDF
-
-  Version 1.13
-  - code modifications to compile with Delphi 5 compiler
-  - enhanced compression tests
-
-  Version 1.15
-  - unit now tested with Delphi XE2 (32 Bit)
-  - new TTestSQLite3ExternalDB class to test TSQLRecordExternal records,
-    i.e. external DB access from the mORMot framework (use an in-memory SQLite3
-    database as an external SynDB engine for fast and reliable testing)
-  - added test of TModTime published property (i.e. latest update time)
-  - added test of TCreateTime published property (i.e. record creation time)
-
-  Version 1.16
-  - added interface-based remote service implementation tests
-  - added test about per-database encryption in TTestExternalDatabase.CryptedDatabase
-  - added TAESECB, TAESCBC, TAESCFB, TAESOFB and TAESCTR classes tests (+ PKCS7)
-  - enhanced SynLZ tests (comparing asm and pas versions of the implementation)
-
-  Version 1.17
-  - added test for TInterfaceCollection kind of parameter
-  - added multi-thread testing of ExecuteInMainThread() method
-  - removed TSQLRecordExternal class type, to allow any TSQLRecord (e.g.
-    TSQLRecordMany) to be used with VirtualTableExternalRegister()
-  - added DBMS full test coverage in TTestExternalDatabase.AutoAdaptSQL
-
-  Version 1.18
-  - included some unit tests like TTestLowLevelTypes and TTestBasicClasses,
-    previously included in SQLite3Commons.pas or TTestLowLevelCommon, extracted
-    from SynCommons.pas, or TTestSQLite3Engine from SQLite3.pas
-  - added test for variant JSON serialization for interface-based services and
-    for ORM (aka TSQLRecord)
-  - added test for SynLZdecompress1partial() new function
-  - added external TSQLRecordOnlyBlob test associated to ticket [21c2d5ae96]
-    and OleDB/JET-based external database tests
-  - included testing of interface-based services in sicSingle, sicPerSession,
-    sicPerUser, sicPerGroup and sicPerThread modes
-  - included testing of ServiceContext threadvar for opt*InMainThread or
-    opt*InPerInterfaceThread options
-  - included testing of new REGEXP function for SQLite3
-  - included testing of TSQLRestServerAuthenticationNone
-  - added TTestMultiThreadProcess test cases over all communication protocols
-  - introducing TTestDDDSharedUnits test cases
-  - added PDF-1.5 and page orientation testing
-  - now default HTTP port would be 8888 under Linux (888 needs root rights)
-
 }
 
 interface
@@ -5502,6 +5443,14 @@ begin
   Check(not IdemPropNameUSameLen(abcde,zbcde,3));
   Check(not IdemPropNameUSameLen(abcde,zbcde,4));
   Check(not IdemPropNameUSameLen(abcde,zbcde,5));
+  Check(FindRawUTF8(['a','bb','cc'],'a')=0);
+  Check(FindRawUTF8(['a','bb','cc'],'cc')=2);
+  Check(FindRawUTF8(['a','bb','cc'],'ab')=-1);
+  Check(FindRawUTF8(['a','bb','cc'],'A')=-1);
+  Check(FindRawUTF8(['a','bb','cc'],'A',false)=0);
+  Check(FindPropName(['a','bb','cc'],'A')=0);
+  Check(FindPropName(['a','bb','cc'],'cC')=2);
+  Check(FindPropName(['a','bb','cc'],'ab')=-1);
   WinAnsi := 'aecD';
   WinAnsi[2] := #$E9;
   WinAnsi[3] := #$E7;
@@ -8351,7 +8300,7 @@ check(IsValidJSON(J));
    peop.YearOfDeath := 10;
    peop.LastName := 'john';
    TObjectVariant.New(Va,peop);
-   Check(Va.id=-1234);
+   Check(Va.id=TID(-1234));
    Check(Va.FirstName='');
    Check(Va.LastName='john');
    Check(Va.YearOfDeath=10);
@@ -10244,95 +10193,95 @@ var Stmt: TSynTableStatement;
     Props: TSQLRecordProperties;
     bits: TSQLFieldBits;
     withID: boolean;
-procedure New(const SQL: RawUTF8);
-begin
-  Stmt.Free;
-  Stmt := TSynTableStatement.Create(SQL,Props.Fields.IndexByName,
-    Props.SimpleFieldsBits[soSelect]);
-  Check(Stmt.SQLStatement=SQL,'Statement should be valid');
-end;
-procedure CheckIdData(limit,offset: integer);
-begin
-  Check(Stmt.TableName='tab');
-  Check(Stmt.Where=nil,'no WHERE clause');
-  Check((length(Stmt.Select)=2)and
-    (Stmt.Select[0].Field=0) and
-    (Props.Fields.List[Stmt.Select[1].Field-1].Name='Data'));
-  Check(Stmt.Limit=limit);
-  Check(Stmt.Offset=offset);
-end;
-procedure CheckWhere(isOR: Boolean);
-begin
-  Check(Stmt.TableName='tab');
-  Check(length(Stmt.Where)=2);
-  Check(Stmt.Where[0].Field=0);
-  Check(Stmt.Where[0].Operator=opGreaterThanOrEqualTo);
-  Check(Stmt.Where[0].ValueInteger=10);
-  Check(Stmt.Where[1].JoinedOR=isOR);
-  Check(Props.Fields.List[Stmt.Where[1].Field-1].Name='YearOfBirth');
-  Check(Stmt.Where[1].Operator=opGreaterThan);
-  Check(Stmt.Where[1].ValueInteger=1600);
-  Check(Stmt.Limit=10);
-  Check(Stmt.Offset=20);
-  Check((length(Stmt.Select)=2)and(Stmt.Select[1].Field=0)and
-    (Props.Fields.List[Stmt.Select[0].Field-1].Name='Data'));
-  Check(Stmt.OrderByField=nil);
-end;
+  procedure NewStmt(const SQL: RawUTF8);
+  begin
+    Stmt.Free;
+    Stmt := TSynTableStatement.Create(SQL,Props.Fields.IndexByName,
+      Props.SimpleFieldsBits[soSelect]);
+    Check(Stmt.SQLStatement=SQL,'Statement should be valid');
+  end;
+  procedure CheckIdData(limit,offset: integer);
+  begin
+    Check(Stmt.TableName='tab');
+    Check(Stmt.Where=nil,'no WHERE clause');
+    Check((length(Stmt.Select)=2)and
+      (Stmt.Select[0].Field=0) and
+      (Props.Fields.List[Stmt.Select[1].Field-1].Name='Data'));
+    Check(Stmt.Limit=limit);
+    Check(Stmt.Offset=offset);
+  end;
+  procedure CheckWhere(isOR: Boolean);
+  begin
+    Check(Stmt.TableName='tab');
+    Check(length(Stmt.Where)=2);
+    Check(Stmt.Where[0].Field=0);
+    Check(Stmt.Where[0].Operator=opGreaterThanOrEqualTo);
+    Check(Stmt.Where[0].ValueInteger=10);
+    Check(Stmt.Where[1].JoinedOR=isOR);
+    Check(Props.Fields.List[Stmt.Where[1].Field-1].Name='YearOfBirth');
+    Check(Stmt.Where[1].Operator=opGreaterThan);
+    Check(Stmt.Where[1].ValueInteger=1600);
+    Check(Stmt.Limit=10);
+    Check(Stmt.Offset=20);
+    Check((length(Stmt.Select)=2)and(Stmt.Select[1].Field=0)and
+      (Props.Fields.List[Stmt.Select[0].Field-1].Name='Data'));
+    Check(Stmt.OrderByField=nil);
+  end;
 begin
   Stmt := nil;
   Props := TSQLRecordPeople.RecordProps;
-  New('select * from atable');
+  NewStmt('select * from atable');
   Check(Stmt.TableName='atable');
   Check(Stmt.Where=nil);
   Stmt.SelectFieldBits(bits,withID);
   Check(withID);
   Check(IsEqual(bits,Props.SimpleFieldsBits[soSelect]));
   Check(Stmt.OrderByField=nil);
-  New('select iD,Data from tab');
+  NewStmt('select iD,Data from tab');
   CheckIdData(0,0);
   Check(Stmt.OrderByField=nil);
-  New('select iD,Data from tab order by firstname');
+  NewStmt('select iD,Data from tab order by firstname');
   CheckIdData(0,0);
   Check((length(Stmt.OrderByField)=1)and(Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName'));
   Check(not Stmt.OrderByDesc);
-  New('select iD,Data from tab order by firstname desc');
+  NewStmt('select iD,Data from tab order by firstname desc');
   CheckIdData(0,0);
   Check((length(Stmt.OrderByField)=1)and(Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName'));
   Check(Stmt.OrderByDesc);
-  New('select rowid , Data from tab order by firstname , lastname desc');
+  NewStmt('select rowid , Data from tab order by firstname , lastname desc');
   CheckIdData(0,0);
   Check((length(Stmt.OrderByField)=2) and
     (Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName') and
     (Props.Fields.List[Stmt.OrderByField[1]-1].Name='LastName'));
   Check(Stmt.OrderByDesc);
-  New('select rowid,Data from tab order by firstname,lastname limit 10');
+  NewStmt('select rowid,Data from tab order by firstname,lastname limit 10');
   CheckIdData(10,0);
   Check((length(Stmt.OrderByField)=2) and
     (Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName') and
     (Props.Fields.List[Stmt.OrderByField[1]-1].Name='LastName'));
   Check(not Stmt.OrderByDesc);
-  New('select rowid,Data from tab group by firstname order by firstname,lastname');
+  NewStmt('select rowid,Data from tab group by firstname order by firstname,lastname');
   CheckIdData(0,0);
   Check((length(Stmt.GroupByField)=1) and
     (Props.Fields.List[Stmt.GroupByField[0]-1].Name='FirstName'));
   Check((length(Stmt.OrderByField)=2) and
     (Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName') and
     (Props.Fields.List[Stmt.OrderByField[1]-1].Name='LastName'));
-  New('select rowid,Data from tab group by firstname,lastname limit 10');
+  NewStmt('select rowid,Data from tab group by firstname,lastname limit 10');
   CheckIdData(10,0);
   Check((length(Stmt.GroupByField)=2) and
     (Props.Fields.List[Stmt.GroupByField[0]-1].Name='FirstName') and
     (Props.Fields.List[Stmt.GroupByField[1]-1].Name='LastName'));
   Check(not Stmt.OrderByDesc);
-  New('select iD,Data from tab limit   20');
+  NewStmt('select iD,Data from tab limit   20');
   CheckIdData(20,0);
   Check(Stmt.OrderByField=nil);
   Check(not Stmt.OrderByDesc);
-  New('select iD,Data from tab  offset   20');
+  NewStmt('select iD,Data from tab  offset   20');
   CheckIdData(0,20);
   Check(Stmt.OrderByField=nil);
   Check(not Stmt.OrderByDesc);
-  New('select data,iD from tab where id >= 10 limit 10 offset 20 order by firstname desc');
+  NewStmt('select data,iD from tab where id >= 10 limit 10 offset 20 order by firstname desc');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=1);
   Check(Stmt.Where[0].Field=0);
@@ -10344,14 +10293,14 @@ begin
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='Data'));
   Check((length(Stmt.OrderByField)=1)and(Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName'));
   Check(Stmt.OrderByDesc);
-  New('select iD,Data from tab where id in (1, 2, 3)');
+  NewStmt('select iD,Data from tab where id in (1, 2, 3)');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=1);
   Check(Stmt.Where[0].Field=0);
   Check(Stmt.Where[0].Operator=opIn);
   Check(Stmt.Where[0].Value='[1,2,3]');
   Check(Stmt.OrderByField=nil);
-  New('select iD,Data from tab where firstname in ( ''a'' ,  ''b'', ''3''  ) order by id desc');
+  NewStmt('select iD,Data from tab where firstname in ( ''a'' ,  ''b'', ''3''  ) order by id desc');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=1);
   Check(Props.Fields.List[Stmt.Where[0].Field-1].Name='FirstName');
@@ -10359,11 +10308,11 @@ begin
   Check(Stmt.Where[0].Value='["a","b","3"]');
   Check((length(Stmt.OrderByField)=1)and(Stmt.OrderByField[0]=0));
   Check(Stmt.OrderByDesc);
-  New('select data,iD from tab where id >= 10 and YearOfBirth > 1600 limit 10 offset 20');
+  NewStmt('select data,iD from tab where id >= 10 and YearOfBirth > 1600 limit 10 offset 20');
   CheckWhere(false);
-  New('select data,iD from tab where rowid>=10 or YearOfBirth>1600 offset 20 limit 10');
+  NewStmt('select data,iD from tab where rowid>=10 or YearOfBirth>1600 offset 20 limit 10');
   CheckWhere(true);
-  New('select data,iD from tab where id <> 100 or data is not null limit 20 offset 10');
+  NewStmt('select data,iD from tab where id <> 100 or data is not null limit 20 offset 10');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=2);
   Check(Stmt.Where[0].Field=0);
@@ -10377,7 +10326,7 @@ begin
   Check((length(Stmt.Select)=2)and(Stmt.Select[1].Field=0)and
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='Data'));
   Check(Stmt.OrderByField=nil);
-  New('select data,iD from tab where firstname like "monet" or data is null limit 20 offset 10');
+  NewStmt('select data,iD from tab where firstname like "monet" or data is null limit 20 offset 10');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=2);
   Check(Props.Fields.List[Stmt.Where[0].Field-1].Name='FirstName');
@@ -10391,19 +10340,19 @@ begin
   Check((length(Stmt.Select)=2)and(Stmt.Select[1].Field=0)and
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='Data'));
   Check(Stmt.OrderByField=nil);
-  New('select count(*) from tab');
+  NewStmt('select count(*) from tab');
   Check(Stmt.TableName='tab');
   Check(Stmt.Where=nil);
   Check((length(Stmt.Select)=1)and(Stmt.Select[0].Field=0));
   Check((length(Stmt.Select)=1)and(Stmt.Select[0].FunctionName='count'));
   Check(Stmt.Limit=0);
-  New('select count(*) from tab limit 10');
+  NewStmt('select count(*) from tab limit 10');
   Check(Stmt.TableName='tab');
   Check(Stmt.Where=nil);
   Check((length(Stmt.Select)=1)and(Stmt.Select[0].Field=0));
   Check((length(Stmt.Select)=1)and(Stmt.Select[0].FunctionName='count'));
   Check(Stmt.Limit=10);
-  New('select count(*) from tab where yearofbirth>1000 limit 10');
+  NewStmt('select count(*) from tab where yearofbirth>1000 limit 10');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=1);
   Check(Props.Fields.List[Stmt.Where[0].Field-1].Name='YearOfBirth');
@@ -10412,7 +10361,7 @@ begin
   Check((length(Stmt.Select)=1)and(Stmt.Select[0].Field=0));
   Check((length(Stmt.Select)=1)and(Stmt.Select[0].FunctionName='count'));
   Check(Stmt.Limit=10);
-  New('select distinct ( yearofdeath )  from  tab where yearofbirth > :(1000): limit 20');
+  NewStmt('select distinct ( yearofdeath )  from  tab where yearofbirth > :(1000): limit 20');
   Check(Stmt.TableName='tab');
   Check(length(Stmt.Where)=1);
   Check(Props.Fields.List[Stmt.Where[0].Field-1].Name='YearOfBirth');
@@ -10422,7 +10371,7 @@ begin
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='YearOfDeath'));
   Check((length(Stmt.Select)=1) and (Stmt.Select[0].FunctionName='distinct'));
   Check(Stmt.Limit=20);
-  New('select id from tab where id>:(1): and integerdynarraycontains ( yearofbirth , :(10): ) '+
+  NewStmt('select id from tab where id>:(1): and integerdynarraycontains ( yearofbirth , :(10): ) '+
     'order by firstname desc limit 20');
   Check(Stmt.TableName='tab');
   Check((length(Stmt.Select)=1) and (Stmt.Select[0].Field=0) and (Stmt.Select[0].Alias=''));
@@ -10437,7 +10386,7 @@ begin
   Check((length(Stmt.OrderByField)=1)and(Props.Fields.List[Stmt.OrderByField[0]-1].Name='FirstName'));
   Check(Stmt.OrderByDesc);
   Check(Stmt.Limit=20);
-  New('select max(yearofdeath) as maxYOD from tab where yearofbirth > :(1000):');
+  NewStmt('select max(yearofdeath) as maxYOD from tab where yearofbirth > :(1000):');
   Check(Stmt.TableName='tab');
   Check((length(Stmt.Select)=1) and
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='YearOfDeath') and
@@ -10450,7 +10399,7 @@ begin
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='YearOfDeath'));
   Check((length(Stmt.Select)=1) and (Stmt.Select[0].FunctionName='max'));
   Check(Stmt.Limit=0);
-  New('select max(yearofdeath)+115 as maxYOD from tab where yearofbirth > :(1000):');
+  NewStmt('select max(yearofdeath)+115 as maxYOD from tab where yearofbirth > :(1000):');
   Check(Stmt.TableName='tab');
   Check((length(Stmt.Select)=1) and
     (Props.Fields.List[Stmt.Select[0].Field-1].Name='YearOfDeath') and
@@ -10552,7 +10501,7 @@ var Model: TSQLModel;
     i,j,n: integer;
     dummy: RawUTF8;
 {$ifndef NOVARIANTS}
-procedure CheckVariantWith(V: Variant; i: Integer; offset: integer=0);
+procedure CheckVariantWith(const V: Variant; const i: Integer; const offset: integer=0);
 begin
   Check(V.ID=i);
   Check(V.Int=i);
@@ -19287,6 +19236,10 @@ begin
       if fTestClass=TSQLRestClientURIMessage then
         break else
       {$endif}
+      {$ifdef CPUARM3264}
+      if fTestClass=TSQLHttpClientWebsockets then
+        break else
+      {$endif CPUARM3264}
         fRunningThreadCount := fRunningThreadCount+20;
   until fRunningThreadCount>fMaxThreads;
   // 3. Cleanup for this protocol (but reuse the same threadpool)

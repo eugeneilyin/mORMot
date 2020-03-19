@@ -80,7 +80,8 @@ type
   {$A-}
   /// memory structure used to store a date and time in native Oracle format
   // - follow the SQLT_DAT column type layout
-  {$ifdef UNICODE}TOracleDate = record{$else}TOracleDate = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TOracleDate = record
+    {$else}TOracleDate = object{$endif}
     Cent, Year, Month, Day, Hour, Min, Sec: byte;
     /// convert an Oracle date and time into Delphi TDateTime
     // - this method will ignore any date before 30 Dec 1899 (i.e. any
@@ -1892,9 +1893,10 @@ begin
     if Props.UseWallet then
       msg := 'using Oracle Wallet' else
       msg := 'as '+Props.UserID;
-    Log.Log(sllInfo,'Connected to % % with %, codepage % (%/%)',
-      [Props.ServerName,msg,Props.ClientVersion,fAnsiConvert.CodePage,
-       fOCICharSet,OracleCharSetName(fOCICharSet)],self);
+    if Log<>nil then
+      Log.Log(sllInfo,'Connected to % % with %, codepage % (%/%)',
+        [Props.ServerName,msg,Props.ClientVersion,fAnsiConvert.CodePage,
+         fOCICharSet,OracleCharSetName(fOCICharSet)],self);
     with NewStatement do
     try // ORM will send date/time as ISO8601 text -> force encoding
       Execute('ALTER SESSION SET NLS_DATE_FORMAT=''YYYY-MM-DD-HH24:MI:SS''',false);
@@ -1911,7 +1913,8 @@ begin
     inherited Connect; // notify any re-connection
   except
     on E: Exception do begin
-      Log.Log(sllError,E);
+      if Log<>nil then
+        Log.Log(sllError,E);
       Disconnect; // clean up on fail
       raise;
     end;
@@ -2017,7 +2020,8 @@ begin
     on E: Exception do begin
       if (Properties as TSQLDBOracleConnectionProperties).IgnoreORA01453OnStartTransaction and
         (Pos('ORA-01453', E.Message ) > 0) then begin
-       Log.Log(sllWarning, 'It seems that we use DBLink, and Oracle implicitly started transaction. ORA-01453 ignored');
+        if Log<>nil then
+          Log.Log(sllWarning, 'It seems that we use DBLink, and Oracle implicitly started transaction. ORA-01453 ignored');
       end else begin
         if fTransactionCount > 0 then
           dec(fTransactionCount);

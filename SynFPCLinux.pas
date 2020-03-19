@@ -143,6 +143,9 @@ var
 // - under Linux/FPC, this API truncates the name to 16 chars
 procedure SetUnixThreadName(ThreadID: TThreadID; const Name: RawByteString);
 
+/// calls mprotect() syscall or clib
+function SynMProtect(addr:pointer; size:size_t; prot:integer): longint;
+
 {$ifdef BSD}
 function fpsysctlhwint(hwid: cint): Int64;
 function fpsysctlhwstr(hwid: cint; var temp: shortstring): pointer;
@@ -153,9 +156,16 @@ function fpsysctlhwstr(hwid: cint; var temp: shortstring): pointer;
 {$ifdef BSD}
 const // see https://github.com/freebsd/freebsd/blob/master/sys/sys/time.h
   CLOCK_REALTIME = 0;
+{$ifdef OpenBSD}
+  CLOCK_MONOTONIC = 3;
+  CLOCK_REALTIME_COARSE = CLOCK_REALTIME; // no faster alternative
+  CLOCK_MONOTONIC_COARSE = CLOCK_MONOTONIC;
+{$else}
   CLOCK_MONOTONIC = 4;
   CLOCK_REALTIME_COARSE = 10; // named CLOCK_REALTIME_FAST in FreeBSD 8.1+
   CLOCK_MONOTONIC_COARSE = 12;
+{$endif OPENBSD}
+
 {$else}
 const
   CLOCK_REALTIME = 0;
@@ -213,6 +223,7 @@ uses
   sysctl,
   {$else}
   Linux,
+  SysCall,
   {$endif BSD}
   dl;
 {$endif LINUX}
@@ -226,6 +237,14 @@ procedure DeleteCriticalSection(var cs : TRTLCriticalSection);
 begin
   {$ifdef LINUXNOTBSD}
   if cs.__m_kind<>0 then
+  {$else}
+  {$ifdef BSD}
+  {$ifdef Darwin}
+  if cs.sig<>0 then
+  {$else}
+  if Assigned(cs) then
+  {$endif Darwin}
+  {$endif BSD}
   {$endif LINUXNOTBSD}
     DoneCriticalSection(cs);
 end;
@@ -372,10 +391,21 @@ end;
 {$else}
 
 {$ifdef BSD}
+
 function clock_gettime(ID: cardinal; r: ptimespec): Integer;
   cdecl external 'libc.so' name 'clock_gettime';
 function clock_getres(ID: cardinal; r: ptimespec): Integer;
   cdecl external 'libc.so' name 'clock_getres';
+
+{$else}
+
+// libc's clock_gettime function uses vDSO (avoid syscall) while FPC by default
+// is compiled without FPC_USE_LIBC defined and do a syscall each time
+//   GetTickCount64 fpc    2 494 563 op/sec
+//   GetTickCount64 libc 119 919 893 op/sec
+function clock_gettime(clk_id : clockid_t; tp: ptimespec) : cint;
+  cdecl; external name 'clock_gettime';
+
 {$endif BSD}
 
 function GetTickCount64: Int64;
@@ -505,8 +535,8 @@ begin // not inlined to avoid try..finally UnicodeString protection
   if cchCount2<0 then
     cchCount2 := StrLen(lpString2);
   SetString(U2,lpString2,cchCount2);
-  result := widestringmanager.CompareUnicodeStringProc(U1,U2,TCompareOptions(dwCmpFlags));
-end;
+  result := widestringmanager.CompareUnicodeStringProc(U1,U2,TCompareOptions(dwCmpFlags))+2;
+end; // caller would make -2 to get regular -1/0/1 comparison values
 
 function GetFileSize(hFile: cInt; lpFileSizeHigh: PDWORD): DWORD;
 var FileInfo: TStat;
@@ -534,6 +564,25 @@ begin
   end;
   fpnanosleep(@timeout,nil)
   // no retry loop on ESysEINTR (as with regular RTL's Sleep)
+end;
+
+{$ifdef BSD}
+function mprotect(Addr: Pointer; Len: size_t; Prot: Integer): Integer;
+  {$ifdef Darwin} cdecl external 'libc.dylib' name 'mprotect';
+  {$else} cdecl external 'libc.so' name 'mprotect'; {$endif}
+{$endif BSD}
+
+function SynMProtect(addr: pointer; size: size_t; prot: integer): longint;
+begin
+  result := -1;
+  {$ifdef UNIX}
+    {$ifdef BSD}
+    result := mprotect(addr, size, prot);
+    {$else}
+    if Do_SysCall(syscall_nr_mprotect, PtrUInt(addr), size, prot) >= 0 then
+      result := 0;
+    {$endif BSD}
+  {$endif UNIX}
 end;
 
 procedure GetKernelRevision;
@@ -567,9 +616,11 @@ begin
   {$else}
   {$ifdef LINUX}
   // try Linux kernel 2.6.32+ or FreeBSD 8.1+ fastest clocks
-  if clock_gettime(CLOCK_REALTIME_COARSE, @tp) = 0 then
+  if (CLOCK_REALTIME_COARSE <> CLOCK_REALTIME_FAST) and
+     (clock_gettime(CLOCK_REALTIME_COARSE, @tp) = 0) then
     CLOCK_REALTIME_FAST := CLOCK_REALTIME_COARSE;
-  if clock_gettime(CLOCK_MONOTONIC_COARSE, @tp) = 0 then
+  if (CLOCK_MONOTONIC_COARSE <> CLOCK_MONOTONIC_FAST) and
+     (clock_gettime(CLOCK_MONOTONIC_COARSE, @tp) = 0) then
     CLOCK_MONOTONIC_FAST := CLOCK_MONOTONIC_COARSE;
   if (clock_gettime(CLOCK_REALTIME_FAST,@tp)<>0) or // paranoid check
      (clock_gettime(CLOCK_MONOTONIC_FAST,@tp)<>0) then

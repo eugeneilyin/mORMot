@@ -96,7 +96,8 @@ type
   // are handled with dedicated code, optionally with case-insensitive search
   // - consider using TMatchs (or SetMatchs/TMatchDynArray) if you expect to
   // search for several patterns, or even TExprParserMatch for expression search
-  {$ifdef UNICODE}TMatch = record{$else}TMatch = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TMatch = record
+    {$else}TMatch = object{$endif}
   private
     Pattern, Text: PUTF8Char;
     P, T, PMax, TMax: PtrInt;
@@ -1277,7 +1278,8 @@ type
   // - is also safer, since will check for reaching end of buffer
   // - raise a EFastReader exception on decoding error (e.g. if a buffer
   // overflow may occur) or call OnErrorOverflow/OnErrorData event handlers
-  {$ifdef FPC_OR_UNICODE}TFastReader = record{$else}TFastReader = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TFastReader = record
+    {$else}TFastReader = object{$endif}
   public
     /// the current position in the memory
     P: PAnsiChar;
@@ -1966,9 +1968,6 @@ type
   // - this class is thread-safe if you use properly the associated Safe lock
   TSynCache = class(TSynPersistentLock)
   protected
-    /// last index in fNameValue.List[] if was added by Find()
-    // - contains -1 if no previous immediate call to Find()
-    fFindLastAddedIndex: integer;
     fFindLastKey: RawUTF8;
     fNameValue: TSynNameValue;
     fRamUsed: cardinal;
@@ -2249,7 +2248,8 @@ type
   TRawByteStringGroupValueDynArray = array of TRawByteStringGroupValue;
 
   /// store several RawByteString content with optional concatenation
-  {$ifdef UNICODE}TRawByteStringGroup = record{$else}TRawByteStringGroup = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TRawByteStringGroup = record
+    {$else}TRawByteStringGroup = object{$endif}
   public
     /// actual list storing the data
     Values: TRawByteStringGroupValueDynArray;
@@ -2333,8 +2333,8 @@ type
 
   /// simple stack-allocated type for handling a non-void type names list
   // - Delphi "object" is buggy on stack -> also defined as record with methods
-  {$ifdef FPC_OR_UNICODE}TPropNameList = record
-  {$else}TPropNameList = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TPropNameList = record
+    {$else}TPropNameList = object{$endif}
   public
     /// the actual names storage
     Values: TRawUTF8DynArray;
@@ -2375,7 +2375,8 @@ type
   // - bits 0..14 map a 15-bit increasing counter (collision-free)
   // - bits 15..30 map a 16-bit process identifier
   // - bits 31..63 map a 33-bit UTC time, encoded as seconds since Unix epoch
-  {$ifdef FPC_OR_UNICODE}TSynUniqueIdentifierBits = record{$else}TSynUniqueIdentifierBits = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TSynUniqueIdentifierBits = record
+    {$else}TSynUniqueIdentifierBits = object{$endif}
   public
     /// the actual 64-bit storage value
     // - in practice, only first 63 bits are used
@@ -3439,7 +3440,7 @@ type
   TBlockingProcessPool = class(TSynPersistent)
   protected
     fClass: TBlockingProcessPoolItemClass;
-    fPool: TObjectListLocked;
+    fPool: TSynObjectListLocked;
     fCallCounter: TBlockingProcessPoolCall; // set TBlockingProcessPoolItem.Call
   public
     /// initialize the pool, for a given implementation class
@@ -3497,8 +3498,8 @@ type
   TSystemUseDataDynArray = array of TSystemUseData;
 
   /// low-level structure used to compute process memory and CPU usage
-  {$ifdef FPC_OR_UNICODE}TProcessInfo = record private
-  {$else}TProcessInfo = object protected{$endif}
+  {$ifdef USERECORDWITHMETHODS}TProcessInfo = record private
+    {$else}TProcessInfo = object protected{$endif}
     {$ifdef MSWINDOWS}
     fSysPrevIdle, fSysPrevKernel, fSysPrevUser,
     fDiffIdle, fDiffKernel, fDiffUser, fDiffTotal: Int64;
@@ -3794,8 +3795,8 @@ type
 
   /// used to store Time Zone information for a single area in TSynTimeZone
   // - Delphi "object" is buggy on stack -> also defined as record with methods
-  {$ifdef FPC_OR_UNICODE}TTimeZoneData = record
-  {$else}TTimeZoneData = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TTimeZoneData = record
+    {$else}TTimeZoneData = object{$endif}
   public
     id: TTimeZoneID;
     display: RawUTF8;
@@ -4565,9 +4566,9 @@ type
     // - you should call OrderedIndexRefresh method to ensure it is sorted
     OrderedIndexNotSorted: boolean;
     /// all TSynValidate instances registered per each field
-    Filters: TObjectList;
+    Filters: TSynObjectList;
     /// all TSynValidate instances registered per each field
-    Validates: TObjectList;
+    Validates: TSynObjectList;
     /// low-level binary comparison used by IDSort and TSynTable.IterateJSONValues
     // - P1 and P2 must point to the values encoded in our SBF compact binary format
     {$ifdef SORTCOMPAREMETHOD}
@@ -4723,8 +4724,8 @@ type
   // - is defined either as an object either as a record, due to a bug
   // in Delphi 2009/2010 compiler (at least): this structure is not initialized
   // if defined as an object on the stack, but will be as a record :(
-  {$ifdef UNICODE}TSynTableData = record{$else}TSynTableData = object{$endif UNICODE}
-  {$ifdef UNICODE}private{$else}protected{$endif UNICODE}
+  {$ifdef USERECORDWITHMETHODS}TSynTableData = record private
+    {$else}TSynTableData = object protected{$endif UNICODE}
     VType: TVarType;
     Filler: array[1..SizeOf(TVarData)-SizeOf(TVarType)-SizeOf(pointer)*2-4] of byte;
     VID: integer;
@@ -6850,12 +6851,12 @@ begin
 end;
 
 function TSynTableFieldProperties.AddFilterOrValidate(aFilter: TSynFilterOrValidate): TSynFilterOrValidate;
-procedure Add(var List: TObjectList);
-begin
-  if List=nil then
-    List := TObjectList.Create;
-  List.Add(result);
-end;
+  procedure Add(var List: TSynObjectList);
+  begin
+    if List=nil then
+      List := TSynObjectList.Create;
+    List.Add(result);
+  end;
 begin
   result := aFilter;
   if (self=nil) or (result=nil) then
@@ -12394,9 +12395,7 @@ constructor TSynCache.Create(aMaxCacheRamUsed: cardinal; aCaseSensitive: boolean
 begin
   inherited Create;
   fNameValue.Init(aCaseSensitive);
-  fNameValue.DynArray.Capacity := 200; // some space for future cached entries
   fMaxRamUsed := aMaxCacheRamUsed;
-  fFindLastAddedIndex := -1;
   fTimeoutSeconds := aTimeoutSeconds;
 end;
 
@@ -12415,41 +12414,30 @@ end;
 
 procedure TSynCache.Add(const aValue: RawUTF8; aTag: PtrInt);
 begin
-  if (self=nil) or (fFindLastAddedIndex<0) or (fFindLastKey='') then
-    // fFindLastAddedIndex should have been set by a previous call to Find()
+  if (self=nil) or (fFindLastKey='') then
     exit;
   ResetIfNeeded;
   inc(fRamUsed,length(aValue));
-  if fFindLastAddedIndex<0 then // Reset occurred in ResetIfNeeded
-    fNameValue.Add(fFindLastKey,aValue,aTag) else
-    with fNameValue.List[fFindLastAddedIndex] do begin // at Find() position
-      Name := fFindLastKey;
-      Value := aValue;
-      Tag := aTag;
-      fFindLastAddedIndex := -1;
-      fFindLastKey := '';
-    end;
+  fNameValue.Add(fFindLastKey,aValue,aTag);
+  fFindLastKey := '';
 end;
 
 function TSynCache.Find(const aKey: RawUTF8; aResultTag: PPtrInt): RawUTF8;
-var added: boolean;
+var ndx: integer;
 begin
   result := '';
   if self=nil then
     exit;
+  fFindLastKey := aKey;
   if aKey='' then
-    fFindLastAddedIndex := -1 else begin
-    fFindLastAddedIndex := fNameValue.DynArray.FindHashedForAdding(aKey,added);
-    if added then
-      // expect a further call to Add()
-      fFindLastKey := aKey else
-      // match key found
-      with fNameValue.List[fFindLastAddedIndex] do begin
-        result := Value;
-        if aResultTag<>nil then
-          aResultTag^ := Tag;
-        fFindLastAddedIndex := -1;
-      end;
+    exit;
+  ndx := fNameValue.Find(aKey);
+  if ndx<0 then
+    exit;
+  with fNameValue.List[ndx] do begin
+    result := Value;
+    if aResultTag<>nil then
+      aResultTag^ := Tag;
   end;
 end;
 
@@ -12483,16 +12471,10 @@ begin
   fSafe.Lock;
   try
     if Count<>0 then begin
-      if fRamUsed<131072 then // no capacity change for small cache content
-        fNameValue.Count := 0 else
-        with fNameValue.DynArray{$ifdef UNDIRECTDYNARRAY}.InternalDynArray{$endif} do begin
-          Capacity := 0;   // force free all fNameValue.List[] key/value pairs
-          Capacity := 200; // then reserve some space for future cached entries
-        end;
+      fNameValue.DynArray.Clear;
       fNameValue.DynArray.ReHash;
       result := true; // mark something was flushed
     end;
-    fFindLastAddedIndex := -1; // fFindLastKey should remain untouched for Add()
     fRamUsed := 0;
     fTimeoutTix := 0;
   finally
@@ -15871,7 +15853,7 @@ begin
   if aClass=nil then
     fClass := TBlockingProcessPoolItem else
     fClass := aClass;
-  fPool := TObjectListLocked.Create(true);
+  fPool := TSynObjectListLocked.Create;
 end;
 
 const
@@ -17088,7 +17070,7 @@ end;
 procedure TSynTimeZone.LoadFromBuffer(const Buffer: RawByteString);
 begin
   fZones.LoadFromBinary(AlgoSynLZ.Decompress(Buffer),{nohash=}true);
-  fZones.ReHash(false);
+  fZones.ReHash;
   FreeAndNil(fIds);
   FreeAndNil(fDisplays);
 end;

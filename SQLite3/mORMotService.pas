@@ -503,7 +503,7 @@ var
   // - then run the global ServicesRun procedure
   // - every TService instance is to be freed by the main application, when
   // it's no more used
-  Services: TList = nil;
+  Services: TSynList = nil;
 
   /// the main TService instance running
   ServiceSingle: TServiceSingle = nil;
@@ -1017,7 +1017,7 @@ begin
   if aDisplayName = '' then
     fDName := aServiceName;
   if Services=nil then
-    GarbageCollectorFreeAndNil(Services,TList.Create);
+    GarbageCollectorFreeAndNil(Services,TSynList.Create);
   Services.Add(self);
   fServiceType := SERVICE_WIN32_OWN_PROCESS or SERVICE_INTERACTIVE_PROCESS;
   fStartType   := SERVICE_AUTO_START;
@@ -1053,7 +1053,8 @@ procedure TService.DoCtrlHandle(Code: DWORD);
 var log: ISynLog;
 begin
   log := ServiceLog.Enter(self, 'DoCtrlHandle');
-  ServiceLog.Add.Log(sllInfo,'%: command % received from OS',[ServiceName,Code],self);
+  if log<>nil then
+    log.Log(sllInfo,'%: command % received from OS',[ServiceName,Code],self);
   try
     case Code of
     SERVICE_CONTROL_STOP: begin

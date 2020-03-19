@@ -793,7 +793,8 @@ type
   end;
 
   /// parameters to be used for WebSockets process
-  {$ifdef UNICODE}TWebSocketProcessSettings = record{$else}TWebSocketProcessSettings = object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TWebSocketProcessSettings = record
+    {$else}TWebSocketProcessSettings = object{$endif}
   public
     /// time in milli seconds between each focPing commands sent to the other end
     // - default is 0, i.e. no automatic ping sending on client side, and
@@ -1042,7 +1043,7 @@ type
   // any Sec-WebSocket-Protocol application content
   TWebSocketServer = class(THttpServer)
   protected
-    fWebSocketConnections: TObjectListLocked;
+    fWebSocketConnections: TSynObjectListLocked;
     fProtocols: TWebSocketProtocolList;
     fSettings: TWebSocketProcessSettings;
     /// validate the WebSockets handshake, then call Context.fProcess.ProcessLoop()
@@ -1347,7 +1348,7 @@ begin
   STATUS_SUCCESS:
     if fCache <> nil then begin
       if fHttp <> nil then
-        cache.Tag := Trim(FindIniNameValue(pointer(headout),'ETAG:')) else
+        FindNameValue(headout,'ETAG:',cache.Tag) else
         cache.Tag := fSocket.HeaderGetValue('ETAG');
       if cache.Tag <> '' then begin
         cache.Content := result;
@@ -3152,7 +3153,7 @@ begin
   fSocketClass := TWebSocketServerSocket;
   fThreadRespClass := TWebSocketServerResp;
   // initialize protocols and connections
-  fWebSocketConnections := TObjectListLocked.Create(false);
+  fWebSocketConnections := TSynObjectListLocked.Create({owned=}false);
   fProtocols := TWebSocketProtocolList.Create;
   fSettings.SetDefaults;
   fSettings.HeartbeatDelay := 20000;
@@ -3172,12 +3173,12 @@ begin
   Context.fProcess := TWebSocketProcessServer.Create(
     ClientSock,protocol,Context.ConnectionID,Context,fSettings,fProcessName);
   Context.fProcess.fServerResp := Context;
-  fWebSocketConnections.SafeAdd(Context);
+  fWebSocketConnections.Add(Context);
   try
     Context.fProcess.ProcessLoop;  // run main blocking loop
   finally
     FreeAndNil(Context.fProcess); // notify end of WebSockets
-    fWebSocketConnections.SafeRemove(Context);
+    fWebSocketConnections.Remove(Context);
   end;
 end;
 
@@ -3185,7 +3186,7 @@ procedure TWebSocketServer.Process(ClientSock: THttpServerSocket;
   ConnectionID: THttpServerConnectionID; ConnectionThread: TSynThread);
 var err: integer;
 begin
-  if ClientSock.ConnectionUpgrade and ClientSock.KeepAliveClient and
+  if (connectionUpgrade in ClientSock.HeaderFlags) and ClientSock.KeepAliveClient and
      IdemPropNameU('GET',ClientSock.Method) and
      IdemPropNameU(ClientSock.Upgrade,'websocket') and
      ConnectionThread.InheritsFrom(TWebSocketServerResp) then begin
@@ -3210,7 +3211,7 @@ end;
 
 function TWebSocketServer.WebSocketConnections: integer;
 begin
-  result := fWebSocketConnections.SafeCount;
+  result := fWebSocketConnections.Count;
 end;
 
 type
@@ -3408,8 +3409,8 @@ function TWebSocketServerSocket.GetRequest(withBody: boolean;
   headerMaxTix: Int64): THttpServerSocketGetRequestResult;
 begin
   result := inherited GetRequest(withBody, headerMaxTix);
-  if (result=grHeaderReceived) and ConnectionUpgrade and KeepAliveClient and
-     IdemPropNameU('GET',Method) and IdemPropNameU(Upgrade,'websocket') then
+  if (result=grHeaderReceived) and (connectionUpgrade in HeaderFlags) and
+     KeepAliveClient and IdemPropNameU('GET',Method) and IdemPropNameU(Upgrade,'websocket') then
     //writeln('!!');
 end;
 
@@ -3477,7 +3478,7 @@ begin
         nil,fProcess.fOwnerConnection,fProcess.fOwnerThread);
       try
         Ctxt.Prepare(url,method,header,data,dataType,'',fTLS);
-        resthead := FindIniNameValue(Pointer(header),'SEC-WEBSOCKET-REST: ');
+        FindNameValue(header,'SEC-WEBSOCKET-REST:',resthead);
         if resthead='NonBlocking' then
           block := wscNonBlockWithoutAnswer else
           block := wscBlockWithAnswer;
@@ -3554,7 +3555,7 @@ begin
       prot := HeaderGetValue('SEC-WEBSOCKET-PROTOCOL');
       result := 'Invalid HTTP Upgrade Header';
       if not IdemPChar(pointer(cmd),'HTTP/1.1 101') or
-         not ConnectionUpgrade or (ContentLength>0) or
+         not (connectionUpgrade in HeaderFlags) or (ContentLength>0) or
          not IdemPropNameU(Upgrade,'websocket') or
          not aProtocol.SetSubprotocol(prot) then
         exit;
@@ -3883,7 +3884,7 @@ begin // you can override this class then call ConnectionAdd
   if Terminated then
     result := false else begin
     aConnection := fStreamClass.Create(aRemoteIP);
-    result := ConnectionAdd(aSocket, aConnection);
+    result := ConnectionAdd(aSocket,aConnection);
   end;
 end;
 

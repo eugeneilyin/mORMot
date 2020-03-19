@@ -178,7 +178,6 @@
   {$define HASUINT64}
   {$define HASINLINENOTX86}
   {$define NODELPHIASM}   // ignore low-level System.@LStrFromPCharLen calls
-  {$define HASAESNI}    // should be commented to test project with valgrind
   {$define HASTTHREADSTART}
   {$define HASINTERFACEASTOBJECT}
   {$define EXTENDEDTOSTRING_USESTR} // FloatToText uses str() in FPC
@@ -186,9 +185,11 @@
   {$define FPC_OR_PUREPASCAL}
   {$define FPC_OR_KYLIX}
   {$define FPC_OR_UNICODE}
+  {$define USERECORDWITHMETHODS}
   {$define FPC_OR_DELPHIXE}
   {$define FPC_OR_DELPHIXE4}
   {$define FPC_ENUMHASINNER}
+  {$define USE_VTYPE_STATIC} // in our inlined VarClear()
 
   // $if FPC_FULLVERSION>20700 breaks Delphi 6-7 and SynProject :(
   {$ifdef VER2_7}
@@ -259,24 +260,32 @@
       {$define FPCSQLITE3STATIC} // use static/arm-linux\sqlite3.o
     {$endif}
     {$ifdef CPUAARCH64}
-      {$ifdef ANDROID}
-        {$define FPCSQLITE3STATIC} // note: problems with current static/aarch64-linux\sqlite3.o
-      {$endif}
+      {$define FPCSQLITE3STATIC} // use:static/aarch64-linux\sqlite3.o
     {$endif}
   {$endif}
 
   {$ifdef BSD}
     // LINUX conditional includes Darwin and BSD family like FreeBSD
     {$define LINUX} // not true, but a POSIX/BSD system - see LINUXNOTBSD
+    {$undef FORCE_STRSSE42}  // fails otherwise for sure
+    {$define ABSOLUTEPASCAL} // NO asm nor redirection (until stabilized)
     {$ifdef DARWIN}
       {$define FPCSQLITE3STATIC} // we supply Darwin static libs
       {$ifdef CPUINTEL}
         {$define FPC_PIC} // may have not be defined by the compiler options
       {$endif}
-      {$undef FORCE_STRSSE42}  // fails otherwise for sure
-      {$define ABSOLUTEPASCAL} // NO asm nor redirection (until stabilized)
     {$else}
       {$define BSDNOTDARWIN}   // OSX has some non-standard API calls
+    {$endif}
+    {$ifdef FREEBSD}
+      {$ifdef CPUX64}
+        {$define FPCSQLITE3STATIC} // we supply x64 static libs
+      {$endif CPUX64}
+    {$endif}
+    {$ifdef OPENBSD}
+      {$ifdef CPUX64}
+        {$define FPCSQLITE3STATIC} // we supply x64 static libs
+      {$endif CPUX64}
     {$endif}
   {$else}
     {$ifdef LINUX}
@@ -302,9 +311,10 @@
     {$ifdef CPUX64}
       {$define CPUINTEL}
       {$define FPC_CPUINTEL}
-      {$ifndef DARWIN}
-        {$define CPUX64ASM} // Delphi XE4 SSE asm is buggy :(
-      {$endif DARWIN}
+      {$ifndef BSD}
+        {$define CPUX64ASM} // Delphi XE4 or Darwin asm are buggy :(
+        {$define HASAESNI}  // SynCrypto rejected by Darwin asm
+      {$endif BSD}
       {$define FPC_X64}   // supports AVX/AVX2/AVX512 - which Delphi doesn't
       {$ASMMODE INTEL}    // to share asm code with Delphi
     {$endif CPUX64}
@@ -321,12 +331,19 @@
       {$define CPUINTEL}
       {$define FPC_CPUINTEL}
       {$define FPC_X86}
-      {$ASMMODE INTEL} // as Delphi expects
+      {$ASMMODE INTEL}   // as Delphi expects
+      {$define HASAESNI} // should be commented to test project with valgrind
       {$ifndef FPC_PIC}
         {$define CPUX86NOTPIC} // use "absolute" instead of local register
       {$endif FPC_PIC}
     {$endif CPUX86}
   {$endif CPU64}
+
+  {$ifdef CPUARM3264}
+    {$ifdef BSD}
+      {$undef USE_VTYPE_STATIC} // circumvent bug in VarClear() on BSD + ARM
+    {$endif BSD}
+  {$endif CPUARM3264}
 
   {$ifdef ISFPC30}
     {$ifndef MSWINDOWS}
@@ -344,10 +361,7 @@
     {$ifdef CPUINTEL}
       {$define HASINTERFACERTTI}
     {$endif}
-    {$ifdef CPUARM}
-      {$define HASINTERFACERTTI}
-    {$endif}
-    {$ifdef CPUAARCH64}
+    {$ifdef CPUARM3264}
       {$define HASINTERFACERTTI}
     {$endif}
   {$endif}
@@ -387,6 +401,7 @@
 (********************** Delphi Conditionals **********************)
 
   {$define DELPHI_OR_FPC_OLDRTTI}
+  {$define USE_VTYPE_STATIC} // "and VTYPE_STATIC" test before VarClear()
 
   {$ifdef LVCL}
     {$define OWNNORMTOUPPER} // NormToUpper[] exists only in our enhanced RTL
@@ -399,6 +414,7 @@
     {$define HASVARUSTRING}
     {$define HASCODEPAGE}
     {$define FPC_OR_UNICODE}
+    {$define USERECORDWITHMETHODS}
     { due to a bug in Delphi 2009+, we need to fake inheritance of record,
       since TDynArrayHashed = object(TDynArray) fails to initialize
       http://blog.synopse.info/post/2011/01/29/record-and-object-issue-in-Delphi-2010 }
@@ -483,8 +499,6 @@
       {$ifend}
       {$if CompilerVersion = 20}
         {$define ISDELPHI20092010} // specific compilation issues
-        // for Delphi 2009 and up, use UNICODE conditional
-        {$define FPC_OR_UNICODE}
       {$ifend}
       {$if CompilerVersion = 21}
         {$define ISDELPHI20092010} //specific compilation issues
@@ -493,7 +507,6 @@
         {$define ISDELPHI2010}
         {$define ISDELPHI2010_OR_FPC} // eltype2 field
         {$define ISDELPHI2010_OR_FPC_NEWRTTI}
-        {$define FPC_OR_UNICODE}
         {$define HASTTHREADSTART}
         {$define HASINTERFACEASTOBJECT}
         {$ifdef NEWRTTINOTUSED} // option reduce EXE size by disabling much RTTI

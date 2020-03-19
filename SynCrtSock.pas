@@ -270,13 +270,14 @@ type
     // updated by every SockSend() call
     fSndBuf: SockString;
     fSndBufLen: integer;
+    // set by AcceptRequest() from TVarSin
+    fRemoteIP: SockString;
     // updated during UDP connection, accessed via PeerAddress/PeerPort
     fPeerAddr: TSockAddr;
     {$ifdef MSWINDOWS}
     fSecure: TSChannelClient;
     {$endif MSWINDOWS}
     procedure SetInt32OptionByIndex(OptName, OptVal: integer); virtual;
-    procedure AcceptRequest(aClientSock: TSocket; aRemoteIP: PSockString);
   public
     /// common initialization of all constructors
     // - do not call directly, but use Open / Bind constructors instead
@@ -298,6 +299,9 @@ type
     // Windows by now, using the SChannel API)
     procedure OpenBind(const aServer, aPort: SockString; doBind: boolean;
       aSock: integer=-1; aLayer: TCrtSocketLayer=cslTCP; aTLS: boolean=false);
+    /// initialize the instance with the supplied accepted socket
+    // - is called from a bound TCP Server, just after Accept()
+    procedure AcceptRequest(aClientSock: TSocket; aClientSin: PVarSin);
     /// initialize SockIn for receiving with read[ln](SockIn^,...)
     // - data is buffered, filled as the data is available
     // - read(char) or readln() is indeed very fast
@@ -418,8 +422,13 @@ type
     // - returns nil on error or a ResultClass instance on success
     // - if ResultClass is nil, will return a plain TCrtSocket, but you may
     // specify e.g. THttpServerSocket if you expect incoming HTTP requests
-    function AcceptIncoming(RemoteIP: PSockString=nil;
-      ResultClass: TCrtSocketClass=nil): TCrtSocket;
+    function AcceptIncoming(ResultClass: TCrtSocketClass=nil): TCrtSocket;
+    /// remote IP address after AcceptRequest() call over TCP
+    // - is either the raw connection IP to the current server socket, or
+    // a custom header value set by a local proxy as retrieved by inherited
+    // THttpServerSocket.GetRequest, searching the header named in
+    // THttpServerGeneric.RemoteIPHeader (e.g. 'X-Real-IP' for nginx)
+    property RemoteIP: SockString read fRemoteIP write fRemoteIP;
     /// remote IP address of the last packet received (SocketLayer=slUDP only)
     function PeerAddress: SockString;
     /// remote IP port of the last packet received (SocketLayer=slUDP only)
@@ -513,10 +522,6 @@ type
   // standard gzip/deflate or custom (synlzo/synlz) protocols
   THttpSocket = class(TCrtSocket)
   protected
-    /// true if the TRANSFER-ENCODING: CHUNKED was set in headers
-    fChunked: boolean;
-    /// to call GetBody only once
-    fBodyRetrieved: boolean;
     /// used by RegisterCompress method
     fCompress: THttpSocketCompressRecDynArray;
     /// set by RegisterCompress method
@@ -526,6 +531,8 @@ type
     /// same as HeaderGetValue('CONTENT-ENCODING'), but retrieved during Request
     // and mapped into the fCompress[] array
     fContentCompress: integer;
+    /// to call GetBody only once
+    fBodyRetrieved: boolean;
     /// cache for HeaderGetText
     fHeaderText: SockString;
     /// compress the data, adding corresponding headers via SockSend()
@@ -562,10 +569,10 @@ type
     ContentType: SockString;
     /// same as HeaderGetValue('UPGRADE'), but retrieved during Request
     Upgrade: SockString;
-    /// same as HeaderGetValue('CONNECTION')='Close', but retrieved during Request
-    ConnectionClose: boolean;
-    /// same as HeaderGetValue('CONNECTION-UPGRADE')<>'', but retrieved during Request
-    ConnectionUpgrade: boolean;
+    /// same as HeaderGetValue('X-POWERED-BY'), but retrieved during Request
+    XPoweredBy: SockString;
+    /// map the presence of some HTTP headers, but retrieved during Request
+    HeaderFlags: set of(transferChuked, connectionClose, connectionUpgrade, connectionKeepAlive);
     /// retrieve the HTTP headers into Headers[] and fill most properties below
     procedure GetHeader;
     /// retrieve the HTTP body (after uncompression if necessary) into Content
@@ -621,18 +628,13 @@ type
     fMethod: SockString;
     fURL: SockString;
     fKeepAliveClient: boolean;
-    fRemoteIP: SockString;
     fRemoteConnectionID: THttpServerConnectionID;
     fServer: THttpServer;
   public
     /// create the socket according to a server
     // - will register the THttpSocketCompress functions from the server
+    // - once created, caller should call AcceptRequest() to accept the socket
     constructor Create(aServer: THttpServer); reintroduce;
-    /// main object function called after aClientSock := Accept + Create
-    // - initialize the internal TCrtSocket with the supplied accepted socket
-    // - caller will then use the GetRequest method below to
-    // get the request
-    procedure InitRequest(aClientSock: TSocket; const aRemoteIP: SockString='');
     /// main object function called after aClientSock := Accept + Create:
     // - get Command, Method, URL, Headers and Body (if withBody is TRUE)
     // - get sent data in Content (if withBody=true and ContentLength<>0)
@@ -648,11 +650,6 @@ type
     // support persistent connections MUST include the "close" connection option
     // in every message"
     property KeepAliveClient: boolean read fKeepAliveClient write fKeepAliveClient;
-    /// the recognized client IP, after a call to GetRequest()
-    // - is either the raw connection IP to the current server socket, or
-    // a custom header value set by a local proxy, e.g.
-    // THttpServerGeneric.RemoteIPHeader='X-Real-IP' for nginx
-    property RemoteIP: SockString read fRemoteIP;
     /// the recognized connection ID, after a call to GetRequest()
     // - identifies either the raw connection on the current server, or is
     // a custom header value set by a local proxy, e.g.
@@ -778,13 +775,14 @@ type
     fServer: THttpServer;
     fServerSock: THttpServerSocket;
     fClientSock: TSocket;
+    fClientSin: TVarSin;
     fConnectionID: THttpServerConnectionID;
     /// main thread loop: read request from socket, send back answer
     procedure Execute; override;
   public
     /// initialize the response thread for the corresponding incoming socket
     // - this version will get the request directly from an incoming socket
-    constructor Create(aSock: TSocket; aServer: THttpServer); reintroduce; overload;
+    constructor Create(aSock: TSocket; const aSin: TVarSin; aServer: THttpServer); reintroduce; overload;
     /// initialize the response thread for the corresponding incoming socket
     // - this version will handle KeepAlive, for such an incoming request
     constructor Create(aServerSock: THttpServerSocket; aServer: THttpServer);
@@ -833,7 +831,8 @@ type
   // Event-driven approach under Linux/POSIX
   TSynThreadPool = class
   protected
-    fSubThread: TObjectList; // holds TSynThreadPoolSubThread
+    fSubThread: array of TSynThreadPoolSubThread;
+    fSubThreadCount: integer;
     fRunningThreads: integer;
     fExceptionsCount: integer;
     fOnTerminate: TNotifyThreadEvent;
@@ -896,8 +895,12 @@ type
     // or profile and tune the Task method
     property ContentionAbortCount: cardinal read fContentionAbortCount;
     /// milliseconds delay to reject a connection due to contention
-    // - default is 5000, i.e. 5 seconds for IOCP, and disabled otherwise
-    // (since aQueuePendingContext is supposed to be used)
+    // - default is 5000, i.e. 5 seconds wait for some room to be available
+    // in the IOCP or aQueuePendingContext internal list
+    // - during this delay, no new connection is available (i.e. Accept is not
+    // called), so that a load balancer could detect the contention and switch
+    // to another instance in the pool, or a direct client may eventually have
+    // its connection rejected, so won't start sending data
     property ContentionAbortDelay: integer read fContentionAbortDelay
       write fContentionAbortDelay;
     /// total milliseconds spent waiting for an available slot in the queue
@@ -927,7 +930,7 @@ type
     {$ifndef USE_WINIOCP}
     function QueueLength: integer; override;
     {$endif}
-    // here aContext is a pointer(TSocket=THandle) value
+    // here aContext is a THttpServerSocket instance
     procedure Task(aCaller: TSynThread; aContext: Pointer); override;
     procedure TaskAbort(aContext: Pointer); override;
   public
@@ -1219,7 +1222,8 @@ type
     // - for THttpApiServer, will return 0 if the system does not support HTTP
     // API 2.0 (i.e. under Windows XP or Server 2003)
     // - for THttpServer, will shutdown any incoming accepted socket if the
-    // internal TSynThreadPool.PendingContextCount+ThreadCount exceeds this limit
+    // internal TSynThreadPool.PendingContextCount+ThreadCount exceeds this limit;
+    // each pending connection is a THttpServerSocket instance in the queue
     // - increase this value if you don't have any load-balancing in place, and
     // in case of e.g. many 503 HTTP answers or if many "QueueFull" messages
     // appear in HTTP.sys log files (normally in
@@ -1316,6 +1320,10 @@ type
   THttpApiRequestAuthentications = set of (
     haBasic, haDigest, haNtlm, haNegotiate, haKerberos);
 
+  THttpApiServer = class;
+
+  THttpApiServers = array of THttpApiServer;
+
   /// HTTP server using fast http.sys kernel-mode server
   // - The HTTP Server API enables applications to communicate over HTTP without
   // using Microsoft Internet Information Server (IIS). Applications can register
@@ -1332,8 +1340,8 @@ type
     /// the internal request queue
     fReqQueue: THandle;
     /// contain list of THttpApiServer cloned instances
-    fClones: TObjectList;
-    // if fClones=nil, fOwner contains the main THttpApiServer instance
+    fClones: THttpApiServers;
+    // if cloned, fOwner contains the main THttpApiServer instance
     fOwner: THttpApiServer;
     /// list of all registered URL
     fRegisteredUnicodeUrl: array of SynUnicode;
@@ -1442,7 +1450,7 @@ type
       aCompressMinSize: integer=1024); override;
     /// access to the internal THttpApiServer list cloned by this main instance
     // - as created by Clone() method
-    property Clones: TObjectList read fClones;
+    property Clones: THttpApiServers read fClones;
   public { HTTP API 2.0 methods and properties }
     /// can be used to check if the HTTP API 2.0 is available
     function HasAPI2: boolean;
@@ -1648,7 +1656,7 @@ type
     fFirstEmptyConnectionIndex: Integer;
     fServer: THttpApiWebSocketServer;
     fSafe: TRTLCriticalSection;
-    fPendingForClose: TList;
+    fPendingForClose: {$ifdef FPC}TFPList{$else}TList{$endif};
     fIndex: integer;
     function AddConnection(aConn: PHttpApiWebSocketConnection): Integer;
     procedure RemoveConnection(index: integer);
@@ -1828,7 +1836,7 @@ type
     fProcessCS: TRTLCriticalSection;
     fHeaderRetrieveAbortDelay: integer;
     fThreadPool: TSynThreadPoolTHttpServer;
-    fInternalHttpServerRespList: TList;
+    fInternalHttpServerRespList: {$ifdef FPC}TFPList{$else}TList{$endif};
     fServerConnectionCount: integer;
     fServerConnectionActive: integer;
     fServerKeepAliveTimeOut: cardinal;
@@ -1951,7 +1959,8 @@ type
   // - used e.g. by class function THttpRequest.Get()
   // - will decode standard HTTP/HTTPS urls or Unix sockets URI like
   // 'http://unix:/path/to/socket.sock:/url/path'
-  TURI = {$ifdef UNICODE}record{$else}object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TURI = record
+    {$else}TURI = object{$endif}
   public
     /// if the server is accessible via https:// and not plain http://
     Https: boolean;
@@ -2520,7 +2529,8 @@ const
 type
   /// may be used to store a connection to a SMTP server
   // - see SendEmail() overloaded function
-  TSMTPConnection = {$ifdef UNICODE}record{$else}object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TSMTPConnection = record
+    {$else}TSMTPConnection = object{$endif}
   public
     /// the SMTP server IP or host name
     Host: SockString;
@@ -3008,7 +3018,8 @@ type
   {$M-}
 
   /// store information of one TPollAsynchSockets connection
-  TPollSocketsSlot = {$ifdef UNICODE}record{$else}object{$endif}
+  {$ifdef USERECORDWITHMETHODS}TPollSocketsSlot = record
+    {$else}TPollSocketsSlot = object{$endif}
     /// the associated TCP connection
     // - equals 0 after TPollAsynchSockets.Stop
     socket: TSocket;
@@ -3558,43 +3569,6 @@ begin
   end;
 end;
 
-function GetHeaderValue(var headers: SockString; const upname: SockString;
-  deleteInHeaders: boolean): SockString;
-var i,j,k: PtrInt;
-begin
-  result := '';
-  if (headers='') or (upname='') then
-    exit;
-  i := 1;
-  repeat
-    k := length(headers)+1;
-    for j := i to k-1 do
-      if headers[j]<' ' then begin
-        k := j;
-        break;
-      end;
-    if IdemPChar(@headers[i],pointer(upname)) then begin
-      j := i;
-      inc(i,length(upname));
-      while headers[i]=' ' do inc(i);
-      result := copy(headers,i,k-i);
-      if deleteInHeaders then begin
-        while true do // delete also ending #13#10
-          if (headers[k]=#0) or (headers[k]>=' ') then
-            break else
-            inc(k);
-        delete(headers,j,k-j);
-      end;
-      exit;
-    end;
-    i := k;
-    while headers[i]<' ' do
-      if headers[i]=#0 then
-        exit else
-        inc(i);
-  until false;
-end;
-
 // rewrite some functions to avoid unattempted ansi<->unicode conversion
 
 function PosCh(ch: AnsiChar; const s: SockString): PtrInt;
@@ -3629,8 +3603,8 @@ begin
     SetString(result,PAnsiChar(@PByteArray(S)[start]),L);
 end;
 
-function Trim(const S: SockString): SockString;
 {$ifdef FPC_OR_PUREPASCAL}
+function Trim(const S: SockString): SockString;
 var i, L: PtrInt;
 begin
   L := Length(S);
@@ -3647,6 +3621,7 @@ begin
   end;
 end;
 {$else}
+function Trim(const S: SockString): SockString;
 asm  // fast implementation by John O'Harrow
   test eax,eax                   {S = nil?}
   xchg eax,edx
@@ -3678,6 +3653,42 @@ asm  // fast implementation by John O'Harrow
   jmp  @@CheckDone
 end;
 {$endif}
+
+function GetHeaderValue(var headers: SockString; const upname: SockString;
+  deleteInHeaders: boolean): SockString;
+var i,j,k: PtrInt;
+begin
+  {$ifdef FPC} Finalize(result); {$else} result := ''; {$endif}
+  if (headers='') or (upname='') then
+    exit;
+  i := 1;
+  repeat
+    k := length(headers)+1;
+    for j := i to k-1 do
+      if headers[j]<' ' then begin
+        k := j;
+        break;
+      end;
+    if IdemPCharUp(@headers[i],pointer(upname),@NormToUpper) then begin
+      j := i;
+      inc(i,length(upname));
+      TrimCopy(headers,i,k-i,result);
+      if deleteInHeaders then begin
+        while true do // delete also ending #13#10
+          if (headers[k]=#0) or (headers[k]>=' ') then
+            break else
+            inc(k);
+        delete(headers,j,k-j);
+      end;
+      exit;
+    end;
+    i := k;
+    while headers[i]<' ' do
+      if headers[i]=#0 then
+        exit else
+        inc(i);
+  until false;
+end;
 
 procedure UpperMove(Source, Dest: PByte; ToUp: PByteArray; L: cardinal);
 begin
@@ -3952,6 +3963,9 @@ begin
   dest[ord(dest[0])] := chr;
 end;
 
+var
+  IP4local: SockString; // contains '127.0.0.1'
+
 procedure IP4Text(const ip4addr; var result: SockString);
 var b: array[0..3] of byte absolute ip4addr;
     s: shortstring;
@@ -3960,7 +3974,7 @@ begin
   if cardinal(ip4addr)=0 then
     result := '' else
   if cardinal(ip4addr)=$0100007f then
-    result := '127.0.0.1' else begin
+    result := IP4local else begin
     s := '';
     i := 0;
     repeat
@@ -3980,7 +3994,7 @@ begin
     IP4Text(sin.sin_addr,result) else begin
     result := GetSinIP(sin); // AF_INET6 may be optimized in a future revision
     if result='::1' then
-      result := '127.0.0.1'; // IP6 localhost loopback benefits of matching IP4
+      result := IP4local; // IP6 localhost loopback benefits of matching IP4
   end;
 end;
 
@@ -4597,11 +4611,15 @@ begin
     SetSockOpt(Sock,SOL_SOCKET, SO_LINGER, @li, SizeOf(li));
     if OptVal>0 then begin
       {$ifdef LINUX}
-      SetSockOpt(Sock,SOL_SOCKET, SO_REUSEADDR,@SO_TRUE,SizeOf(SO_TRUE));
-      {$endif}
-      {$ifdef BSD}
-      SetSockOpt(Sock,SOL_SOCKET,SO_NOSIGPIPE,@SO_TRUE,SizeOf(SO_TRUE));
-      {$endif}
+        {$ifdef BSD}
+          SetSockOpt(Sock,SOL_SOCKET,SO_REUSEPORT,@SO_TRUE,SizeOf(SO_TRUE));
+        {$ifndef OpenBSD}
+          SetSockOpt(Sock,SOL_SOCKET,SO_NOSIGPIPE,@SO_TRUE,SizeOf(SO_TRUE));
+        {$endif OpenBSD}
+        {$else}
+          SetSockOpt(Sock,SOL_SOCKET, SO_REUSEADDR,@SO_TRUE,SizeOf(SO_TRUE));
+        {$endif BSD}
+      {$endif LINUX}
     end;
     exit;
   end;
@@ -4697,7 +4715,7 @@ function WSAIsFatalError: boolean;
 var err: integer;
 begin
   err := WSAGetLastError;
-  result := (err<>NO_ERROR) and (err<>WSATRY_AGAIN) and (err<>WSAEINTR)
+  result := (err<>NO_ERROR) and (err<>WSATRY_AGAIN) and (err<>WSAEINTR) and (err<>WSAEADDRNOTAVAIL)
     {$ifdef MSWINDOWS}and (err<>WSAETIMEDOUT) and (err<>WSAEWOULDBLOCK){$endif};
 end;
 
@@ -4865,20 +4883,12 @@ begin
   SetInt32Option(Sock,OptName,OptVal);
 end;
 
-procedure TCrtSocket.AcceptRequest(aClientSock: TSocket; aRemoteIP: PSockString);
-begin
-  CreateSockIn; // use SockIn by default if not already initialized: 2x faster
-  OpenBind('','',false,aClientSock, fSocketLayer); // set the ACCEPTed aClientSock
-  Linger := 5; // should remain open for 5 seconds after a closesocket() call
-  if (aRemoteIP<>nil) and (aRemoteIP^='') then
-    aRemoteIP^ := GetRemoteIP(aClientSock);
-end;
-
 procedure TCrtSocket.OpenBind(const aServer, aPort: SockString;
   doBind: boolean; aSock: integer; aLayer: TCrtSocketLayer; aTLS: boolean);
 const BINDTXT: array[boolean] of string[4] = ('open','bind');
       BINDMSG: array[boolean] of string = ('Is a server running on this address:port?',
         'Another process may be currently listening to this port!');
+var retry: integer;
 begin
   fSocketLayer := aLayer;
   fWasBind := doBind;
@@ -4887,10 +4897,19 @@ begin
       fPort := DEFAULT_PORT[aTLS] else // default port is 80/443 (HTTP/S)
       fPort := aPort;
     fServer := aServer;
-    fSock := CallServer(aServer,Port,doBind,aLayer,Timeout); // OPEN or BIND
-    if fSock<=0 then
-      raise ECrtSocket.CreateFmt('OpenBind(%s:%s,%s) failed: %s',
-        [aServer,fPort,BINDTXT[doBind],BINDMSG[doBind]],-1);
+    if doBind then // allow small number of retries (e.g. XP or BSD during aggressive tests)
+      retry := 10 else 
+      retry := {$ifdef BSD}10{$else}2{$endif}; 
+    repeat
+      fSock := CallServer(aServer,Port,doBind,aLayer,Timeout); // OPEN or BIND
+      if (fSock>0) or WSAIsFatalError then
+        break;
+      dec(retry);
+      if retry=0 then
+        raise ECrtSocket.CreateFmt('OpenBind(%s:%s,%s) failed: %s',
+          [aServer,fPort,BINDTXT[doBind],BINDMSG[doBind]],-1);
+      sleep(10);
+    until false;
   end else
     fSock := aSock; // ACCEPT mode -> socket is already created by caller
   if TimeOut>0 then begin // set timout values for both directions
@@ -4918,6 +4937,21 @@ begin
   TSynLog.Add.Log(sllCustom2, 'OpenBind(%:%) % sock=% (accept=%) ',
     [fServer,fPort,BINDTXT[doBind], fSock, aSock], self);
   {$endif}
+end;
+
+procedure TCrtSocket.AcceptRequest(aClientSock: TSocket; aClientSin: PVarSin);
+begin
+  {$ifdef LINUXNOTBSD}
+  // on Linux fd returned from accept() inherits all parent fd options
+  // except O_NONBLOCK and O_ASYNC;
+  fSock := aClientSock;
+  {$else}
+  // on other OS inheritance is undefined, so call OpenBind to set all fd options
+  OpenBind('','',false,aClientSock, fSocketLayer); // set the ACCEPTed aClientSock
+  Linger := 5; // should remain open for 5 seconds after a closesocket() call
+  {$endif LINUXNOTBSD}
+  if aClientSin<>nil then
+    IPText(aClientSin^,fRemoteIP);
 end;
 
 procedure TCrtSocket.SockSend(const Values: array of const);
@@ -5014,7 +5048,7 @@ begin
   result := Len=0;
   if (self=nil) or (fSock<=0) or (Len<=0) or (P=nil) then
     exit;
-  endtix := GetTick64+TimeOut;
+  endtix := {$ifdef MSWINDOWS}GetTick64{$else}0{$endif};
   repeat
     {$ifdef MSWINDOWS}
     if fSecure.Initialized then
@@ -5029,8 +5063,12 @@ begin
       inc(PByte(P),sent);
     end else if WSAIsFatalError then
       exit; // fatal socket error
-    if GetTick64>endtix then
-      exit; // identify timeout as error
+    {$ifndef MSWINDOWS}
+    if endtix=0 then // measure time elapsed only if write was not finished
+      endtix := GetTick64+TimeOut else
+    {$endif}
+      if GetTick64>endtix then
+        exit; // identify timeout as error
     SleepHiRes(1);
   until false;
   result := true;
@@ -5041,8 +5079,7 @@ begin
   SndLow(pointer(Data),length(Data));
 end;
 
-function TCrtSocket.AcceptIncoming(RemoteIP: PSockString;
-  ResultClass: TCrtSocketClass): TCrtSocket;
+function TCrtSocket.AcceptIncoming(ResultClass: TCrtSocketClass): TCrtSocket;
 var client: TSocket;
     sin: TVarSin;
 begin
@@ -5055,7 +5092,8 @@ begin
   if ResultClass=nil then
     ResultClass := TCrtSocket;
   result := ResultClass.Create;
-  result.AcceptRequest(client,RemoteIP);
+  result.AcceptRequest(client,@sin);
+  result.CreateSockIn; // use SockIn with 1KB input buffer: 2x faster
 end;
 
 function TCrtSocket.SockInRead(Content: PAnsiChar; Length: integer;
@@ -5124,10 +5162,14 @@ begin
     cspSocketError:
       result := -1; // indicates broken/closed socket
     end; // cspNoData will leave result=0
+  {$ifdef MSWINDOWS}
+  // under Unix SockReceivePending use poll(fSocket) and if data available
+  // ioctl syscall is redundant
   if aPendingAlsoInSocket then
     // also includes data in socket bigger than TTextRec's buffer
     if (IOCtlSocket(Sock,FIONREAD,insocket)=0) and (insocket>0) then
       inc(result,insocket);
+  {$endif MSWINDOWS}
 end;
 
 destructor TCrtSocket.Destroy;
@@ -5245,7 +5287,7 @@ begin
   if (self<>nil) and (fSock>0) and (Buffer<>nil) and (Length>0) then begin
     expected := Length;
     Length := 0;
-    start := GetTick64;
+    start := {$ifdef MSWINDOWS}GetTick64{$else}0{$endif};
     repeat
       read := expected-Length;
       {$ifdef MSWINDOWS}
@@ -5271,16 +5313,20 @@ begin
           break; // good enough for now
         inc(PByte(Buffer),read);
       end;
-      diff := GetTick64-start;
-      if diff>=TimeOut then begin
-        {$ifdef SYNCRTDEBUGLOW}
-        TSynLog.Add.Log(sllCustom2, 'TrySockRecv: timeout (diff=%>%)',[diff,TimeOut],self);
-        {$endif}
-        exit; // identify read timeout as error
+      {$ifndef MSWINDOWS}
+      if start=0 then // measure time elapsed only if read was not finished
+        start := GetTick64 else {$endif} begin
+        diff := GetTick64-start;
+        if diff>=TimeOut then begin
+          {$ifdef SYNCRTDEBUGLOW}
+          TSynLog.Add.Log(sllCustom2, 'TrySockRecv: timeout (diff=%>%)',[diff,TimeOut],self);
+          {$endif}
+          exit; // identify read timeout as error
+        end;
+        if diff<100 then
+          SleepHiRes(0) else
+          SleepHiRes(1);
       end;
-      if diff<100 then
-        SleepHiRes(0) else
-        SleepHiRes(1);
     until false;
     result := true;
   end;
@@ -6051,13 +6097,12 @@ constructor THttpServer.Create(const aPort: SockString; OnStart,
   OnStop: TNotifyThreadEvent; const ProcessName: SockString;
   ServerThreadPoolCount: integer; KeepAliveTimeOut: integer);
 begin
-  fInternalHttpServerRespList := TList.Create;
+  fInternalHttpServerRespList := {$ifdef FPC}TFPList{$else}TList{$endif}.Create;
   InitializeCriticalSection(fProcessCS);
   fSock := TCrtSocket.Bind(aPort); // BIND + LISTEN
   fServerKeepAliveTimeOut := KeepAliveTimeOut; // 30 seconds by default
   if fThreadPool<>nil then
-    {$ifndef USE_WINIOCP}if not fThreadPool.QueuePendingContext then{$endif}
-      fThreadPool.ContentionAbortDelay := 5000; // 5 seconds default
+    fThreadPool.ContentionAbortDelay := 5000; // 5 seconds default
   // event handlers set before inherited Create to be visible in childs
   fOnHttpThreadStart := OnStart;
   SetOnTerminate(OnStop);
@@ -6091,26 +6136,29 @@ begin
   end;
   endtix := GetTick64+20000;
   EnterCriticalSection(fProcessCS);
-  if fInternalHttpServerRespList<>nil then begin
-    for i := 0 to fInternalHttpServerRespList.Count-1 do begin
-      resp := fInternalHttpServerRespList.List[i];
-      resp.Terminate;
-      DirectShutdown(resp.fServerSock.Sock,{rdwr=}true);
+  try
+    if fInternalHttpServerRespList<>nil then begin
+      for i := 0 to fInternalHttpServerRespList.Count-1 do begin
+        resp := fInternalHttpServerRespList.List[i];
+        resp.Terminate;
+        DirectShutdown(resp.fServerSock.Sock,{rdwr=}true);
+      end;
+      repeat // wait for all THttpServerResp.Execute to be finished
+        if (fInternalHttpServerRespList.Count=0) and fExecuteFinished then
+          break;
+        LeaveCriticalSection(fProcessCS);
+        SleepHiRes(100);
+        EnterCriticalSection(fProcessCS);
+      until GetTick64>endtix;
+      FreeAndNil(fInternalHttpServerRespList);
     end;
-    repeat // wait for all THttpServerResp.Execute to be finished
-      if (fInternalHttpServerRespList.Count=0) and fExecuteFinished then
-        break;
-      LeaveCriticalSection(fProcessCS);
-      SleepHiRes(100);
-      EnterCriticalSection(fProcessCS);
-    until GetTick64>endtix;
-    FreeAndNil(fInternalHttpServerRespList);
+  finally
+    LeaveCriticalSection(fProcessCS);
+    FreeAndNil(fThreadPool); // release all associated threads and I/O completion
+    FreeAndNil(fSock);
+    inherited Destroy;       // direct Thread abort, no wait till ended
+    DeleteCriticalSection(fProcessCS);
   end;
-  LeaveCriticalSection(fProcessCS);
-  FreeAndNil(fThreadPool); // release all associated threads and I/O completion
-  FreeAndNil(fSock);
-  inherited Destroy;       // direct Thread abort, no wait till ended
-  DeleteCriticalSection(fProcessCS);
 end;
 
 function THttpServer.GetStat(one: THttpServerSocketGetRequestResult): integer;
@@ -6198,8 +6246,8 @@ end;
 procedure THttpServer.Execute;
 var ClientSock: TSocket;
     ClientSin: TVarSin;
-    {$ifdef MONOTHREAD}
     ClientCrtSock: THttpServerSocket;
+    {$ifdef MONOTHREAD}
     endtix: Int64;
     {$endif}
 begin
@@ -6238,14 +6286,15 @@ begin
       {$else}
       if Assigned(fThreadPool) then begin
         // use thread pool to process the request header, and probably its body
-        if not fThreadPool.Push(pointer(PtrUInt(ClientSock)),{waitoncontention=}true) then begin
+        ClientCrtSock := fSocketClass.Create(self);
+        ClientCrtSock.AcceptRequest(ClientSock,@ClientSin);
+        if not fThreadPool.Push(pointer(PtrUInt(ClientCrtSock)),{waitoncontention=}true) then begin
           // returned false if there is no idle thread in the pool, and queue is full
-          DirectShutdown(ClientSock); // expects the proxy to balance to another server
-          continue;
+          ClientCrtSock.Free; // will call DirectShutdown(ClientSock)
         end;
       end else
         // default implementation creates one thread for each incoming socket
-        fThreadRespClass.Create(ClientSock, self);
+        fThreadRespClass.Create(ClientSock,ClientSin,self);
       {$endif MONOTHREAD}
       end;
   except
@@ -6462,14 +6511,15 @@ end;
 
 { THttpServerResp }
 
-constructor THttpServerResp.Create(aSock: TSocket; aServer: THttpServer);
+constructor THttpServerResp.Create(aSock: TSocket; const aSin: TVarSin; aServer: THttpServer);
 var c: THttpServerSocketClass;
 begin
+  fClientSock := aSock;
+  fClientSin := aSin;
   if aServer=nil then
     c := THttpServerSocket else
     c := aServer.fSocketClass;
-  fClientSock := aSock; // ensure it is set ASAP: on Linux, Execute raises immediately
-  Create(c.Create(aServer),aServer);
+  Create(c.Create(aServer),aServer); // on Linux, Execute raises during Create
 end;
 
 constructor THttpServerResp.Create(aServerSock: THttpServerSocket; aServer: THttpServer);
@@ -6576,8 +6626,8 @@ begin
       if fClientSock<>0 then begin
         // direct call from incoming socket
         aSock := fClientSock;
-        fClientSock := 0; // mark no need to Shutdown and close fClientSock
-        fServerSock.InitRequest(aSock); // now fClientSock is in fServerSock
+        fClientSock := 0; // fServerSock owns fClientSock
+        fServerSock.AcceptRequest(aSock,@fClientSin);
         if fServer<>nil then
           HandleRequestsProcess;
       end else begin
@@ -6621,7 +6671,7 @@ begin
   Content := '';
   {$I-}
   // direct read bytes, as indicated by Content-Length or Chunked
-  if fChunked then begin // we ignore the Length
+  if transferChuked in HeaderFlags then begin // we ignore the Length
     LContent := 0; // current read position in Content
     repeat
       if SockIn<>nil then begin
@@ -6685,31 +6735,30 @@ var s,c: SockString;
     P: PAnsiChar;
 begin
   fHeaderText := '';
-  fChunked := false;
+  HeaderFlags := [];
   fBodyRetrieved := false;
   fContentCompress := -1;
   integer(fCompressAcceptHeader) := 0;
   ContentType := '';
   Upgrade := '';
   ContentLength := -1;
-  ConnectionClose := false;
-  ConnectionUpgrade := false;
   ServerInternalState := 0;
   n := 0;
   repeat
     SockRecvLn(s);
     if s='' then
       break; // headers end with a void line
-    if length(Headers)<=n then
-      SetLength(Headers,n+n shr 3+16);
-    Headers[n] := s;
-    inc(n);
-    P := pointer(s);
+    P := pointer(s); // P := nil below to store in Headers[]
     case IdemPCharArray(P,['CONTENT-', 'TRANSFER-ENCODING: CHUNKED', 'CONNECTION: ',
-      'ACCEPT-ENCODING:', 'UPGRADE:', 'SERVER-INTERNALSTATE:']) of
+      'ACCEPT-ENCODING:', 'UPGRADE:', 'SERVER-INTERNALSTATE:', 'X-POWERED-BY']) of
     0: case IdemPCharArray(P+8,['LENGTH:', 'TYPE:', 'ENCODING:']) of
        0: ContentLength := GetCardinal(P+16);
-       1: trimcopy(s,14,255,ContentType);
+       1: begin
+            trimcopy(s,14,255,ContentType);
+            if (ContentType<>'') and
+               not IdemPChar(pointer(ContentType),'APPLICATION/JSON') then
+              P := nil; // is searched by HEADER_CONTENT_TYPE_UPPER later on
+          end;
        2: if fCompress<>nil then begin
             trimcopy(s,18,255,c);
             for i := 0 to high(fCompress) do
@@ -6718,16 +6767,36 @@ begin
                 break;
               end;
           end;
+       else P := nil;
        end;
-    1: fChunked := true;
-    2: case IdemPCharArray(P+12,['CLOSE', 'UPGRADE', 'KEEP-ALIVE, UPGRADE']) of
-       0:   ConnectionClose := true;
-       1,2: ConnectionUpgrade := true;
+    1: include(HeaderFlags,transferChuked);
+    2: case IdemPCharArray(P+12,['CLOSE','UPGRADE','KEEP-ALIVE']) of
+       0: include(HeaderFlags,connectionClose);
+       1: include(HeaderFlags,connectionUpgrade);
+       2: begin
+            include(HeaderFlags,connectionKeepAlive);
+            if P[22]=',' then begin
+              inc(P,23);
+              if P^=' ' then inc(P);
+              if IdemPChar(P,'UPGRADE') then
+                include(HeaderFlags,connectionUpgrade);
+            end;
+          end;
+       else P := nil;
        end;
     3: if fCompress<>nil then
-         fCompressAcceptHeader := ComputeContentEncoding(fCompress,P+16);
+         fCompressAcceptHeader := ComputeContentEncoding(fCompress,P+16) else
+         P := nil;
     4: trimcopy(s,9,255,Upgrade);
     5: ServerInternalState := GetCardinal(P+21);
+    6: XPoweredBy := s; // not in headers
+    else P := nil;
+    end;
+    if P=nil then begin // only store meaningful header
+      if length(Headers)<=n then
+        SetLength(Headers,n+n shr 3+16);
+      Headers[n] := s;
+      inc(n);
     end;
   until false;
   SetLength(Headers,n);
@@ -6859,12 +6928,6 @@ begin
   end;
 end;
 
-procedure THttpServerSocket.InitRequest(aClientSock: TSocket; const aRemoteIP: SockString);
-begin
-  fRemoteIP := aRemoteIP;
-  AcceptRequest(aClientSock, @fRemoteIP);
-end;
-
 function THttpServerSocket.GetRequest(withBody: boolean; headerMaxTix: Int64): THttpServerSocketGetRequestResult;
 var P: PAnsiChar;
     status: cardinal;
@@ -6873,6 +6936,8 @@ var P: PAnsiChar;
 begin
   result := grError;
   try
+    // use SockIn with 1KB buffer if not already initialized: 2x faster
+    CreateSockIn;
     // abort now with no exception if socket is obviously broken
     if fServer<>nil then begin
       pending := SockInPending(100,{alsosocket=}true);
@@ -6899,7 +6964,7 @@ begin
       if fServer.fRemoteIPHeaderUpper<>'' then begin
         P := FindHeader(pointer(Headers),length(Headers),fServer.fRemoteIPHeaderUpper);
         if (P<>nil) and (P^<>#0) then
-          fRemoteIP := P;
+          fRemoteIP := P; // real Internet IP (replace 127.0.0.1 from a proxy)
       end;
       if fServer.fRemoteConnIDHeaderUpper<>'' then begin
         P := FindHeader(pointer(Headers),length(Headers),fServer.fRemoteConnIDHeaderUpper);
@@ -6907,7 +6972,7 @@ begin
           fRemoteConnectionID := GetNextItemUInt64(P);
       end;
     end;
-    if ConnectionClose then
+    if connectionClose in HeaderFlags then
       fKeepAliveClient := false;
     if (ContentLength<0) and (KeepAliveClient or (fMethod = 'GET')) then
       ContentLength := 0; // HTTP/1.1 and no content length -> no eof
@@ -6940,7 +7005,7 @@ begin
         end;
       end;
     end;
-    if withBody and not ConnectionUpgrade then begin
+    if withBody and not (connectionUpgrade in HeaderFlags) then begin
       GetBody;
       result := grBodyReceived;
     end else
@@ -6956,7 +7021,11 @@ const SHUT_: array[boolean] of integer = (SHUT_RD, SHUT_RDWR);
 begin
   if sock<=0 then
     exit;
-  Shutdown(sock,SHUT_[rdwr]); // SHUT_RD doesn't unlock accept() on Linux
+  {$ifdef LINUXNOTBSD}
+  // at last under Linux close() is enough. For example nginx don't call shutdown
+  if rdwr then
+  {$endif LINUXNOTBSD}
+    Shutdown(sock,SHUT_[rdwr]); // SHUT_RD doesn't unlock accept() on Linux
   CloseSocket(sock); // SO_LINGER usually set to 5 or 10 seconds
 end;
 
@@ -6978,8 +7047,8 @@ begin
   result := LibC.Recv(sock,buf^,buflen,0);
   {$else}
   result := fpRecv(sock,buf,buflen,0);
-  {$endif}
-  {$endif}
+  {$endif KYLIX3}
+  {$endif MSWINDOWS}
 end;
 
 function AsynchSend(sock: TSocket; buf: pointer; buflen: integer): integer;
@@ -7079,9 +7148,10 @@ begin
   fQueuePendingContext := aQueuePendingContext;
   {$endif}
   // now create the worker threads
-  fSubThread := TObjectList.Create(true);
-  for i := 1 to NumberOfThreads do
-    fSubThread.Add(TSynThreadPoolSubThread.Create(Self));
+  fSubThreadCount := NumberOfThreads;
+  SetLength(fSubThread,fSubThreadCount);
+  for i := 0 to fSubThreadCount-1 do
+    fSubThread[i] := TSynThreadPoolSubThread.Create(Self);
 end;
 
 destructor TSynThreadPool.Destroy;
@@ -7091,14 +7161,14 @@ begin
   fTerminated := true; // fSubThread[].Execute will check this flag
   try
     // notify the threads we are shutting down
-    for i := 0 to fSubThread.Count-1 do
+    for i := 0 to fSubThreadCount-1 do
       {$ifdef USE_WINIOCP}
       PostQueuedCompletionStatus(fRequestQueue,0,0,nil);
       {$else}
-      TSynThreadPoolSubThread(fSubThread.Items[i]).fEvent.SetEvent;
+      fSubThread[i].fEvent.SetEvent;
       {$endif}
     {$ifndef USE_WINIOCP}
-    // cleanup now any pending task
+    // cleanup now any pending task (e.g. THttpServerSocket instance)
     for i := 0 to fPendingContextCount-1 do
       TaskAbort(fPendingContext[i]);
     {$endif}
@@ -7106,7 +7176,8 @@ begin
     endtix := GetTick64+30000;
     while (fRunningThreads>0) and (GetTick64<endtix) do
       SleepHiRes(5);
-    fSubThread.Free;
+    for i := 0 to fSubThreadCount-1 do
+      fSubThread[i].Free;
   finally
     {$ifdef USE_WINIOCP}
     CloseHandle(fRequestQueue);
@@ -7126,16 +7197,18 @@ function TSynThreadPool.Push(aContext: pointer; aWaitOnContention: boolean): boo
   {$else}
   function Enqueue: boolean;
   var i, n: integer;
+      found: TSynThreadPoolSubThread;
       thread: ^TSynThreadPoolSubThread;
   begin
-    result := false;
+    result := false; // queue is full
+    found := nil;
     EnterCriticalsection(fSafe);
     try
-      thread := pointer(fSubThread.List);
-      for i := 1 to fSubThread.Count do
+      thread := pointer(fSubThread);
+      for i := 1 to fSubThreadCount do
         if thread^.fProcessingContext=nil then begin
-          thread^.fProcessingContext := aContext;
-          thread^.fEvent.SetEvent;
+          found := thread^;
+          found.fProcessingContext := aContext;
           result := true; // found one available thread
           exit;
         end else
@@ -7143,7 +7216,7 @@ function TSynThreadPool.Push(aContext: pointer; aWaitOnContention: boolean): boo
       if not fQueuePendingContext then
         exit;
       n := fPendingContextCount;
-      if n+fSubThread.Count>QueueLength then
+      if n+fSubThreadCount>QueueLength then
         exit; // too many connection limit reached (see QueueIsFull)
       if n=length(fPendingContext) then
         SetLength(fPendingContext,n+n shr 3+64);
@@ -7152,6 +7225,8 @@ function TSynThreadPool.Push(aContext: pointer; aWaitOnContention: boolean): boo
       result := true; // added in pending queue
     finally
       LeaveCriticalsection(fSafe);
+      if found<>nil then
+        found.fEvent.SetEvent; // rather notify outside of the fSafe lock
     end;
   end;
   {$endif}
@@ -7168,7 +7243,7 @@ begin
     tix := GetTick64;
     starttix := tix;
     endtix := tix+fContentionAbortDelay; // default 5 sec
-    repeat
+    repeat // during this delay, no new connection is ACCEPTed
       if tix-starttix<50 then // wait for an available slot in the queue
         SleepHiRes(1) else
         SleepHiRes(10);
@@ -7176,7 +7251,7 @@ begin
       if fTerminated then
         exit;
       if Enqueue then begin
-        result := true; // thread pool acquired the client sock
+        result := true; // thread pool acquired or queued the client sock
         break;
       end;
     until fTerminated or (tix>endtix);
@@ -7202,7 +7277,8 @@ end;
 
 function TSynThreadPool.QueueIsFull: boolean;
 begin
-  result := fQueuePendingContext and (GetPendingContextCount+fSubThread.Count>QueueLength);
+  result := fQueuePendingContext and
+    (GetPendingContextCount+fSubThreadCount>QueueLength);
 end;
 
 function TSynThreadPool.PopPendingContext: pointer;
@@ -7216,6 +7292,8 @@ begin
       result := fPendingContext[0];
       dec(fPendingContextCount);
       Move(fPendingContext[1],fPendingContext[0],fPendingContextCount*SizeOf(pointer));
+      if fPendingContextCount=128 then
+        SetLength(fPendingContext,128); // small queue when congestion is resolved
     end;
   finally
     LeaveCriticalsection(fSafe);
@@ -7276,10 +7354,10 @@ begin
 end;
 
 procedure TSynThreadPoolSubThread.Execute;
-var Context: pointer;
+var ctxt: pointer;
     {$ifdef USE_WINIOCP}
-    Dummy1: DWORD;
-    Dummy2: PtrUInt;
+    dum1: DWORD;
+    dum2: PtrUInt;
     {$endif}
 begin
   if fOwner<>nil then
@@ -7288,27 +7366,29 @@ begin
     NotifyThreadStart(self);
     repeat
       {$ifdef USE_WINIOCP}
-      if (not GetQueuedCompletionStatus(fOwner.fRequestQueue,Dummy1,Dummy2,Context,INFINITE) and
+      if (not GetQueuedCompletionStatus(fOwner.fRequestQueue,dum1,dum2,ctxt,INFINITE) and
          fOwner.NeedStopOnIOError) or fOwner.fTerminated then
         break;
-      if Context<>nil then
-        DoTask(Context);
+      if ctxt<>nil then
+        DoTask(ctxt);
       {$else}
       fEvent.WaitFor(INFINITE);
       if fOwner.fTerminated then
         break;
       EnterCriticalSection(fOwner.fSafe);
-      Context := fProcessingContext; { TODO : use Interlocked*() to reduce OS calls? }
+      ctxt := fProcessingContext;
       LeaveCriticalSection(fOwner.fSafe);
-      while Context<>nil do begin
-        DoTask(Context);
-        Context := fOwner.PopPendingContext; // unqueue any pending context
+      if ctxt<>nil then begin
+        repeat
+          DoTask(ctxt);
+          ctxt := fOwner.PopPendingContext; // unqueue any pending context
+        until ctxt=nil;
+        EnterCriticalSection(fOwner.fSafe);
+        fProcessingContext := nil; // indicates this thread is now available
+        LeaveCriticalSection(fOwner.fSafe);
       end;
-      EnterCriticalSection(fOwner.fSafe);
-      fProcessingContext := nil; // indicates this thread is now available
-      LeaveCriticalSection(fOwner.fSafe);
       {$endif USE_WINIOCP}
-    until fOwner.fTerminated;
+    until fOwner.fTerminated or Terminated;
   finally
     InterlockedDecrement(fOwner.fRunningThreads);
   end;
@@ -7356,11 +7436,10 @@ var ServerSock: THttpServerSocket;
     headertix: Int64;
     res: THttpServerSocketGetRequestResult;
 begin
-  if fServer.Terminated then
-    exit;
-  ServerSock := fServer.fSocketClass.Create(fServer);
+  ServerSock := aContext;
   try
-    ServerSock.InitRequest(TSocket(PtrUInt(aContext)));
+    if fServer.Terminated then
+      exit;
     // get Header of incoming request in the thread pool
     headertix := fServer.HeaderRetrieveAbortDelay;
     if headertix>0 then
@@ -7382,7 +7461,7 @@ begin
         ServerSock := nil; // THttpServerResp will own and free ServerSock
       end else begin
         // no Keep Alive = multi-connection -> process in the Thread Pool
-        if not ServerSock.ConnectionUpgrade then begin
+        if not (connectionUpgrade in ServerSock.HeaderFlags) then begin
           ServerSock.GetBody; // we need to get it now
           InterlockedIncrement(fServer.fStats[grBodyReceived]);
         end;
@@ -7402,7 +7481,7 @@ end;
 
 procedure TSynThreadPoolTHttpServer.TaskAbort(aContext: Pointer);
 begin
-  DirectShutdown(TSocket(PtrUInt(aContext)));
+  THttpServerSocket(aContext).Free;
 end;
 
 
@@ -8641,12 +8720,13 @@ type
 procedure THttpApiServer.Clone(ChildThreadCount: integer);
 var i: integer;
 begin
-  if (fReqQueue=0) or not Assigned(OnRequest) or (ChildThreadCount<=0) then
+  if (fReqQueue=0) or not Assigned(OnRequest) or (ChildThreadCount<=0) or (fClones<>nil) then
     exit; // nothing to clone (need a queue and a process event)
   if ChildThreadCount>256 then
     ChildThreadCount := 256; // not worth adding
-  for i := 1 to ChildThreadCount do
-    fClones.Add(THttpApiServerClass(Self.ClassType).CreateClone(self));
+  SetLength(fClones,ChildThreadCount);
+  for i := 0 to ChildThreadCount-1 do
+    fClones[i] := THttpApiServerClass(Self.ClassType).CreateClone(self);
 end;
 
 function THttpApiServer.GetAPIVersion: string;
@@ -8654,21 +8734,12 @@ begin
   result := Format('HTTP API %d.%d',[Http.Version.MajorVersion,Http.Version.MinorVersion]);
 end;
 
-procedure THttpApiServer.SetOnTerminate(const Event: TNotifyThreadEvent);
-var i: integer;
-begin
-  inherited SetOnTerminate(Event);
-  if (Clones<>nil) and (fOwner=nil) then
-    for i := 0 to Clones.Count-1 do
-      THttpApiServer(Clones[i]).OnHttpThreadTerminate := Event;
-end;
-
 constructor THttpApiServer.Create(CreateSuspended: boolean; QueueName: SynUnicode;
   OnStart,OnStop: TNotifyThreadEvent; const ProcessName: SockString);
 var bindInfo: HTTP_BINDING_INFO;
 begin
   SetLength(fLogDataStorage,sizeof(HTTP_LOG_FIELDS_DATA)); // should be done 1st
-  inherited Create(true,OnStart,OnStop,ProcessName);
+  inherited Create({suspended=}true,OnStart,OnStop,ProcessName);
   HttpApiInitialize; // will raise an exception in case of failure
   EHttpApiServer.RaiseOnError(hInitialize,
     Http.Initialize(Http.Version,HTTP_INITIALIZE_SERVER));
@@ -8687,7 +8758,6 @@ begin
       fUrlGroupID,HttpServerBindingProperty,@bindInfo,SizeOf(bindInfo)));
   end else
     EHttpApiServer.RaiseOnError(hCreateHttpHandle,Http.CreateHttpHandle(fReqQueue));
-  fClones := TObjectList.Create;
   fReceiveBufferSize := 1048576; // i.e. 1 MB
   if not CreateSuspended then
     Suspended := False;
@@ -8696,7 +8766,6 @@ end;
 constructor THttpApiServer.CreateClone(From: THttpApiServer);
 begin
   SetLength(fLogDataStorage,sizeof(HTTP_LOG_FIELDS_DATA));
-  inherited Create(false,From.fOnHttpThreadStart,From.fOnTerminate,From.ProcessName);
   fOwner := From;
   fReqQueue := From.fReqQueue;
   fOnRequest := From.fOnRequest;
@@ -8713,12 +8782,15 @@ begin
   SetRemoteIPHeader(From.RemoteIPHeader);
   SetRemoteConnIDHeader(From.RemoteConnIDHeader);
   fLoggingServiceName := From.fLoggingServiceName;
+  inherited Create(false,From.fOnHttpThreadStart,From.fOnTerminate,From.ProcessName);
 end;
 
 procedure THttpApiServer.DestroyMainThread;
 var i: integer;
 begin
   if fReqQueue<>0 then begin
+    for i := 0 to length(fClones)-1 do
+      fClones[i].Terminate; // for CloseHandle() below to finish Execute
     if Http.Version.MajorVersion>1 then begin
      if fUrlGroupID<>0 then begin
        Http.RemoveUrlFromUrlGroup(fUrlGroupID,nil,HTTP_URL_FLAG_REMOVE_ALL);
@@ -8736,28 +8808,19 @@ begin
       CloseHandle(fReqQueue); // will break all THttpApiServer.Execute
     end;
     fReqQueue := 0;
-    FreeAndNil(fClones);
+    for i := 0 to length(fClones)-1 do
+      fClones[i].Free;
+    fClones := nil;
     Http.Terminate(HTTP_INITIALIZE_SERVER);
   end;
 end;
 
 destructor THttpApiServer.Destroy;
-{$ifdef LVCL}
-var i: integer;
-{$endif}
 begin
-  {$ifdef LVCL}
   Terminate; // for Execute to be notified about end of process
-  {$endif}
   try
-    if (fClones<>nil) and (Http.Module<>0) then // fClones=nil for clone threads
+    if (fOwner=nil) and (Http.Module<>0) then // fOwner<>nil for cloned threads
       DestroyMainThread;
-    {$ifdef LVCL}
-    for i := 1 to 500 do
-      if fExecuteFinished then
-        break else
-        SleepHiRes(10);
-    {$endif}
   finally
     inherited Destroy;
   end;
@@ -9016,7 +9079,8 @@ begin
           P := Req^.Headers.pUnknownHeaders;
           if P<>nil then
           for i := 1 to Req^.Headers.UnknownHeaderCount do
-            if (P^.NameLength=L) and IdemPChar(P^.pName,Pointer(fRemoteConnIDHeaderUpper)) then begin
+            if (P^.NameLength=L) and
+               IdemPChar(P^.pName,Pointer(fRemoteConnIDHeaderUpper)) then begin
               SetString(RemoteConn,p^.pRawValue,p^.RawValueLength); // need #0 end
               R := pointer(RemoteConn);
               Context.fConnectionID := GetNextItemUInt64(R);
@@ -9147,17 +9211,6 @@ begin
     Context.Free;
     fExecuteFinished := true;
   end;
-end;
-
-procedure THttpApiServer.RegisterCompress(aFunction: THttpSocketCompress;
-  aCompressMinSize: integer=1024);
-var i: integer;
-begin
-  inherited;
-  if fClones<>nil then
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).
-        RegisterCompress(aFunction,aCompressMinSize);
 end;
 
 function THttpApiServer.GetHTTPQueueLength: Cardinal;
@@ -9342,23 +9395,40 @@ begin
   fLogData := pointer(fLogDataStorage);
 end;
 
+procedure THttpApiServer.RegisterCompress(aFunction: THttpSocketCompress;
+  aCompressMinSize: integer=1024);
+var i: integer;
+begin
+  inherited;
+  for i := 0 to length(fClones)-1 do
+    fClones[i].RegisterCompress(aFunction,aCompressMinSize);
+end;
+
+procedure THttpApiServer.SetOnTerminate(const Event: TNotifyThreadEvent);
+var i: integer;
+begin
+  inherited SetOnTerminate(Event);
+  if fOwner=nil then
+    for i := 0 to length(fClones)-1 do
+      fClones[i].OnHttpThreadTerminate := Event;
+end;
+
 procedure THttpApiServer.LogStop;
 var i: integer;
 begin
   if (self=nil) or (fClones=nil) or (fLogData=nil) then
     exit;
   fLogData := nil;
-  for i := 0 to fClones.Count-1 do
-    THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).fLogData := nil;
+  for i := 0 to length(fClones)-1 do
+    fClones[i].fLogData := nil;
 end;
 
 procedure THttpApiServer.SetReceiveBufferSize(Value: cardinal);
 var i: integer;
 begin
   fReceiveBufferSize := Value;
-  if fClones<>nil then // parameter shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).fReceiveBufferSize := Value;
+  for i := 0 to length(fClones)-1 do
+    fClones[i].fReceiveBufferSize := Value;
 end;
 
 procedure THttpApiServer.SetServerName(const aName: SockString);
@@ -9369,81 +9439,72 @@ begin
     ServerName := pointer(aName);
     ServerNameLength := Length(aName);
   end;
-  if fClones<>nil then // server name is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetServerName(aName);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetServerName(aName);
 end;
 
 procedure THttpApiServer.SetOnRequest(const aRequest: TOnHttpServerRequest);
 var i: integer;
 begin
   inherited SetOnRequest(aRequest);
-  if fClones<>nil then // event is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetOnRequest(aRequest);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetOnRequest(aRequest);
 end;
 
 procedure THttpApiServer.SetOnBeforeBody(const aEvent: TOnHttpServerBeforeBody);
 var i: integer;
 begin
   inherited SetOnBeforeBody(aEvent);
-  if fClones<>nil then // event is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetOnBeforeBody(aEvent);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetOnBeforeBody(aEvent);
 end;
 
 procedure THttpApiServer.SetOnBeforeRequest(const aEvent: TOnHttpServerRequest);
 var i: integer;
 begin
   inherited SetOnBeforeRequest(aEvent);
-  if fClones<>nil then // event is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetOnBeforeRequest(aEvent);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetOnBeforeRequest(aEvent);
 end;
 
 procedure THttpApiServer.SetOnAfterRequest(const aEvent: TOnHttpServerRequest);
 var i: integer;
 begin
   inherited SetOnAfterRequest(aEvent);
-  if fClones<>nil then // event is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetOnAfterRequest(aEvent);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetOnAfterRequest(aEvent);
 end;
 
 procedure THttpApiServer.SetOnAfterResponse(const aEvent: TOnHttpServerAfterResponse);
 var i: integer;
 begin
   inherited SetOnAfterResponse(aEvent);
-  if fClones<>nil then // event is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetOnAfterResponse(aEvent);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetOnAfterResponse(aEvent);
 end;
 
 procedure THttpApiServer.SetMaximumAllowedContentLength(aMax: cardinal);
 var i: integer;
 begin
   inherited SetMaximumAllowedContentLength(aMax);
-  if fClones<>nil then // parameter is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetMaximumAllowedContentLength(aMax);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetMaximumAllowedContentLength(aMax);
 end;
 
 procedure THttpApiServer.SetRemoteIPHeader(const aHeader: SockString);
 var i: integer;
 begin
   inherited SetRemoteIPHeader(aHeader);
-  if fClones<>nil then // parameter is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetRemoteIPHeader(aHeader);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetRemoteIPHeader(aHeader);
 end;
 
 procedure THttpApiServer.SetRemoteConnIDHeader(const aHeader: SockString);
 var i: integer;
 begin
   inherited SetRemoteConnIDHeader(aHeader);
-  if fClones<>nil then // parameter is shared by all clones
-    for i := 0 to fClones.Count-1 do
-      THttpApiServer(fClones.List{$ifdef FPC}^{$endif}[i]).SetRemoteConnIDHeader(aHeader);
+  for i := 0 to length(fClones)-1 do
+    fClones[i].SetRemoteConnIDHeader(aHeader);
 end;
 
 procedure THttpApiServer.SetLoggingServiceName(const aName: SockString);
@@ -9846,7 +9907,7 @@ begin
   {$else}
    InitializeCriticalSection(fSafe);
   {$endif}
-  fPendingForClose := TList.Create;
+  fPendingForClose := {$ifdef FPC}TFPList{$else}TList{$endif}.Create;
   fName := aName;
   fManualFragmentManagement := aManualFragmentManagement;
   fServer := aServer;
@@ -9886,6 +9947,7 @@ begin
   DeleteCriticalSection(fSafe);
   {$ENDIF}
   FreeMem(fConnections, fConnectionsCapacity * SizeOf(PHttpApiWebSocketConnection));
+  fConnections := nil;
   inherited;
 end;
 
@@ -10273,6 +10335,7 @@ begin
     fRegisteredProtocols^[i].Free;
   fRegisteredProtocols^ := nil;
   Dispose(fRegisteredProtocols);
+  fRegisteredProtocols := nil;
   inherited;
 end;
 
@@ -12281,7 +12344,7 @@ begin
   byte(notif.events) := 0;
   if (timeoutMS<0) or fTerminated then
     exit;
-  start := GetTick64;
+  start := {$ifdef MSWINDOWS}GetTick64{$else}0{$endif};
   repeat
     // non-blocking search within fPoll[]
     EnterCriticalSection(fPollLock);
@@ -12306,14 +12369,18 @@ begin
     // wait a little for something to happen
     if fTerminated or (timeoutMS=0) then
       exit;
-    elapsed := GetTick64-start; // allow multi-threaded process
-    if elapsed>timeoutMS then
-      exit else
-    if elapsed>300 then
-      SleepHiRes(50) else
-    if elapsed>50 then
-      SleepHiRes(10) else
-      SleepHiRes(1);
+    {$ifndef MSWINDOWS}
+    if start=0 then // measure time elapsed only if we wait
+      start := GetTick64 else {$endif} begin
+      elapsed := GetTick64-start; // allow multi-threaded process
+      if elapsed>timeoutMS then
+        exit else
+      if elapsed>300 then
+        SleepHiRes(50) else
+      if elapsed>50 then
+        SleepHiRes(10) else
+        SleepHiRes(1);
+    end;
   until fTerminated;
 end;
 
@@ -12717,6 +12784,7 @@ begin
     NormToUpper[i] := i;
   for i := ord('a') to ord('z') do
     dec(NormToUpper[i],32);
+  IP4local := '127.0.0.1'; // use var string with refcount=1 to avoid allocation
   {$ifdef MSWINDOWS}
   Assert(
     {$ifdef CPU64}

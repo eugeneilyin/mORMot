@@ -389,7 +389,7 @@ type
     // this case, Close method won't be called
     function TrySockRecv(Buffer: pointer; var Length: integer; StopBeforeLength: boolean=false): boolean;
     /// call readln(SockIn^,Line) or simulate it with direct use of Recv(Sock, ..)
-    // - char are read one by one
+    // - char are read one by one if needed
     // - use TimeOut milliseconds wait for incoming data
     // - raise ECrtSocket exception on socket error
     // - by default, will handle #10 or #13#10 as line delimiter (as normal text
@@ -574,7 +574,8 @@ type
     /// map the presence of some HTTP headers, but retrieved during Request
     HeaderFlags: set of(transferChuked, connectionClose, connectionUpgrade, connectionKeepAlive);
     /// retrieve the HTTP headers into Headers[] and fill most properties below
-    procedure GetHeader;
+    // - only relevant headers are indexed, unless HeadersUnFiltered is set
+    procedure GetHeader(HeadersUnFiltered: boolean=false);
     /// retrieve the HTTP body (after uncompression if necessary) into Content
     procedure GetBody;
     /// add an header entry, returning the just entered entry index in Headers[]
@@ -1126,7 +1127,7 @@ type
   public
     /// initialize the server instance, in non suspended state
     constructor Create(CreateSuspended: boolean; OnStart,OnStop: TNotifyThreadEvent;
-      const ProcessName: SockString); override;
+      const ProcessName: SockString); reintroduce; virtual;
     /// override this function to customize your http server
     // - InURL/InMethod/InContent properties are input parameters
     // - OutContent/OutContentType/OutCustomHeader are output parameters
@@ -1189,7 +1190,7 @@ type
     // - if handler returns value > 0 it will override the OnProcess response code
     // - warning: this handler must be thread-safe (can be called by several
     // threads simultaneously)
-    property OnAfterRequest: TOnHttpServerRequest  read fOnAfterRequest write SetOnAfterRequest;
+    property OnAfterRequest: TOnHttpServerRequest read fOnAfterRequest write SetOnAfterRequest;
     /// event handler called after response is sent back to client
     // - main purpose is to apply post-response analysis, logging, etc.
     // - warning: this handler must be thread-safe (can be called by several
@@ -1849,6 +1850,7 @@ type
     fExecuteFinished: boolean;
     fStats: array[THttpServerSocketGetRequestResult] of integer;
     fSocketClass: THttpServerSocketClass;
+    fHeadersNotFiltered: boolean;
     function GetStat(one: THttpServerSocketGetRequestResult): integer;
     function GetHTTPQueueLength: Cardinal; override;
     procedure SetHTTPQueueLength(aValue: Cardinal); override;
@@ -1877,10 +1879,11 @@ type
     // incoming connections. Default is 32, which may be sufficient for most
     // cases, maximum is 256. If you set 0, the thread pool will be disabled
     // and one thread will be created for any incoming connection
-    // - you can also tune (or disable with 0) HTTP/1.1 keep alive delay
+    // - you can also tune (or disable with 0) HTTP/1.1 keep alive delay and
+    // how incoming request Headers[] are pushed to the processing method
     constructor Create(const aPort: SockString; OnStart,OnStop: TNotifyThreadEvent;
       const ProcessName: SockString; ServerThreadPoolCount: integer=32;
-      KeepAliveTimeOut: integer=30000); reintroduce; virtual;
+      KeepAliveTimeOut: integer=30000; HeadersUnFiltered: boolean=false); reintroduce; virtual;
     /// enable NGINX X-Accel internal redirection for HTTP_RESP_STATICFILE
     // - will define internally a matching OnSendFile event handler
     // - generating "X-Accel-Redirect: " header, trimming any supplied left
@@ -1895,6 +1898,11 @@ type
     procedure NginxSendFileFrom(const FileNameLeftTrim: TFileName);
     /// release all memory and handlers
     destructor Destroy; override;
+    /// by default, only relevant headers are added to internal headers list
+    // - for instance, Content-Length, Content-Type and Content-Encoding are
+    // stored as fields in this THttpSocket, but not included in its Headers[]
+    // - set this property to true to include all incoming headers
+    property HeadersNotFiltered: boolean read fHeadersNotFiltered;
     /// access to the main server low-level Socket
     // - it's a raw TCrtSocket, which only need a socket to be bound, listening
     // and accept incoming request
@@ -4711,12 +4719,13 @@ begin
       result := -1; // on socket error -> raise ioresult error
 end;
 
-function WSAIsFatalError: boolean;
+function WSAIsFatalError(anothernonfatal: integer=NO_ERROR): boolean;
 var err: integer;
 begin
   err := WSAGetLastError;
-  result := (err<>NO_ERROR) and (err<>WSATRY_AGAIN) and (err<>WSAEINTR) and (err<>WSAEADDRNOTAVAIL)
-    {$ifdef MSWINDOWS}and (err<>WSAETIMEDOUT) and (err<>WSAEWOULDBLOCK){$endif};
+  result := (err<>NO_ERROR) and (err<>WSATRY_AGAIN) and (err<>WSAEINTR) and
+    {$ifdef MSWINDOWS}(err<>WSAETIMEDOUT) and (err<>WSAEWOULDBLOCK) and{$endif}
+    (err<>anothernonfatal); // allow WSAEADDRNOTAVAIL from OpenBind()
 end;
 
 function WSAErrorAtShutdown(sock: TSocket): integer;
@@ -4902,10 +4911,10 @@ begin
       retry := {$ifdef BSD}10{$else}2{$endif}; 
     repeat
       fSock := CallServer(aServer,Port,doBind,aLayer,Timeout); // OPEN or BIND
-      if (fSock>0) or WSAIsFatalError then
+      if (fSock>0) or WSAIsFatalError(WSAEADDRNOTAVAIL) then
         break;
       dec(retry);
-      if retry=0 then
+      if retry<=0 then
         raise ECrtSocket.CreateFmt('OpenBind(%s:%s,%s) failed: %s',
           [aServer,fPort,BINDTXT[doBind],BINDMSG[doBind]],-1);
       sleep(10);
@@ -5570,7 +5579,6 @@ begin
 end;
 
 procedure THttpClientSocket.RequestSendHeader(const url, method: SockString);
-var aURL: SockString;
 begin
   if fSock<=0 then
     exit;
@@ -5579,9 +5587,8 @@ begin
   if TCPPrefix<>'' then
     SockSend(TCPPrefix);
   if (url='') or (url[1]<>'/') then
-    aURL := '/'+url else // need valid url according to the HTTP/1.1 RFC
-    aURL := url;
-  SockSend([method,' ',aURL,' HTTP/1.1']);
+    SockSend([method,' /',url,' HTTP/1.1']) else
+    SockSend([method,' ',url,' HTTP/1.1']);
   if Port=DEFAULT_PORT[fTLS] then
     SockSend(['Host: ',Server]) else
     SockSend(['Host: ',Server,':',Port]);
@@ -5665,7 +5672,7 @@ begin
         DoRetry(STATUS_HTTPVERSIONNONSUPPORTED,Command); // 505=wrong format
         exit;
       end;
-      GetHeader; // read all other headers
+      GetHeader(false); // read all other headers
       if (result<>STATUS_NOCONTENT) and not IdemPChar(pointer(method),'HEAD') then
         GetBody; // get content if necessary (not HEAD method)
     except
@@ -6095,7 +6102,8 @@ end;
 
 constructor THttpServer.Create(const aPort: SockString; OnStart,
   OnStop: TNotifyThreadEvent; const ProcessName: SockString;
-  ServerThreadPoolCount: integer; KeepAliveTimeOut: integer);
+  ServerThreadPoolCount: integer; KeepAliveTimeOut: integer;
+  HeadersUnFiltered: boolean);
 begin
   fInternalHttpServerRespList := {$ifdef FPC}TFPList{$else}TList{$endif}.Create;
   InitializeCriticalSection(fProcessCS);
@@ -6114,6 +6122,7 @@ begin
     fThreadPool := TSynThreadPoolTHttpServer.Create(self,ServerThreadPoolCount);
     fHTTPQueueLength := 1000;
   end;
+  fHeadersNotFiltered := HeadersUnFiltered;
   inherited Create(false,OnStart,OnStop,ProcessName);
 end;
 
@@ -6729,7 +6738,7 @@ begin
   {$I+}
 end;
 
-procedure THttpSocket.GetHeader;
+procedure THttpSocket.GetHeader(HeadersUnFiltered: boolean);
 var s,c: SockString;
     i, n: integer;
     P: PAnsiChar;
@@ -6748,7 +6757,7 @@ begin
     SockRecvLn(s);
     if s='' then
       break; // headers end with a void line
-    P := pointer(s); // P := nil below to store in Headers[]
+    P := pointer(s); // set P=nil below to store in Headers[]
     case IdemPCharArray(P,['CONTENT-', 'TRANSFER-ENCODING: CHUNKED', 'CONNECTION: ',
       'ACCEPT-ENCODING:', 'UPGRADE:', 'SERVER-INTERNALSTATE:', 'X-POWERED-BY']) of
     0: case IdemPCharArray(P+8,['LENGTH:', 'TYPE:', 'ENCODING:']) of
@@ -6792,7 +6801,7 @@ begin
     6: XPoweredBy := s; // not in headers
     else P := nil;
     end;
-    if P=nil then begin // only store meaningful header
+    if (P=nil) or HeadersUnFiltered then begin // only store meaningful headers
       if length(Headers)<=n then
         SetLength(Headers,n+n shr 3+16);
       Headers[n] := s;
@@ -6933,6 +6942,7 @@ var P: PAnsiChar;
     status: cardinal;
     pending: integer;
     reason, allheaders: SockString;
+    noheaderfilter: boolean;
 begin
   result := grError;
   try
@@ -6943,7 +6953,9 @@ begin
       pending := SockInPending(100,{alsosocket=}true);
       if (pending<0) or (fServer=nil) or fServer.Terminated then
         exit;
-    end;
+      noheaderfilter := fServer.HeadersNotFiltered;
+    end else
+      noheaderfilter := false;
     // 1st line is command: 'GET /path HTTP/1.1' e.g.
     SockRecvLn(Command);
     if TCPPrefix<>'' then
@@ -6959,7 +6971,7 @@ begin
        IdemPChar(P,'HTTP/1.1');
     Content := '';
     // get headers and content
-    GetHeader;
+    GetHeader(noheaderfilter);
     if fServer<>nil then begin // nil from TRTSPOverHTTPServer
       if fServer.fRemoteIPHeaderUpper<>'' then begin
         P := FindHeader(pointer(Headers),length(Headers),fServer.fRemoteIPHeaderUpper);
@@ -12809,11 +12821,13 @@ begin
     (ord(reqUserAgent)=40) and
     (ord(respLocation)=23) and (sizeof(THttpHeader)=4) and
     (integer(HTTP_LOG_FIELD_TEST_SUB_STATUS)=HTTP_LOG_FIELD_SUB_STATUS));
-  FillChar(WinHttpAPI, SizeOf(WinHttpAPI), 0);
-  WinHttpAPIInitialize;
   GetTick64 := GetProcAddress(GetModuleHandle(kernel32),'GetTickCount64');
   if not Assigned(GetTick64) then // fallback before Vista
     GetTick64 := @GetTick64ForXP;
+  {$ifdef USEWININET}
+  FillChar(WinHttpAPI, SizeOf(WinHttpAPI), 0);
+  WinHttpAPIInitialize;
+  {$endif}
   {$endif MSWINDOWS}
   FillChar(WsaDataOnce,sizeof(WsaDataOnce),0);
   if InitSocketInterface then

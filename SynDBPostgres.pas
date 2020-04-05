@@ -9,18 +9,17 @@ unit SynDBPostgres;
 
    Features:
     - fast, minimum memory allocation
+    - includes its own simple wrapper to the libpq native client
+    - perfect fit for our ORM (JSON results, bulk insert/update/delete)
     - array binding for select statements (caller should use =ANY(?) etc.)
 
    Limitations:
-    - FPC only (uses postgres3dyn.pp)
-      (TODO - use our own simple wrapper)
     - works with PostgreSQL>=7.4 and (v3 protocol)
-    - libpg>=8.3 is required (PQunescapeBytea)
     - consider creating the database with UTF8 collation
     - notifications are not implemented
-    - Postgres level prepared statements works only for SQLs what starts
+    - Postgres level prepared cached statements works only for SQLs what starts
       exactly with SELECT INSERT UPDATE DELETE VALUES and not contains ";"
-    - parameter parser will fails in case SQL contains comments with ? inside
+    - parameters parser will fails in case SQL contains comments with ? inside
       (TODO - will be fixed)
     - all query rows are returned at once, caller should care about pagination
       (TODO - implement singleRowMode?)
@@ -34,30 +33,28 @@ interface
 {$I Synopse.inc} // define HASINLINE CPU32 CPU64 OWNNORMTOUPPER
 
 uses
-  {$ifndef FPC}
-  SynDBPostgres is for Free Pascal only
+  {$ifdef MSWINDOWS}
+  Windows,
   {$endif}
   SysUtils,
-  postgres3dyn,
   SynCommons,
   SynTable,
   SynDB;
 
 type
-  PPPGresult = ^PPGresult;
-
   /// exception type associated to the native libpg Interface
   ESQLDBPostgres = class(ESQLDBException);
-
 
   /// connection properties which will implement an internal Thread-Safe
   // connection pool
   TSQLDBPostgresConnectionProperties = class(TSQLDBConnectionPropertiesThreadSafe)
   private
-    FOids2FieldType: TSynDictionary; // thread-safe Oid/TSQLDBFieldType map
+    fOids: TWordDynArray; // O(n) search in L1 cache - use SSE2 on FPC x86_64
+    fOidsFieldTypes: TSQLDBFieldTypeDynArray;
+    fOidsCount: integer;
   protected
     procedure GetForeignKeys; override;
-    /// fill mapping of OID
+    /// fill mapping of standard OID
     // - at runtime mapping can be defined using Oid2FieldType() method
     // - OIDs defined in DB can be retrieved using query
     //  "select oid, typname from pg_type where typtype = 'b' order by oid"
@@ -71,17 +68,15 @@ type
     // in aPassword parameter to prevent logging it (see TSQLDBConnectionProperties.DatabaseNameSafe)
     // - better to use environment variables and postgres config file for connection parameters
     constructor Create(const aServerName, aDatabaseName, aUserID, aPassword: RawUTF8); override;
-    /// release related memory, and all per-thread connections
-    destructor Destroy; override;
     /// create a new connection
     // - caller is responsible of freeing this instance
     // - this overridden method will create an TSQLDBPostgresConnection instance
     function NewConnection: TSQLDBConnection; override;
     /// add or replace mapping of OID into TSQLDBFieldType
-    // - in case mapping for OID is not defined column type of such OIDs will be ftUTF8
-    function Oid2FieldType(const cOID: Oid): TSQLDBFieldType; {$ifdef HASINLINE} inline; {$endif}
+    // - in case mapping for OID is not defined, returns ftUTF8
+    function Oid2FieldType(cOID: cardinal): TSQLDBFieldType; {$ifdef HASINLINE} inline; {$endif}
     // add new (or override existed) OID to FieldType mapping
-    procedure MapOid(const cOid: Oid; const fieldType: TSQLDBFieldType);
+    procedure MapOid(cOid: cardinal; fieldType: TSQLDBFieldType);
   end;
 
 
@@ -89,26 +84,28 @@ type
   TSQLDBPostgresConnection = class(TSQLDBConnectionThreadSafe)
   protected
     // prepared statement names = SHA-256 of its SQL
-    FPQprepared: TRawUTF8List;
+    fPrepared: THash256DynArray; // O(n) fast search in L1 cache
+    fPreparedCount: integer;
     // the associated low-level provider connection
-    fPGConn: PPGconn;
-    /// raise an exception on error and clean result
-    // - will set pRes to nil if passed
-    // - if forceClean is true - will clean passed res in any case
-    procedure Check(res: PPGresult; pRes: PPPGresult = nil; forceClean: boolean = true);
+    fPGConn: pointer;
+    // fServerSettings: set of (ssByteAasHex);
+    // maintain fPrepared[] hash list to identify already cached
+    function PrepareCached(const aSQL: RawUTF8; aParamCount: integer;
+      out aName: RawUTF8): integer;
     /// direct execution of SQL statement what do not returns a result
     // - statement should not contains parameters
     // - raise an ESQLDBPostgres on error
-    procedure DirectExecSQL(const SQL: RawUTF8);
+    procedure DirectExecSQL(const SQL: RawUTF8); overload;
+    /// direct execution of SQL statement what do not returns a result
+    // - overloaded method to return a single value e.g. from a SELECT
+    procedure DirectExecSQL(const SQL: RawUTF8; out Value: RawUTF8); overload;
+    /// query the pg_settings table for a given setting
+    function GetServerSetting(const Name: RawUTF8): RawUTF8;
   public
-    /// connect to a specified database engine
-    constructor Create(aProperties: TSQLDBConnectionProperties); override;
-    /// release memory and connection
-    destructor Destroy; override;
     /// connect to the specified server
     // - should raise an ESQLDBPostgres on error
     procedure Connect; override;
-    /// stop connection to the specified ZEOS database server
+    /// stop connection to the specified PostgreSQL database server
     // - should raise an ESQLDBPostgres on error
     procedure Disconnect; override;
     /// return TRUE if Connect has been already successfully called
@@ -124,7 +121,9 @@ type
     // - StartTransaction method must have been called before
     procedure Rollback; override;
     /// direct access to the associated PPGconn connection
-    property Direct: PPGconn read fPGConn;
+    property Direct: pointer read fPGConn;
+    /// how many prepared statements are currently cached for this connection
+    property PreparedCount: integer read fPreparedCount;
   end;
 
 
@@ -133,20 +132,20 @@ type
   protected
     fPreparedStmtName: RawUTF8; // = SHA-256 of the SQL
     fParsedSQL: RawUTF8;
-    fPreparedParamsCount: longint;
-    fRes: PPGresult;
-    fResStatus: TExecStatusType; // fRes.resultStatus is not correct
-    // pointers to query parameters. initialized by Prepare, filled in Executeprepared
-    fPGParams: array of PChar;
-    // 0 - text, 1 - binary. initialized by Prepare, filled in Executeprepared
-    fPGParamFormats: array of longint;
+    fPreparedParamsCount: integer;
+    fRes: pointer;
+    fResStatus: integer;
+    // pointers to query parameters; initialized by Prepare, filled in Executeprepared
+    fPGParams: TPointerDynArray;
+    // 0 - text, 1 - binary; initialized by Prepare, filled in Executeprepared
+    fPGParamFormats: TIntegerDynArray;
     // non zero for binary params
-    fPGparamLengths: array of longint;
-    procedure BindColumnus;
+    fPGparamLengths: TIntegerDynArray;
+    /// define the result columns name and content
+    procedure BindColumns;
     /// raise an exception if Col is out of range according to fColumnCount
     // or rowset is not initialized
-    procedure CheckColAndRowset(const Col: integer); {$ifdef HASINLINE} inline; {$endif}
-    //reserved for binary protocol fPrmLength: array of Longint;
+    procedure CheckColAndRowset(const Col: integer);
   public
     /// finalize the statement for a given connection
     destructor Destroy; override;
@@ -158,8 +157,7 @@ type
     procedure Prepare(const aSQL: RawUTF8; ExpectResults: boolean = False); overload; override;
     /// Execute a prepared SQL statement
     // - parameters marked as ? should have been already bound with Bind*() functions
-    // - this implementation will also handle bound array of values (if any),
-    // if IZDatabaseInfo.SupportsArrayBindings is true for this provider
+    // - this implementation will also handle bound array of values (if any)
     // - this overridden method will log the SQL statement if sllSQL has been
     // enabled in SynDBLog.Family.Level
     // - raise an ESQLDBPostgres on any error
@@ -178,6 +176,8 @@ type
     // - if SeekFirst is TRUE, will put the cursor on the first row of results
     // - raise an ESQLDBPostgres on any error
     function Step(SeekFirst: boolean = False): boolean; override;
+    /// clear(fRes) when ISQLDBStatement is back in cache
+    procedure ReleaseRows; override;
     /// return a Column integer value of the current Row, first Col is 0
     function ColumnInt(Col: integer): int64; override;
     /// returns TRUE if the column contains NULL
@@ -192,79 +192,328 @@ type
     function ColumnUTF8(Col: integer): RawUTF8; override;
     /// return a Column as a blob value of the current Row, first Col is 0
     function ColumnBlob(Col: integer): RawByteString; override;
-    /// How many parameters founded during prepare stage
-    property PreparedParamsCount: longint read fPreparedParamsCount;
+    /// append all columns values of the current Row to a JSON stream
+    // - overriden method to avoid temporary memory allocation or conversion
+    procedure ColumnsToJSON(WR: TJSONWriter); override;
+    /// how many parameters founded during prepare stage
+    property PreparedParamsCount: integer read fPreparedParamsCount;
   end;
 
+
 var
-  PQlibVersion: function: longint; cdecl;
-
-
-/// process simple SQL (no ; inside) as expected by libpq
-// - replace all '?' in the SQL statement with position parameters $1, $2..
-// - returns the number of ? parameters found within aSQL
-//  For SQL with ; ( several statements should not be parametized)  or w/o ? return as is
-// Compliant with Postgres expectations
-function ReplaceQParamsByIndex(const aSQL: RawUTF8; var aNewSQL: RawUTF8): integer;
-
-/// convert an array of quoted RawUTF8 into PostgreSQL ARRAY
-// - 'one', 't"wo' -> '{"one","t\"wo"}'
-// - 1,2,3 -> '{1,2,3}'
-function UTF8Array2PostgreArray(const Values: TRawUTF8DynArray): RawUTF8;
+  /// allow to specify a libpq library file name to use
+  SynDBPostgresLibrary: TFileName;
 
 
 implementation
 
 uses
   SynLog,
-  SynCrypto; // PGSQL expects names for prepared statements = use SHA-256
+  SynCrypto; // libpq requires named prepared statements = use SHA-256
 
 
-{ TSQLDBPostgresConnection }
+{ *********** minimal access to libpq native Postgres client library }
 
-procedure TSQLDBPostgresConnection.Check(res: PPGresult; pRes: PPPGresult;
-  forceClean: boolean);
+const // see pg_type.h
+  BOOLOID = 16;
+  BYTEAOID = 17;
+  INT8OID = 20;
+  INT2OID = 21;
+  INT4OID = 23;
+  REGPROCOID = 24;
+  TEXTOID = 25;
+  OIDOID = 26;
+  FLOAT4OID = 700;
+  FLOAT8OID = 701;
+  ABSTIMEOID = 702;
+  CASHOID = 790;
+  DATEOID = 1082;
+  TIMEOID = 1083;
+  TIMESTAMPOID = 1114;
+  TIMESTAMPTZOID = 1184;
+  TIMETZOID = 1266;
+  NUMERICOID = 1700;
+
+  CHAROID = 18;
+  NAMEOID = 19;
+  INT2VECTOROID	= 22;
+  TIDOID = 27;
+  XIDOID = 28;
+  CIDOID = 29;
+  OIDVECTOROID	= 30;
+  JSONOID = 114;
+  XMLOID = 142;
+  PGNODETREEOID	= 194;
+  PGDDLCOMMANDOID = 32;
+  POINTOID= 600;
+  LSEGOID = 601;
+  PATHOID = 602;
+  BOXOID = 603;
+  POLYGONOID = 604;
+  LINEOID = 628;
+  RELTIMEOID = 703;
+  TINTERVALOID = 704;
+  UNKNOWNOID = 705;
+  CIRCLEOID = 718;
+  MACADDROID = 829;
+  INETOID = 869;
+  CIDROID = 650;
+  INT2ARRAYOID = 1005;
+  INT4ARRAYOID = 1007;
+  TEXTARRAYOID= 1009;
+  OIDARRAYOID = 1028;
+  FLOAT4ARRAYOID = 1021;
+  ACLITEMOID = 1033;
+  CSTRINGARRAYOID = 1263;
+  BPCHAROID = 1042;
+  VARCHAROID = 1043;
+  INTERVALOID = 1186;
+  BITOID = 1560;
+  VARBITOID = 1562;
+  REFCURSOROID= 1790;
+  REGPROCEDUREOID = 2202;
+  REGOPEROID = 2203;
+  REGOPERATOROID = 2204;
+  REGCLASSOID = 2205;
+  REGTYPEOID = 2206;
+  REGROLEOID = 4096;
+  REGNAMESPACEOID = 4089;
+  REGTYPEARRAYOID = 2211;
+  UUIDOID = 2950;
+  LSNOID = 3220;
+  TSVECTOROID = 3614;
+  GTSVECTOROID = 3642;
+  TSQUERYOID = 3615;
+  REGCONFIGOID = 3734;
+  REGDICTIONARYOID = 3769;
+  JSONBOID = 3802;
+  INT4RANGEOID	  = 3904;
+
+const
+  PGRES_EMPTY_QUERY = 0;
+  PGRES_COMMAND_OK = 1;
+  PGRES_TUPLES_OK = 2;
+  PGRES_COPY_OUT = 3;
+  PGRES_COPY_IN = 4;
+  PGRES_BAD_RESPONSE = 5;
+  PGRES_NONFATAL_ERROR = 6;
+  PGRES_FATAL_ERROR = 7;
+
+  CONNECTION_OK = 0;
+  CONNECTION_BAD = 1;
+  CONNECTION_STARTED = 2;
+  CONNECTION_MADE = 3;
+  CONNECTION_AWAITING_RESPONSE = 4;
+  CONNECTION_AUTH_OK = 5;
+  CONNECTION_SETENV = 6;
+  CONNECTION_SSL_STARTUP = 7;
+  CONNECTION_NEEDED = 8;
+
+  PGFMT_TEXT = 0;
+  PGFMT_BIN = 1;
+
+type
+  PPGconn = type pointer;
+  PPGresult = type pointer;
+  PPPGresult = ^PPGresult;
+
+  PQnoticeProcessor = procedure(arg: pointer; message: PUTF8Char); cdecl;
+
+  /// direct access to the libpq native Postgres protocol 3 library
+  // - only the endpoints needed by this unit are imported
+  TSQLDBPostgresLib = class(TSQLDBLib)
+  protected
+    /// raise an exception on error and clean result
+    // - will set pRes to nil if passed
+    // - if andClear is true - will call always PQ.Clear(res)
+    procedure Check(conn: PPGconn; res: PPGresult;
+      pRes: PPPGresult = nil; andClear: boolean = true);
+  public
+    LibVersion: function: integer; cdecl;
+    IsThreadSafe: function: integer; cdecl;
+    SetDBLogin: function(pghost, pgport, pgoptions, pgtty, dbName,
+      login, pwd: PUTF8Char): PPGconn; cdecl;
+    Status: function(conn: PPGconn): integer; cdecl;
+    Finish: procedure(conn: PPGconn); cdecl;
+    ResultStatus: function(res: PPGresult): integer; cdecl;
+    ResultErrorField: function(res: PPGresult; fieldcode: integer): PUTF8Char; cdecl;
+    ErrorMessage: function(conn: PPGconn): PUTF8Char; cdecl;
+    SetNoticeProcessor: function(conn: PPGconn; proc: PQnoticeProcessor;
+      arg: pointer): PQnoticeProcessor; cdecl;
+    Clear: procedure(res: PPGresult); cdecl;
+    Freemem: procedure(ptr: pointer); cdecl;
+    Exec: function(conn: PPGconn; query: PUTF8Char): PPGresult; cdecl;
+    Prepare: function(conn: PPGconn; stmtName, query: PUTF8Char; nParams: integer;
+      paramTypes: PCardinal): PPGresult; cdecl;
+    ExecPrepared: function(conn: PPGconn; stmtName: PUTF8Char; nParams: integer;
+      paramValues: PPchar; paramLengths, paramFormats: PInteger;
+      resultFormat: integer): PPGresult; cdecl;
+    ExecParams: function(conn: PPGconn; command: PUTF8Char; nParams: integer;
+      paramTypes: PCardinal; paramValues: PPchar; paramLengths, paramFormats: PInteger;
+      resultFormat: integer):PPGresult; cdecl;
+    nfields: function(res: PPGresult): integer; cdecl;
+    ntuples: function(res: PPGresult): integer; cdecl;
+    cmdTuples: function(res: PPGresult): PUTF8Char; cdecl;
+    fname: function(res: PPGresult; field_num: integer): PUTF8Char; cdecl;
+    ftype: function(res: PPGresult; field_num: integer): cardinal; cdecl;
+    GetValue: function(res: PPGresult; tup_num, field_num: integer): PUTF8Char; cdecl;
+    GetLength: function(res: PPGresult; tup_num, field_num: integer): integer; cdecl;
+    GetIsNull: function(res: PPGresult; tup_num, field_num: integer): integer; cdecl;
+    /// try to dynamically load the libpq library
+    // - raise ESQLDBPostgres if the expected library is not found
+    constructor Create;
+    /// just a wrapper around FastSetString + GetValue/GetLength
+    procedure GetRawUTF8(res: PPGresult; tup_num, field_num: integer;
+      var result: RawUTF8);
+  end;
+
+const
+  PQ_ENTRIES: array[0..22] of PChar = (
+    'PQlibVersion', 'PQisthreadsafe', 'PQsetdbLogin', 'PQstatus', 'PQfinish',
+    'PQresultStatus', 'PQresultErrorField', 'PQerrorMessage', 'PQsetNoticeProcessor',
+    'PQclear', 'PQfreemem', 'PQexec', 'PQprepare', 'PQexecPrepared', 'PQexecParams',
+    'PQnfields', 'PQntuples', 'PQcmdTuples', 'PQfname', 'PQftype', 'PQgetvalue',
+    'PQgetlength', 'PQgetisnull');
+
 var
-  errMsg, errCode: PChar;
+  PQ: TSQLDBPostgresLib = nil;
+
+{ TSQLDBPostgresLib }
+
+const
+  LIBNAME = {$ifdef MSWINDOWS}'libpq.dll'{$else}
+    {$ifdef darwin}'libpq.dylib'{$else}'libpq.so.5'{$endif}{$endif};
+  LIBNAME2 = {$ifdef MSWINDOWS}''{$else}
+    {$ifdef darwin}''{$else}'libpq.so.4'{$endif}{$endif};
+
+constructor TSQLDBPostgresLib.Create;
+var
+  P: PPointer;
+  i: PtrInt;
+  l2: TFileName;
+begin
+  if LIBNAME2 <> '' then
+    l2 := ExeVersion.ProgramFilePath + LIBNAME2;
+  TryLoadLibrary([SynDBPostgresLibrary, ExeVersion.ProgramFilePath + LIBNAME,
+    l2, LIBNAME, LIBNAME2], ESQLDBPostgres);
+  P := @@LibVersion;
+  for i := 0 to High(PQ_ENTRIES) do
+  begin
+    P^ := GetProcAddress(fHandle, PQ_ENTRIES[i]);
+    if P^ = nil then
+    begin
+      FreeLibrary(fHandle);
+      fHandle := 0;
+      raise ESQLDBPostgres.CreateUTF8('Invalid %: missing %', [LIBNAME, PQ_ENTRIES[i]]);
+    end;
+    inc(P);
+  end;
+end;
+
+procedure TSQLDBPostgresLib.GetRawUTF8(res: PPGresult;
+  tup_num, field_num: integer; var result: RawUTF8);
+begin
+  FastSetString(result, GetValue(res, tup_num, field_num),
+    GetLength(res, tup_num, field_num));
+end;
+
+procedure TSQLDBPostgresLib.Check(conn: PPGconn; res: PPGresult; pRes: PPPGresult;
+  andClear: boolean);
+var
+  errMsg, errCode: PUTF8Char;
 begin
   if (res = nil) or // nil in case of very fatal error, out of emory for example
-    (PQresultStatus(res) in [PGRES_BAD_RESPONSE, PGRES_NONFATAL_ERROR,
+    (ResultStatus(res) in [PGRES_BAD_RESPONSE, PGRES_NONFATAL_ERROR,
      PGRES_FATAL_ERROR]) then
   begin
-    errMsg := PQerrorMessage(fPGConn);
+    errMsg := ErrorMessage(conn);
     if res <> nil then
-      errCode := PQresultErrorField(res, Ord('C'){PG_DIAG_SQLSTATE})
+      errCode := ResultErrorField(res, Ord('C'){PG_DIAG_SQLSTATE})
     else
       errCode := nil;
-    PQclear(res);
+    Clear(res);
     if pRes <> nil then
       pRes^ := nil;
     raise ESQLDBPostgres.CreateUTF8('% PGERRCODE: %, %', [self, errCode, errMsg]);
   end
-  else if forceClean then
-    PQclear(res);
+  else if andClear then
+    Clear(res);
+end;
+
+
+{ TSQLDBPostgresConnection }
+
+function TSQLDBPostgresConnection.PrepareCached(const aSQL: RawUTF8; aParamCount: integer;
+  out aName: RawUTF8): integer;
+var
+  dig: TSHA256Digest;
+begin
+  dig := SHA256Digest(aSQL);
+  aName := SHA256DigestToString(dig);
+  result := Hash256Index(pointer(fPrepared), fPreparedCount, @dig);
+  if result >= 0 then
+    exit; // already prepared
+  PQ.Check(fPGConn, PQ.Prepare(fPGConn, pointer(aName), pointer(aSQL), aParamCount, nil));
+  result := fPreparedCount;
+  inc(fPreparedCount);
+  if result = length(fPrepared) then
+    SetLength(fPrepared, result + 32);
+  fPrepared[result] := dig;
 end;
 
 procedure TSQLDBPostgresConnection.DirectExecSQL(const SQL: RawUTF8);
 begin
-  Check(PQexec(fPGConn, pointer(SQL)));
+  PQ.Check(fPGConn, PQ.Exec(fPGConn, pointer(SQL)));
 end;
 
-constructor TSQLDBPostgresConnection.Create(aProperties: TSQLDBConnectionProperties);
+procedure TSQLDBPostgresConnection.DirectExecSQL(const SQL: RawUTF8; out Value: RawUTF8);
+var
+  res: PPGresult;
 begin
-  inherited Create(aProperties);
-  FPQprepared := TRawUTF8List.Create([fCaseSensitive, fNoDuplicate]);
+  res := PQ.Exec(fPGConn, pointer(SQL));
+  PQ.Check(fPGConn, res, nil, {andclear=}false);
+  PQ.GetRawUTF8(res, 0, 0, Value);
+  PQ.Clear(res);
 end;
 
-destructor TSQLDBPostgresConnection.Destroy;
+function TSQLDBPostgresConnection.GetServerSetting(const Name: RawUTF8): RawUTF8;
+var
+  sql: RawUTF8;
 begin
-  FPQprepared.Free;
-  inherited Destroy;
+  FormatUTF8('select setting from pg_settings where name=''%''', [Name], sql);
+  DirectExecSQL(sql, result);
 end;
 
-procedure SynLogNoticeProcessor({%H-}arg: Pointer; message: PAnsiChar); cdecl;
+// our conversion is faster than PQUnescapeByteA - which requires libpq 8.3+
+//  and calls malloc()
+// https://github.com/postgres/postgres/blob/master/src/interfaces/libpq/fe-exec.c
+
+// checking \x for hexadecimal encoding is what UnescapeByteA() does
+// -> no need to ask server settings
+// note: bytea_output is HEX by default (at least since PostgreSQL 9.0)
+
+function BlobInPlaceDecode(P: PAnsiChar; PLen: integer): integer;
 begin
-  SynDBLog.Add.Log(sllInfo, 'PGINFO: %', [message]);
+  if (P = nil) or (PLen <= 0) then
+    result := 0
+  else
+  if PWord(P)^ = ord('\') + ord('x') shl 8 then {ssByteAasHex in fServerSettings}
+  begin
+    result := (PLen - 2) shr 1; // skip trailing \x and compute number of bytes
+    if result > 0 then
+      HexToBinFast(P + 2, PByte(P), result); // in-place conversion
+  end
+  else
+    result := OctToBin(P, pointer(P)); // in-place conversion
+end;
+
+procedure SynLogNoticeProcessor({%H-}arg: Pointer; message: PUTF8Char); cdecl;
+begin
+  SynDBLog.Add.Log(sllTrace, 'PGINFO: %', [message], TObject(arg));
+end;
+
+procedure DummyNoticeProcessor({%H-}arg: Pointer; message: PUTF8Char); cdecl;
+begin
 end;
 
 procedure TSQLDBPostgresConnection.Connect;
@@ -274,26 +523,28 @@ begin
   log := SynDBLog.Enter(self, 'Connect');
   Disconnect; // force fTrans=fError=fServer=fContext=nil
   try
-    fPGConn := PQsetdbLogin(pointer(Properties.ServerName), nil, // pgport,
-      nil, // pgoptions,
-      nil, // pgtty,
+    fPGConn := PQ.SetDBLogin(pointer(Properties.ServerName), nil, nil, nil,
       pointer(Properties.DatabaseName), pointer(Properties.UserID),
       pointer(Properties.PassWord));
-    if (PQstatus(fPGConn) = CONNECTION_BAD) then
-      raise ESQLDBPostgres.CreateUTF8('Connection to database % failed. Reason: %',
-        [PQerrorMessage(fPGConn)]);
+    if PQ.Status(fPGConn) = CONNECTION_BAD then
+      raise ESQLDBPostgres.CreateUTF8('Connection to database % failed [%]',
+        [Properties.DatabaseNameSafe, PQ.ErrorMessage(fPGConn)]);
+    // if GetServerSetting('bytea_output') = 'HEX' then
+    //   include(fServerSettings, ssByteAasHex);
     if log <> nil then
     begin
-      PQsetNoticeProcessor(fPGConn, SynLogNoticeProcessor, pointer(self));
-      log.Log(sllDB, 'Connected to % using % v%',
-        [fProperties.ServerName, Postgres3LoadedLibrary, PQlibVersion()]);
-    end;
+      PQ.SetNoticeProcessor(fPGConn, SynLogNoticeProcessor, pointer(self));
+      log.Log(sllDB, 'Connected to % % using % v%', [fProperties.ServerName,
+        fProperties.DatabaseNameSafe, PQ.fLibraryPath, PQ.LibVersion], self);
+    end
+    else // to ensure no performance drop due to notice to console
+      PQ.SetNoticeProcessor(fPGConn, DummyNoticeProcessor, nil);
     inherited Connect; // notify any re-connection
   except
     on E: Exception do
     begin
       if log <> nil then
-        log.Log(sllError, E);
+        log.Log(sllError, 'Connect: % on %', [E, Properties.DatabaseNameSafe], self);
       Disconnect; // clean up on fail
       raise;
     end;
@@ -307,7 +558,7 @@ begin
   finally
     if fPGConn <> nil then
     begin
-      PQfinish(fPGConn);
+      PQ.Finish(fPGConn);
       fPGConn := nil;
     end;
   end;
@@ -325,9 +576,9 @@ end;
 
 procedure TSQLDBPostgresConnection.StartTransaction;
 var
-  {%H-}Log: ISynLog;
+  log: ISynLog;
 begin
-  Log := SynDBLog.Enter(self, 'StartTransaction');
+  log := SynDBLog.Enter(self, 'StartTransaction');
   if TransactionCount > 0 then
     raise ESQLDBPostgres.CreateUTF8('Invalid %.StartTransaction: nested ' +
       'transactions are not supported by the Postgres - use SAVEPOINT instead', [self]);
@@ -337,6 +588,8 @@ begin
   except
     on E: Exception do
     begin
+      if log <> nil then
+        log.Log(sllError, 'StartTransaction: % on %', [E, Properties.DatabaseNameSafe], self);
       if fTransactionCount > 0 then
         Dec(fTransactionCount);
       raise;
@@ -375,48 +628,48 @@ begin
       fForeignKeys.Add(ColumnUTF8(2), ColumnUTF8(3));
 end;
 
-procedure TSQLDBPostgresConnectionProperties.fillOidMapping;
-begin
-  mapOid(702, ftDate);     // abstime
-  mapOid(1082, ftDate);    // date
-  mapOid(1083, ftDate);    // time
-  mapOid(1114, ftDate);    // timestamp
-  mapOid(1184, ftDate);    // timestampz
-  mapOid(1266, ftDate);    // timez
-  mapOid(20, ftInt64);     // int8
-  mapOid(21, ftInt64);     // int2
-  mapOid(23, ftInt64);     // int4
-  mapOid(24, ftInt64);     // regproc
-  mapOid(26, ftInt64);     // oid
-  mapOid(700, ftDouble);   // float4
-  mapOid(701, ftDouble);   // float8
-  mapOid(1700, ftDouble);  // numeric
-  mapOid(790, ftCurrency); // money
-  mapOid(17, ftBlob);      // bytea
-end;
+procedure TSQLDBPostgresConnectionProperties.FillOidMapping;
+begin // see pg_type.h (most used first)
+  mapOid(INT4OID, ftInt64);
+  mapOid(INT8OID, ftInt64);
+  mapOid(TEXTOID, ftUTF8);
+  mapOid(FLOAT8OID, ftDouble);
+  mapOid(TIMESTAMPOID, ftDate);
+  mapOid(BYTEAOID, ftBlob);
+  mapOid(NUMERICOID, ftCurrency);// our ORM uses NUMERIC(19,4) for currency
+  mapOid(BOOLOID, ftInt64);
+  mapOid(INT2OID, ftInt64);
+  mapOid(CASHOID, ftCurrency);
+  mapOid(TIMESTAMPTZOID, ftDate);
+  mapOid(ABSTIMEOID, ftDate);
+  mapOid(DATEOID, ftDate);
+  mapOid(TIMEOID, ftDate);
+  mapOid(TIMETZOID, ftDate);
+  mapOid(REGPROCOID, ftInt64);
+  mapOid(OIDOID, ftInt64);
+  mapOid(FLOAT4OID, ftDouble);
+end; // any unregistered OID will be handled as ftUTF8
 
 constructor TSQLDBPostgresConnectionProperties.Create(
   const aServerName, aDatabaseName, aUserID, aPassword: RawUTF8);
 begin
-  InitialisePostgres3;
-  if PQisthreadsafe() <> 1 then
-    raise ESQLDBPostgres.Create('libpq should be compiler in threadsafe mode');
-  if @PQunescapeBytea = nil then
-    raise ESQLDBPostgres.Create('libpq should be 8.3+ (PQunescapeBytea not found)');
+  GlobalLock;
+  try
+    if PQ = nil then
+      GarbageCollectorFreeAndNil(PQ, TSQLDBPostgresLib.Create);
+  finally
+    GlobalUnLock;
+  end;
+  if PQ.IsThreadSafe <> 1 then
+    raise ESQLDBPostgres.Create('libpq should be compiled in threadsafe mode');
   fDBMS := dPostgreSQL;
-  // missed in postgres3dyn
-  PQlibVersion := GetProcedureAddress(Postgres3LibraryHandle, 'PQlibVersion');
-  FOids2FieldType := TSynDictionary.Create(TypeInfo(TCardinalDynArray),
-    TypeInfo(TSQLDBFieldTypeDynArray));
   FillOidMapping;
   inherited Create(aServerName, aDatabaseName, aUserID, aPassWord);
-end;
-
-destructor TSQLDBPostgresConnectionProperties.Destroy;
-begin
-  FOids2FieldType.Free;
-  inherited Destroy;
-  ReleasePostgres3;
+  // JSONDecodedPrepareToSQL will detect cPostgreBulkArray and set
+  // DecodedFieldTypesToUnnest -> fast bulk insert/delete/update
+  fBatchSendingAbilities := [cCreate, cDelete, cUpdate, cPostgreBulkArray];
+  // disable MultiInsert SQL and rely on cPostgreBulkArray process for cCreate
+  fOnBatchInsert := nil; // see TSQLRestStorageExternal.InternalBatchStop
 end;
 
 function TSQLDBPostgresConnectionProperties.NewConnection: TSQLDBConnection;
@@ -424,196 +677,61 @@ begin
   result := TSQLDBPostgresConnection.Create(self);
 end;
 
-function TSQLDBPostgresConnectionProperties.Oid2FieldType(
-  const cOID: Oid): TSQLDBFieldType;
+function TSQLDBPostgresConnectionProperties.Oid2FieldType(cOID: cardinal): TSQLDBFieldType;
+var
+  i: PtrInt;
 begin
-  if not FOids2FieldType.FindAndCopy(cOID, result) then
+  if cOID <= 65535 then
+  begin
+    i := WordScanIndex(pointer(fOids), fOidsCount, cOID);
+    if i >= 0 then
+      result := fOidsFieldTypes[i]
+    else
+      result := ftUTF8;
+  end
+  else
     result := ftUTF8;
 end;
 
-procedure TSQLDBPostgresConnectionProperties.MapOid(const cOid: Oid;
-  const fieldType: TSQLDBFieldType);
+procedure TSQLDBPostgresConnectionProperties.MapOid(cOid: cardinal;
+  fieldType: TSQLDBFieldType);
+var
+  i: PtrInt;
 begin
-  FOids2FieldType.AddOrUpdate(cOid, fieldType);
+  if cOID > 65535 then
+    raise ESQLDBPostgres.CreateUTF8('Out of range %.MapOid(%)', [self, cOID]);
+  i := WordScanIndex(pointer(fOids), fOidsCount, cOID);
+  if i < 0 then
+  begin
+    i := FOidsCount;
+    inc(FOidsCount);
+    if i = length(FOids) then
+    begin
+      SetLength(fOids, i + 32);
+      SetLength(fOidsFieldTypes, i + 32);
+    end;
+    fOids[i] := cOid;
+  end;
+  fOidsFieldTypes[i] := fieldType // set or replace
 end;
 
-/// In case aSQL is simple (no ; inside)
-// - replace all '?' in the SQL statement with position parameters $1, $2..
-// - returns the number of ? parameters found within aSQL
-// - for SQL with ; ( several statements should not be parametized) or w/o ? return as is
-function ReplaceQParamsByIndex(const aSQL: RawUTF8; var aNewSQL: RawUTF8): integer;
+procedure TSQLDBPostgresStatement.BindColumns;
 var
-  ndx, L: PtrInt;
-  s, d: PAnsiChar;
-begin
-  aNewSQL := aSQL;
-  result := 0;
-  ndx := 0;
-  L := Length(aSQL);
-  s := pointer(aSQL);
-  // calculate ? parameters count, check for ;
-  while s^ <> #0 do
-  begin
-    if s^ = '?' then
-    begin
-      inc(ndx);
-      if ndx > 9 then  // ? will be replaced by $n $nn $nnn
-        if ndx > 99 then
-          inc(L, 3)
-        else
-          inc(L, 2)
-        else
-          inc(L);
-    end
-    else if s^ = '''' then
-    begin
-      repeat // ignore double quotes between single quotes
-        inc(s);
-        if s^ = #0 then
-          exit; // quote without proper ending -> reject
-      until (s^ = '''') and (s[1] <> '''');
-    end else if s^ = ';' then
-      exit; // complex expression can not be prepared
-    inc(s);
-  end;
-  if ndx = 0 then // no ? parameter
-    exit;
-  result := ndx;
-  // parse SQL and replace ? into $n
-  FastSetString(aNewSQL, nil, L);
-  s := pointer(aSQL);
-  d := pointer(aNewSQL);
-  ndx := 0;
-  repeat
-    if s^ = '?' then
-    begin
-      d^ := '$';
-      inc(d);
-      inc(ndx);
-      d := AppendUInt32ToBuffer(d, ndx);
-    end
-    else if s^ = '''' then
-    begin
-      repeat // ignore double quotes between single quotes
-        d^ := s^;
-        inc(d);
-        inc(s);
-      until (s^ = '''') and (s[1] <> '''');
-      d^ := s^; // store last '''
-      inc(d);
-    end
-    else
-    begin
-      d^ := s^;
-      inc(d);
-    end;
-    inc(s);
-  until s^ = #0;
-  assert(d - pointer(aNewSQL) = length(aNewSQL)); // until stabilized
-end;
-
-/// Convert array of RawUTF8 to PostgreSQL ARRAY
-// - 'one', 't"wo' -> '{"one","t\"wo"}'
-// - 1,2,3 -> '{1,2,3}'
-function UTF8Array2PostgreArray(const Values: TRawUTF8DynArray): RawUTF8;
-var
-  V: ^RawUTF8;
-  s, d: PUTF8Char;
-  L, vl, j: PtrInt;
-  n, i: integer;
-  c: AnsiChar;
-begin
-  result := '';
-  n := length(Values);
-  if n = 0 then
-    exit;
-  L := 2; // '{}'
-  inc(L, n); // ',' after each element
-  v := pointer(Values);
-  for i := 1 to n do
-  begin
-    vl := length(v^);
-    if vl = 0 then
-    begin
-      inc(L, vl);
-      s := pointer(v^);
-      if s^ = '''' then // quoted ftUTF8
-        for j := 1 to vl - 2 do
-          if s[j] = '''' then
-            dec(L) // double ' into single '
-          else if s[j] = '"' then
-            inc(L); // \ before "
-    end;
-    inc(v);
-  end;
-  FastSetString(result, nil, L);
-  d := pointer(result);
-  d^ := '{';
-  inc(d);
-  v := pointer(Values);
-  for i := 1 to n do
-  begin
-    vl := length(v^);
-    if vl <> 0 then
-    begin
-      inc(L, vl);
-      s := pointer(v^);
-      if s^ = '''' then // quoted ftUTF8
-      begin
-        d^ := '"';
-        inc(d);
-        for j := 1 to vl - 2 do
-        begin
-          c := s[j];
-          if c = '''' then
-            continue // double ' into single '
-          else if c = '"' then
-          begin
-            d^ := '\'; // \ before "
-            inc(d);
-          end;
-          d^ := c;
-          inc(d);
-        end;
-        d^ := '"';
-        inc(d);
-      end
-      else
-      repeat // regular content
-        d^ := s^;
-        inc(d);
-        inc(s);
-        dec(vl);
-      until vl = 0;
-    end;
-    d^ := ',';
-    inc(d);
-    inc(v);
-  end;
-  d^ := '}'; // replace last ',' by '}'
-  inc(d);
-  assert(d - pointer(result) = length(result)); // until stabilized
-end;
-
-procedure TSQLDBPostgresStatement.BindColumnus;
-var
-  nCols, c: longint;
+  nCols, c: integer;
   cName: RawUTF8;
-  colOID: Oid;
 begin
   fColumn.Clear;
   fColumn.ReHash;
-  nCols := PQnfields(fRes);
+  nCols := PQ.nfields(fRes);
   fColumn.Capacity := nCols;
   for c := 0 to nCols - 1 do
   begin
-    cName := PQfname(fRes, c);
+    cName := PQ.fname(fRes, c);
     with PSQLDBColumnProperty(fColumn.AddAndMakeUniqueName(cName))^ do
     begin
-      colOID := PQftype(fRes, c);
-      ColumnType := TSQLDBPostgresConnectionProperties(Connection.Properties)
-        .Oid2FieldType(colOID);
-      // use PQfmod to get additional type info?
+      ColumnAttr := PQ.ftype(fRes, c);
+      ColumnType := TSQLDBPostgresConnectionProperties(Connection.
+        Properties).Oid2FieldType(ColumnAttr);
     end;
   end;
 end;
@@ -622,7 +740,7 @@ procedure TSQLDBPostgresStatement.CheckColAndRowset(const Col: integer);
 begin
   CheckCol(Col);
   if (fRes = nil) or (fResStatus <> PGRES_TUPLES_OK) then
-    raise ESQLDBPostgres.CreateUTF8('%.Execute should be called before', [self]);
+    raise ESQLDBPostgres.CreateUTF8('%.Execute not called before Column*', [self]);
 end;
 
 destructor TSQLDBPostgresStatement.Destroy;
@@ -634,29 +752,26 @@ begin
   end;
 end;
 
+// see https://www.postgresql.org/docs/9.3/libpq-exec.html
+
 procedure TSQLDBPostgresStatement.Prepare(const aSQL: RawUTF8; ExpectResults: boolean);
 var
-  c: TSQLDBPostgresConnection;
+  fromcache: integer;
 begin
+  SQLLogBegin(sllDB);
   if aSQL = '' then
-    raise ESQLDBPostgres.Create('Empty statement passed to prepare');
+    raise ESQLDBPostgres.CreateUTF8('%.Prepare: empty statement', [self]);
   inherited Prepare(aSQL, ExpectResults); // will strip last ;
-  fPreparedParamsCount := ReplaceQParamsByIndex(fSQL, fParsedSQL);
-  if (fPreparedParamsCount > 0) and (IdemPCharArray(PUTF8Char(fParsedSQL),
+  fPreparedParamsCount := ReplaceParamsByNumbers(fSQL, fParsedSQL, '$');
+  if (fPreparedParamsCount > 0) and (IdemPCharArray(pointer(fParsedSQL),
       ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'VALUES']) >= 0) then
   begin // preparable
-    fPreparedStmtName := SHA256(fParsedSQL);
-    c := pointer(Connection);
-    if c.FPQprepared.IndexOf(fPreparedStmtName) < 0 then
-    begin // not prepared in this connection yet
-      c.Check(PQPrepare(c.fPGConn, pointer(fPreparedStmtName), pointer(fParsedSQL),
-        fPreparedParamsCount, nil));
-      c.FPQprepared.Add(fPreparedStmtName);
-      SynDBLog.Add.Log(sllDebug, 'Prepare: Statement cache MISS', self);
-    end
-    else
-      SynDBLog.Add.Log(sllDebug, 'Prepare: Statement cache HIT', self);
-  end;
+    fromcache := TSQLDBPostgresConnection(fConnection).PrepareCached(
+      fParsedSQL, fPreparedParamsCount, fPreparedStmtName);
+    SQLLogEnd(' name=% cache=%', [fPreparedStmtName, fromcache]);
+  end
+  else
+    SQLLogEnd;
   SetLength(fPGParams, fPreparedParamsCount);
   SetLength(fPGParamFormats, fPreparedParamsCount);
   SetLength(fPGparamLengths, fPreparedParamsCount);
@@ -668,28 +783,26 @@ var
   p: PSQLDBParam;
   c: TSQLDBPostgresConnection;
 begin
+  SQLLogBegin(sllSQL);
   if fParsedSQL = '' then
-    raise ESQLDBPostgres.Create('Statement not prepared');
+    raise ESQLDBPostgres.CreateUTF8('%.ExecutePrepared: Statement not prepared', [self]);
   if fParamCount <> fPreparedParamsCount then
-    raise ESQLDBPostgres.CreateUTF8('Query expect % parameters but % is binded',
-      [fPreparedParamsCount, fParamCount]);
+    raise ESQLDBPostgres.CreateUTF8('%.ExecutePrepared: Query expects % parameters ' +
+      'but % bound', [self, fPreparedParamsCount, fParamCount]);
   inherited ExecutePrepared;
-  with SynDBLog.Add do
-    if sllSQL in Family.Level then
-      Log(sllSQL, fParsedSQL, self, 2048);
-  for i := 0 to fParamCount - 1 do // repack parameters as expected by Postgre
+  for i := 0 to fParamCount - 1 do // set parameters as expected by PostgreSQL
   begin
-    // mark parameter as textual by default
+    // mark parameter as textual by default, with no blob len
     fPGParamFormats[i] := 0;
     fPGparamLengths[i] := 0;
     // convert parameter value as text stored in p^.VData
     p := @fParams[i];
     if p^.VArray <> nil then
     begin
-      if not (p^.VType in [ftInt64, ftDouble, ftCurrency, ftUTF8]) then
+      if not (p^.VType in [ftInt64, ftDouble, ftCurrency, ftDate, ftUTF8]) then
         raise ESQLDBPostgres.CreateUTF8('%.ExecutePrepared: Invalid array type % ' +
           'on bound parameter #%', [Self, ToText(p^.VType)^, i]);
-      p^.VData := UTF8Array2PostgreArray(p^.VArray);
+      p^.VData := BoundArrayToJSONArray(p^.VArray);
     end
     else
     begin
@@ -702,9 +815,9 @@ begin
         ftCurrency:
           Curr64ToStr(p^.VInt64, RawUTF8(p^.VData));
         ftDouble:
-          ExtendedToStr(PDouble(@p^.VInt64)^, DOUBLE_PRECISION, RawUTF8(p^.VData));
+          DoubleToStr(PDouble(@p^.VInt64)^, RawUTF8(p^.VData));
         ftDate:
-          // Posgres expects space instead of T in ISO8601 expanded format
+          // Postgres expects space instead of T in ISO8601 expanded format
           p^.VData := DateTimeToIso8601(PDateTime(@p^.VInt64)^, true, ' ');
         ftUTF8:
           ; // text already in p^.VData
@@ -714,52 +827,51 @@ begin
           fPGparamLengths[i] := length(p^.VData);
         end;
         else
-          raise ESQLDBPostgres.CreateUTF8(
-            '%.ExecutePrepared: cannot bind parameter #% of type %',
-              [self, i, ToText(p^.VType)^]);
+          raise ESQLDBPostgres.CreateUTF8('%.ExecutePrepared: cannot bind ' +
+            'parameter #% of type %', [self, i, ToText(p^.VType)^]);
       end;
-      fPGParams[i] := pointer(p^.VData);
     end;
+    fPGParams[i] := pointer(p^.VData);
   end;
   c := TSQLDBPostgresConnection(Connection);
   if fPreparedStmtName <> '' then
-    fRes := PQexecPrepared(c.fPGConn, pointer(fPreparedStmtName), fPreparedParamsCount,
-      pointer(fPGParams), pointer(fPGparamLengths), pointer(fPGParamFormats), 0)
-  else if fPreparedParamsCount = 0 then // PQexec can include multiple SQL commands
-    fRes := PQexec(c.fPGConn, pointer(fParsedSQL))
+    fRes := PQ.ExecPrepared(c.fPGConn, pointer(fPreparedStmtName), fPreparedParamsCount,
+      pointer(fPGParams), pointer(fPGparamLengths), pointer(fPGParamFormats), PGFMT_TEXT)
+  else if fPreparedParamsCount = 0 then
+    // PQexec handles multiple SQL commands
+    fRes := PQ.Exec(c.fPGConn, pointer(fParsedSQL))
   else
-    fRes := PQexecParams(c.fPGConn, pointer(fParsedSQL), fPreparedParamsCount, nil,
-      pointer(fPGParams), pointer(fPGparamLengths), pointer(fPGParamFormats), 0);
-  c.Check(fRes, @fRes, false{forceClean});
-
-  fResStatus := PQresultStatus(fRes);
+    fRes := PQ.ExecParams(c.fPGConn, pointer(fParsedSQL), fPreparedParamsCount, nil,
+      pointer(fPGParams), pointer(fPGparamLengths), pointer(fPGParamFormats), PGFMT_TEXT);
+  PQ.Check(c.fPGConn, fRes, @fRes, {forceClean=}false);
+  fResStatus := PQ.ResultStatus(fRes);
   if fExpectResults then
   begin
-    if (fResStatus <> PGRES_TUPLES_OK) then
-    begin // may be we do not need check?
-      PQclear(fRes);
+    if fResStatus <> PGRES_TUPLES_OK then
+    begin // paranoid check
+      PQ.Clear(fRes);
       fRes := nil;
-      raise ESQLDBPostgres.Create('result expected but statement not return tuples');
+      raise ESQLDBPostgres.CreateUTF8('%.ExecutePrepared: result expected but ' +
+        'statement did not return tuples', [self]);
     end;
-    fTotalRowsRetrieved := PQntuples(fRes);
+    fTotalRowsRetrieved := PQ.ntuples(fRes);
     fCurrentRow := -1;
-    if fColumn.Count = 0 then // if columnus exists then statement is already cached
-      BindColumnus;
-  end;
+    if fColumn.Count = 0 then // if columns exist then statement is already cached
+      BindColumns;
+    SQLLogEnd(' rows=%', [fTotalRowsRetrieved]);
+  end
+  else
+    SQLLogEnd;
 end;
 
 function TSQLDBPostgresStatement.UpdateCount: integer;
 begin
-  result := GetCardinalDef(PQcmdTuples(fRes), 0);
+  result := GetCardinalDef(PQ.cmdTuples(fRes), 0);
 end;
 
 procedure TSQLDBPostgresStatement.Reset;
 begin
-  if fRes <> nil then
-  begin
-    PQclear(fRes);
-    fRes := nil;
-  end;
+  ReleaseRows;
   fResStatus := PGRES_EMPTY_QUERY;
   inherited Reset;
 end;
@@ -776,59 +888,121 @@ begin
   inc(fCurrentRow);
 end;
 
+procedure TSQLDBPostgresStatement.ReleaseRows;
+begin
+  if fRes <> nil then
+  begin
+    PQ.clear(fRes);
+    fRes := nil;
+  end;
+  inherited ReleaseRows;
+end;
+
 function TSQLDBPostgresStatement.ColumnInt(Col: integer): int64;
 begin
   CheckColAndRowset(Col);
-  result := GetInt64(PQgetvalue(fRes, fCurrentRow, Col));
+  result := GetInt64(PQ.GetValue(fRes, fCurrentRow, Col));
 end;
 
 function TSQLDBPostgresStatement.ColumnNull(Col: integer): boolean;
 begin
   CheckColAndRowset(Col);
-  result := (PQgetisnull(fRes, fCurrentRow, Col) = 1);
+  result := (PQ.GetIsNull(fRes, fCurrentRow, Col) = 1);
 end;
 
 function TSQLDBPostgresStatement.ColumnDouble(Col: integer): double;
 begin
   CheckColAndRowset(Col);
-  result := GetExtended(PQgetvalue(fRes, fCurrentRow, Col));
+  result := GetExtended(PQ.GetValue(fRes, fCurrentRow, Col));
 end;
 
 function TSQLDBPostgresStatement.ColumnDateTime(Col: integer): TDateTime;
 begin
   CheckColAndRowset(Col);
-  Iso8601ToDateTimePUTF8CharVar(PQgetvalue(fRes, fCurrentRow, Col),
-    PQgetlength(fRes, fCurrentRow, Col), result);
+  Iso8601ToDateTimePUTF8CharVar(PQ.GetValue(fRes, fCurrentRow, Col),
+    PQ.GetLength(fRes, fCurrentRow, Col), result);
 end;
 
 function TSQLDBPostgresStatement.ColumnCurrency(Col: integer): currency;
 begin
   CheckColAndRowset(Col);
-  result := GetExtended(PQgetvalue(fRes, fCurrentRow, Col));
+  PInt64(@result)^ := StrToCurr64(PQ.GetValue(fRes, fCurrentRow, Col));
 end;
 
 function TSQLDBPostgresStatement.ColumnUTF8(Col: integer): RawUTF8;
 begin
   CheckColAndRowset(Col);
-  FastSetString(result, PQgetvalue(fRes, fCurrentRow, Col),
-    PQgetlength(fRes, fCurrentRow, Col));
+  PQ.GetRawUTF8(fRes, fCurrentRow, Col, result);
 end;
 
 function TSQLDBPostgresStatement.ColumnBlob(Col: integer): RawByteString;
 var
-  l: size_t;
-  blb: PByte;
-begin
+  P: PAnsiChar;
+begin // PGFMT_TEXT was used -> need to convert into binary
   CheckColAndRowset(Col);
-  blb := PQunescapeBytea(PByte(PQgetvalue(fRes, fCurrentRow, Col)), @l);
-  try
-    if blb = nil then
-      raise EOutOfMemory.Create('PQunescapeBytea: Out of memory');
-    FastSetStringCP(result, blb, l, CP_NONE);
-  finally
-    if blb <> nil then
-      PQfreemem(blb);
-  end;
+  P := pointer(PQ.GetValue(fRes, fCurrentRow, Col));
+  SetString(result, P, BlobInPlaceDecode(P, PQ.GetLength(fRes, fCurrentRow, col)));
 end;
 
+procedure TSQLDBPostgresStatement.ColumnsToJSON(WR: TJSONWriter);
+var
+  col: integer;
+  P: pointer;
+begin
+  if (fRes = nil) or (fResStatus <> PGRES_TUPLES_OK) or (fCurrentRow < 0) then
+    raise ESQLDBPostgres.CreateUTF8('%.ColumnToJSON unexpected', [self]);
+  if WR.Expand then
+    WR.Add('{');
+  for col := 0 to fColumnCount - 1 do
+  with fColumns[col] do
+  begin
+    if WR.Expand then
+      WR.AddFieldName(ColumnName); // add '"ColumnName":'
+    if PQ.GetIsNull(fRes, fCurrentRow, col) = 1 then
+      WR.AddShort('null')
+    else
+    begin
+      P := PQ.GetValue(fRes, fCurrentRow, col);
+      case ColumnType of
+        ftNull:
+          WR.AddShort('null');
+        ftInt64, ftDouble, ftCurrency:
+          WR.AddNoJSONEscape(P, PQ.GetLength(fRes, fCurrentRow, col));
+        ftUTF8:
+          if (ColumnAttr = JSONOID) or (ColumnAttr = JSONBOID) then
+            WR.AddNoJSONEscape(P, PQ.GetLength(fRes, fCurrentRow, col))
+          else
+          begin
+            WR.Add('"');
+            WR.AddJSONEscape(P);
+            WR.Add('"');
+          end;
+        ftDate:
+          begin
+            WR.Add('"');
+            if (PQ.GetLength(fRes, fCurrentRow, col) > 10) and (PAnsiChar(P)[10] = ' ') then
+              PAnsiChar(P)[10] := 'T'; // ensure strict ISO-8601 encoding
+            WR.AddJSONEscape(P);
+            WR.Add('"');
+          end;
+        ftBlob:
+          if fForceBlobAsNull then
+            WR.AddShort('null')
+          else
+            WR.WrBase64(P, BlobInPlaceDecode(P,
+              PQ.GetLength(fRes, fCurrentRow, col)), {withmagic=}true);
+        else
+          raise ESQLDBPostgres.CreateUTF8('%.ColumnsToJSON: %?', [self, ToText(ColumnType)^]);
+      end;
+    end;
+    WR.Add(',');
+  end;
+  WR.CancelLastComma; // cancel last ','
+  if WR.Expand then
+    WR.Add('}');
+end;
+
+
+initialization
+  TSQLDBPostgresConnectionProperties.RegisterClassNameForDefinition;
 end.

@@ -329,6 +329,8 @@ type
     // otherwise, it will fetch one row of data, to be called within a loop
     // - raise an ESQLDBOracle on any error
     function Step(SeekFirst: boolean=false): boolean; override;
+    /// finalize the OCI cursor resources - not implemented yet
+    procedure ReleaseRows; override;
     /// returns TRUE if the column contains NULL
     function ColumnNull(Col: integer): boolean; override;
     /// return a Column integer value of the current Row, first Col is 0
@@ -412,6 +414,22 @@ var
   // in %ORACLE_HOME%\bin
   // - you can specify here a folder name in which the oci.dll is to be found
   SynDBOracleOCIpath: TFileName;
+
+const
+  // defined here for overriding OCI_CHARSET_UTF8/OCI_CHARSET_WIN1252 if needed
+  OCI_UTF8 = $367;
+  OCI_AL32UTF8 = $369;
+  OCI_UTF16ID = 1000;
+  OCI_WE8MSWIN1252 = 178;
+
+var
+  /// the OCI charset used for UTF-8 encoding
+  // - OCI_UTF8 is a deprecated encoding, and OCI_AL32UTF8 should be preferred
+  // - but you can fallback for OCI_UTF8 for compatibility purposes
+  OCI_CHARSET_UTF8: cardinal = OCI_AL32UTF8;
+
+  /// the OCI charset used for WinAnsi encoding
+  OCI_CHARSET_WIN1252: cardinal = OCI_WE8MSWIN1252;
 
 
 implementation
@@ -535,7 +553,7 @@ type
   dvoid   = Pointer;
   text    = PAnsiChar;
   OraText = PAnsiChar;
-  size_T  = Integer;
+  size_T  = PtrUInt;
 
   pub1 = ^ub1;
   psb1 = ^sb1;
@@ -825,12 +843,6 @@ const
   OCI_SHARED      = $10;
   OCI_NO_UCB      = $40;
   OCI_NO_MUTEX    = $80;
-
-  { fixed Client Character Set }
-  OCI_UTF8 = $367;
-  OCI_AL32UTF8 = $369;
-  OCI_UTF16ID = 1000;
-  OCI_WE8MSWIN1252 = 178;
 
   { OCI Credentials }
   OCI_CRED_RDBMS  = 1;
@@ -1248,7 +1260,6 @@ type
   /// direct access to the native Oracle Client Interface (OCI)
   TSQLDBOracleLib = class(TSQLDBLib)
   protected
-    fLibraryPath: TFileName;
     procedure HandleError(Conn: TSQLDBConnection; Stmt: TSQLDBStatement;
       Status: Integer; ErrorHandle: POCIError; InfoRaiseException: Boolean=false;
       LogLevelNoRaise: TSynLogInfo=sllNone);
@@ -1473,7 +1484,7 @@ begin
     if Len>0 then begin
       Len := Len*3; // max UTF-8 size according to number of characters
       SetLength(Text,Len);
-      result := BlobRead(Stmt,svchp,errhp,locp,pointer(Text),Len,OCI_UTF8,ColumnDBForm);
+      result := BlobRead(Stmt,svchp,errhp,locp,pointer(Text),Len,OCI_CHARSET_UTF8,ColumnDBForm);
       if TextResize then
         SetLength(Text,result) else
         Text[result+1] := #0; // ensure ASCIIZ (e.g. when escaping to JSON)
@@ -1665,7 +1676,7 @@ begin
         result := CodePageToCharSetID(env,GetACP);
   end;
   CP_UTF8:
-    result := OCI_UTF8;
+    result := OCI_CHARSET_UTF8;
   CP_UTF16:
     result := OCI_UTF16ID;
   else begin
@@ -1682,38 +1693,28 @@ begin
     result := OCI_WE8MSWIN1252;
 end;
 
-{$ifdef KYLIX3}
-function SafeLoadLibrary(const aFileName: TFileName): HMODULE;
-begin
- result := LoadLibrary(PAnsiChar(AnsiString(aFileName)));
-end;
-{$endif KYLIX3}
-
 constructor TSQLDBOracleLib.Create;
 const LIBNAME = {$ifdef MSWINDOWS}'oci.dll'{$else}'libclntsh.so'{$endif};
 var P: PPointer;
     i: integer;
-    orhome: string;
+    l1, l2, l3: TFileName;
 begin
-  fLibraryPath := LIBNAME;
   if (SynDBOracleOCIpath<>'') and DirectoryExists(SynDBOracleOCIpath) then
-    fLibraryPath := ExtractFilePath(ExpandFileName(SynDBOracleOCIpath+PathDelim))+fLibraryPath;
-  fHandle := SafeLoadLibrary(fLibraryPath);
-  if fHandle=0 then begin
-    if fHandle=0 then begin
-      orhome := GetEnvironmentVariable('ORACLE_HOME');
-      if orhome<>'' then begin
-        fLibraryPath := IncludeTrailingPathDelimiter(orhome)+'bin'+PathDelim+LIBNAME;
-        fHandle := SafeLoadLibrary(fLibraryPath);
-      end;
+    l1 := ExtractFilePath(ExpandFileName(SynDBOracleOCIpath+PathDelim))+LIBNAME;
+  l2 := ExeVersion.ProgramFilePath+LIBNAME;
+  if not FileExists(l2) then begin
+    l2 := ExeVersion.ProgramFilePath+'OracleInstantClient';
+    if not DirectoryExists(l2) then begin
+      l2 := ExeVersion.ProgramFilePath+'OCI';
+      if not DirectoryExists(l2) then
+        l2 := ExeVersion.ProgramFilePath+'Oracle';
     end;
+    l2 := l2+PathDelim+LIBNAME;
   end;
-  if fHandle=0 then begin
-    fLibraryPath := ExeVersion.ProgramFilePath+'OracleInstantClient'+PathDelim+LIBNAME;
-    fHandle := SafeLoadLibrary(fLibraryPath);
-  end;
-  if fHandle=0 then
-    raise ESQLDBOracle.Create('Unable to find Oracle Client Interface '+LIBNAME);
+  l3 := GetEnvironmentVariable('ORACLE_HOME');
+  if l3<>'' then
+    l3 := IncludeTrailingPathDelimiter(l3)+'bin'+PathDelim+LIBNAME;
+  TryLoadLibrary([l1, l2, l3, LIBNAME], ESQLDBOracle);
   P := @@ClientVersion;
   for i := 0 to High(OCI_ENTRIES) do begin
     P^ := GetProcAddress(fHandle,OCI_ENTRIES[i]);
@@ -1736,7 +1737,7 @@ class function TSQLDBOracleConnectionProperties.ExtractTnsName(
   const aServerName: RawUTF8): RawUTF8;
 var i: integer;
 begin
-  i := PosEx('/',aServerName);
+  i := PosExChar('/',aServerName);
   if i=0 then
     result := aServerName else
     result := copy(aServerName,i+1,100);
@@ -1744,7 +1745,7 @@ end;
 
 function TSQLDBOracleConnectionProperties.IsCachable(P: PUTF8Char): boolean;
 begin
-  result := false;
+  result := false; // no client-side cache, only server-side
 end;
 
 constructor TSQLDBOracleConnectionProperties.Create(const aServerName,
@@ -1754,8 +1755,13 @@ begin
   fBatchSendingAbilities := [cCreate,cUpdate,cDelete]; // array DML feature
   fBatchMaxSentAtOnce := 10000;  // iters <= 32767 for better performance
   inherited Create(aServerName,'',aUserID,aPassWord);
-  if OCI=nil then
-    GarbageCollectorFreeAndNil(OCI,TSQLDBOracleLib.Create);
+  GlobalLock;
+  try
+    if OCI=nil then
+      GarbageCollectorFreeAndNil(OCI,TSQLDBOracleLib.Create);
+  finally
+    GlobalUnLock;
+  end;
   fBlobPrefetchSize := 4096;
   fRowsPrefetchSize := 128*1024;
   fStatementCacheSize := 30; // default is 20
@@ -1788,7 +1794,7 @@ end;
 
 procedure TSQLDBOracleConnectionProperties.PasswordChanged(const ANewPassword: RawUTF8);
 begin
-  SynDBLog.Add.Log(sllDB, 'PasswordChanged called',self);
+  SynDBLog.Add.Log(sllDB, 'PasswordChanged method called',self);
   fPassWord := ANewPassword;
   if Assigned(FOnPasswordChanged) then
     FOnPasswordChanged(Self);
@@ -1820,26 +1826,30 @@ begin
 end;
 
 procedure TSQLDBOracleConnection.Connect;
-var Log: ISynLog;
+var log: ISynLog;
     Props: TSQLDBOracleConnectionProperties;
     mode: ub4;
     msg: RawUTF8;
+    r: sword;
 const
     type_owner_name: RawUTF8 = 'SYS';
     type_NymberListName: RawUTF8 = 'ODCINUMBERLIST';
     type_Varchar2ListName: RawUTF8 = 'ODCIVARCHAR2LIST';
     type_Credential: array[boolean] of integer = (OCI_CRED_RDBMS,OCI_CRED_EXT);
 begin
-  Log := SynDBLog.Enter(self,'Connect');
+  log := SynDBLog.Enter(self,'Connect');
   Disconnect; // force fTrans=fError=fServer=fContext=nil
   Props := Properties as TSQLDBOracleConnectionProperties;
   with OCI do
   try
-    if fEnv=nil then
+    if fEnv=nil then begin
       // will use UTF-8 encoding by default, in a multi-threaded context
       // OCI_EVENTS is needed to support Oracle RAC Connection Load Balancing
-      EnvNlsCreate(fEnv,Props.EnvironmentInitializationMode,
-        nil,nil,nil,nil,0,nil,OCI_UTF8,OCI_UTF8);
+      r := EnvNlsCreate(fEnv,Props.EnvironmentInitializationMode,
+        nil,nil,nil,nil,0,nil,OCI_CHARSET_UTF8,OCI_CHARSET_UTF8);
+      if r <> OCI_SUCCESS then
+        raise ESQLDBOracle.CreateUTF8('OCIEnvNlsCreate fails with code %', [r]);
+    end;
     HandleAlloc(fEnv,fError,OCI_HTYPE_ERROR);
     HandleAlloc(fEnv,fServer,OCI_HTYPE_SERVER);
     HandleAlloc(fEnv,fContext,OCI_HTYPE_SVCCTX);
@@ -1893,8 +1903,8 @@ begin
     if Props.UseWallet then
       msg := 'using Oracle Wallet' else
       msg := 'as '+Props.UserID;
-    if Log<>nil then
-      Log.Log(sllInfo,'Connected to % % with %, codepage % (%/%)',
+    if log<>nil then
+      log.log(sllInfo,'Connected to % % with %, codepage % (%/%)',
         [Props.ServerName,msg,Props.ClientVersion,fAnsiConvert.CodePage,
          fOCICharSet,OracleCharSetName(fOCICharSet)],self);
     with NewStatement do
@@ -1913,8 +1923,8 @@ begin
     inherited Connect; // notify any re-connection
   except
     on E: Exception do begin
-      if Log<>nil then
-        Log.Log(sllError,E);
+      if log<>nil then
+        log.log(sllError,E);
       Disconnect; // clean up on fail
       raise;
     end;
@@ -1922,9 +1932,9 @@ begin
 end;
 
 constructor TSQLDBOracleConnection.Create(aProperties: TSQLDBConnectionProperties);
-var Log: ISynLog;
+var log: ISynLog;
 begin
-  Log := SynDBLog.Enter(self,'Create');
+  log := SynDBLog.Enter(self,'Create');
   if not aProperties.InheritsFrom(TSQLDBOracleConnectionProperties) then
     raise ESQLDBOracle.CreateUTF8('Invalid %.Create(%)',[self,aProperties]);
   OCI.RetrieveVersion;
@@ -1939,14 +1949,12 @@ begin
 end;
 
 procedure TSQLDBOracleConnection.Disconnect;
-var Log: ISynLog;
 begin
   try
     inherited Disconnect; // flush any cached statement
   finally
     if (fError<>nil) and (OCI<>nil) then
-    with OCI do begin
-      Log := SynDBLog.Enter(self,'Disconnect');
+    with SynDBLog.Enter(self,'Disconnect'), OCI do begin
       if fTrans<>nil then begin
         // close any opened session
         HandleFree(fTrans,OCI_HTYPE_TRANS);
@@ -2003,9 +2011,9 @@ begin
 end;
 
 procedure TSQLDBOracleConnection.StartTransaction;
-var Log: ISynLog;
+var log: ISynLog;
 begin
-  Log := SynDBLog.Enter(self,'StartTransaction');
+  log := SynDBLog.Enter(self,'StartTransaction');
   if TransactionCount>0 then
     raise ESQLDBOracle.CreateUTF8('Invalid %.StartTransaction: nested '+
       'transactions are not supported by the Oracle driver',[self]);
@@ -2036,8 +2044,9 @@ procedure TSQLDBOracleConnection.STRToUTF8(P: PAnsiChar; var result: RawUTF8;
 var L: integer;
 begin
   L := StrLen(PUTF8Char(P));
-  if (L=0) or (ColumnDBCharSet=OCI_UTF8) or (ColumnDBForm=SQLCS_NCHAR) then
-    SetString(result,P,L) else
+  if (L=0) or (ColumnDBCharSet=OCI_AL32UTF8) or (ColumnDBCharSet=OCI_UTF8) or
+     (ColumnDBForm=SQLCS_NCHAR) then
+    FastSetString(result,P,L) else
     result := fAnsiConvert.AnsiBufferToRawUTF8(P,L);
 end;
 
@@ -2047,12 +2056,12 @@ procedure TSQLDBOracleConnection.STRToAnsiString(P: PAnsiChar; var result: AnsiS
 var L: integer;
 begin
   L := StrLen(PUTF8Char(P));
-  if (L=0) or ((ColumnDBCharSet<>OCI_UTF8) and (ColumnDBForm<>SQLCS_NCHAR) and
-     (fAnsiConvert.CodePage=GetACP)) then
+  if (L=0) or ((ColumnDBCharSet<>OCI_AL32UTF8) and (ColumnDBCharSet<>OCI_UTF8) and
+      (ColumnDBForm<>SQLCS_NCHAR) and (fAnsiConvert.CodePage=GetACP)) then
     SetString(result,P,L) else
     result := CurrentAnsiConvert.AnsiToAnsi(fAnsiConvert,P,L);
 end;
-{$endif}
+{$endif UNICODE}
 
 
 { TSQLDBOracleStatement }
@@ -2296,9 +2305,8 @@ begin // dedicated version to avoid as much memory allocation than possible
   if V=nil then
     result := ftNull else
     result := C^.ColumnType;
+  VarClear(Value);
   with TVarData(Value) do begin
-    {$ifndef FPC}if VType and VTYPE_STATIC<>0 then{$endif}
-      VarClear(Value);
     VType := MAP_FIELDTYPE2VARTYPE[result];
     case result of
       ftNull: ; // do nothing
@@ -2426,7 +2434,7 @@ begin
 end;
 
 constructor TSQLDBOracleStatement.CreateFromExistingStatement(
-  aConnection: TSQLDBConnection; aStatement: POCIStmt);
+  aConnection: TSQLDBConnection; aStatement: pointer);
 begin
   Create(aConnection);
   fTimeElapsed.Resume;
@@ -2441,7 +2449,6 @@ begin
         fCurrentRow := 0; // mark cursor on the first row
     except
       on E: Exception do begin
-        SynDBLog.Add.Log(sllError,E);
         fStatement := nil; // do not release the statement in constructor
         FreeHandles(True);
         raise;
@@ -2543,6 +2550,7 @@ procedure TSQLDBOracleStatement.ExecutePrepared;
 var i,j: PtrInt;
     Env: POCIEnv;
     Context: POCISvcCtx;
+    param: PSQLDBParam;
     Type_List: POCIType;
     oData: pointer;
     oDataDAT: ^TOracleDateArray absolute oData;
@@ -2569,12 +2577,7 @@ begin
   if (fStatement=nil) then
     raise ESQLDBOracle.CreateUTF8('%.ExecutePrepared without previous Prepare',[self]);
   inherited ExecutePrepared; // set fConnection.fLastAccessTicks
-  with SynDBLog.Add do
-    if sllSQL in Family.Level then begin
-      tmp := SQLWithInlinedParams;
-      Log(sllSQL,tmp,self,2048);
-    end;
-  fTimeElapsed.Resume;
+  SQLLogBegin(sllSQL);
   try
     ociArraysCount := 0;
     Env := (Connection as TSQLDBOracleConnection).fEnv;
@@ -2693,7 +2696,8 @@ begin
         for i := 0 to fParamCount-1 do
         if Length(fParams[i].VArray)>0 then begin
           // 1.2.1. Bind an array as one object
-          case fParams[i].VType of
+          param := @fParams[i];
+          case param.VType of
           ftInt64:
             Type_List := TSQLDBOracleConnection(Connection).fType_numList;
           ftUTF8:
@@ -2708,18 +2712,18 @@ begin
           OCI.Check(nil,self,OCI.ObjectNew(Env, fError, Context, OCI_TYPECODE_VARRAY, Type_List, nil,
             OCI_DURATION_SESSION, True, ociArrays[ociArraysCount]), fError);
           inc(ociArraysCount);
-          SetString(fParams[i].VData,nil,Length(fParams[i].VArray)*sizeof(Int64));
-          oData := pointer(fParams[i].VData);
-          for j := 0 to Length(fParams[i].VArray)-1 do
-            case fParams[i].VType of
+          SetString(param.VData,nil,Length(param.VArray)*sizeof(Int64));
+          oData := pointer(param.VData);
+          for j := 0 to Length(param.VArray)-1 do
+            case param.VType of
             ftInt64: begin
-              SetInt64(pointer(fParams[i].Varray[j]),oDataINT^[j]);
+              SetInt64(pointer(param.Varray[j]),oDataINT^[j]);
               OCI.Check(nil,self,OCI.NumberFromInt(fError, @oDataINT[j], sizeof(Int64), OCI_NUMBER_SIGNED, num_val), fError);
               OCI.Check(nil,self,OCI.CollAppend(Env, fError, @num_val, nil, ociArrays[ociArraysCount-1]),fError);
             end;
             ftUTF8: begin
               str_val := nil;
-              SynCommons.UnQuoteSQLStringVar(pointer(fParams[i].VArray[j]),tmp);
+              SynCommons.UnQuoteSQLStringVar(pointer(param.VArray[j]),tmp);
               OCI.Check(nil,self,OCI.StringAssignText(Env, fError, pointer(tmp), length(tmp), str_val), fError);
               OCI.Check(nil,self,OCI.CollAppend(Env, fError, str_val, nil, ociArrays[ociArraysCount-1]),fError);
             end;
@@ -2866,7 +2870,7 @@ begin
             fBoundCursor[i] := PPointer(@VInt64)^; // available via BoundCursor()
           end else // on error, release bound statement resource
             if OCI.HandleFree(PPointer(@VInt64)^,OCI_HTYPE_STMT)<>OCI_SUCCESS then
-              SynDBLog.Add.Log(sllError,'ExecutePrepared: SQLT_RSET param release',self);
+              SynDBLog.Add.Log(sllError,'ExecutePrepared: HandleFree(SQLT_RSET)',self);
       ftInt64:
         if VDBType=SQLT_FLT then // retrieve OUT integer parameter
           VInt64 := trunc(unaligned(PDouble(@VInt64)^));
@@ -2880,7 +2884,7 @@ begin
         SQLT_TIMESTAMP: begin // release OCIDateTime resource
           oOCIDateTime := PPointer(VData)^;
           if OCI.DescriptorFree(oOCIDateTime,OCI_DTYPE_TIMESTAMP)<>OCI_SUCCESS then
-            SynDBLog.Add.Log(sllError,'ExecutePrepared: OCI_DTYPE_TIMESTAMP param release',self);
+            SynDBLog.Add.Log(sllError,'ExecutePrepared: DescriptorFree(OCI_DTYPE_TIMESTAMP)',self);
           VData := '';
         end;
         end;
@@ -2890,7 +2894,7 @@ begin
       end;
     end;
   finally
-    fTimeElapsed.Pause;
+    fTimeElapsed.FromExternalMicroSeconds(SQLLogEnd);
   end;
 end;
 
@@ -2934,6 +2938,11 @@ begin
   OCI.Check(nil,nil,OCI.DateTimeConstruct(env,fError,result,Y,M,D,HH,MM,SS,0,nil,0),fError);
 end;
 
+procedure TSQLDBOracleStatement.ReleaseRows;
+begin // not implemented yet
+  inherited ReleaseRows;
+end;
+
 procedure TSQLDBOracleStatement.FreeHandles(AfterError: boolean);
 const // see http://gcov.php.net/PHP_5_3/lcov_html/ext/oci8/oci8_statement.c.gcov.php
   RELEASE_MODE: array[boolean] of integer = (OCI_DEFAULT,OCI_STMTCACHE_DELETE);
@@ -2952,10 +2961,10 @@ begin
             case ColumnValueDBType of
             SQLT_CLOB, SQLT_BLOB:
               if OCI.DescriptorFree(P^,OCI_DTYPE_LOB)<>OCI_SUCCESS then
-                SynDBLog.Add.Log(sllError,'FreeHandles: Invalid Blob Release',self);
+                SynDBLog.Add.Log(sllError,'FreeHandles: Invalid OCI_DTYPE_LOB',self);
             SQLT_RSET:
               if OCI.HandleFree(P^,OCI_HTYPE_STMT)<>OCI_SUCCESS then
-                SynDBLog.Add.Log(sllError,'FreeHandles: Invalid Cursor Release',self);
+                SynDBLog.Add.Log(sllError,'FreeHandles: Invalid SQLT_RSET',self);
             else raise ESQLDBOracle.CreateUTF8(
               '%.FreeHandles: Wrong % type for inlined column %',
               [self,ColumnValueDBType,ColumnName]);
@@ -3011,10 +3020,6 @@ begin
   if fStatement<>nil then
     OCI.AttrGet(fStatement,OCI_HTYPE_STMT,@result,nil,OCI_ATTR_ROW_COUNT,fError);
 end;
-
-const
-  CHARSET_UTF8: cardinal = OCI_UTF8;
-  CHARSET_WIN1252: cardinal = OCI_WE8MSWIN1252;
 
 procedure TSQLDBOracleStatement.SetColumnsForPreparedStatement;
 var aName: RawUTF8;
@@ -3192,7 +3197,7 @@ begin
       end;
       // avoid memory leak for cached statement
       if DescriptorFree(oHandle, OCI_DTYPE_PARAM)<>OCI_SUCCESS then
-        SynDBLog.Add.Log(sllError, 'Invalid column descriptor release',self);
+        SynDBLog.Add.Log(sllError, 'Invalid DescriptorFree(OCI_DTYPE_PARAM)',self);
     end;
     assert(fColumn.Count=integer(ColCount));
     // 3. Dispatch data in row buffer
@@ -3241,14 +3246,17 @@ begin
         ColumnValueDBSize,ColumnValueDBType,Indicators,nil,nil,OCI_DEFAULT),fError);
       case ColumnType of
       ftCurrency: // currency content is returned as SQLT_STR
-        Check(nil,self,AttrSet(oDefine,OCI_HTYPE_DEFINE,@CHARSET_WIN1252,0,OCI_ATTR_CHARSET_ID,fError),fError);
+        Check(nil,self,AttrSet(oDefine,OCI_HTYPE_DEFINE,@OCI_CHARSET_WIN1252,0,
+          OCI_ATTR_CHARSET_ID,fError),fError);
       ftUTF8:
         case ColumnValueDBForm of
         SQLCS_IMPLICIT: // force CHAR + VARCHAR2 inlined fields charset
           // -> a conversion into UTF-8 will probably truncate the inlined result
-          Check(nil,self,AttrSet(oDefine,OCI_HTYPE_DEFINE,@ColumnValueDBCharSet,0,OCI_ATTR_CHARSET_ID,fError),fError);
+          Check(nil,self,AttrSet(oDefine,OCI_HTYPE_DEFINE,@ColumnValueDBCharSet,0,
+            OCI_ATTR_CHARSET_ID,fError),fError);
         SQLCS_NCHAR: // NVARCHAR2 + NCLOB will be retrieved directly as UTF-8 content
-          Check(nil,self,AttrSet(oDefine,OCI_HTYPE_DEFINE,@CHARSET_UTF8,0,OCI_ATTR_CHARSET_ID,fError),fError);
+          Check(nil,self,AttrSet(oDefine,OCI_HTYPE_DEFINE,@OCI_CHARSET_UTF8,0,
+            OCI_ATTR_CHARSET_ID,fError),fError);
         end;
       end;
       inc(RowSize,fRowBufferCount*ColumnValueDBSize);
@@ -3263,8 +3271,10 @@ procedure TSQLDBOracleStatement.Prepare(const aSQL: RawUTF8;
   ExpectResults: Boolean);
 var oSQL: RawUTF8;
     env: POCIEnv;
+    cached: boolean;
 begin
-  fTimeElapsed.Resume;
+  cached := false;
+  SQLLogBegin(sllDB);
   try
     try
       if (fStatement<>nil) or (fColumnCount>0) then
@@ -3278,13 +3288,11 @@ begin
         HandleAlloc(env,fError,OCI_HTYPE_ERROR);
         if fUseServerSideStatementCache then begin
           if StmtPrepare2(TSQLDBOracleConnection(Connection).fContext,fStatement,
-            fError,pointer(oSQL),length(oSQL),nil,0,OCI_NTV_SYNTAX,OCI_PREP2_CACHE_SEARCHONLY) = OCI_SUCCESS then
-            SynDBLog.Add.Log(sllDebug,'Prepare: Statement cache HIT',self)
-          else begin
-            Check(nil,self,StmtPrepare2(TSQLDBOracleConnection(Connection).fContext,fStatement,
-              fError,pointer(oSQL),length(oSQL),nil,0,OCI_NTV_SYNTAX,OCI_DEFAULT),fError);
-            SynDBLog.Add.Log(sllDebug,'Prepare: Statement cache miss',self);
-          end;
+             fError,pointer(oSQL),length(oSQL),nil,0,OCI_NTV_SYNTAX,
+             OCI_PREP2_CACHE_SEARCHONLY) = OCI_SUCCESS then
+            cached := true else
+          Check(nil,self,StmtPrepare2(TSQLDBOracleConnection(Connection).fContext,fStatement,
+            fError,pointer(oSQL),length(oSQL),nil,0,OCI_NTV_SYNTAX,OCI_DEFAULT),fError);
         end else begin
           HandleAlloc(env,fStatement,OCI_HTYPE_STMT);
           Check(nil,self,StmtPrepare(fStatement,fError,pointer(oSQL),length(oSQL),
@@ -3295,13 +3303,12 @@ begin
       SetColumnsForPreparedStatement;
     except
       on E: Exception do begin
-        SynDBLog.Add.Log(sllError,E);
         FreeHandles(True);
         raise;
       end;
     end;
   finally
-    fTimeElapsed.Pause;
+    fTimeElapsed.FromExternalMicroSeconds(SQLLogEnd(' cache=%',[cached]));
   end;
 end;
 

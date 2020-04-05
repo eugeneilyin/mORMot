@@ -157,9 +157,12 @@ uses
       {$endif FPC}
       SynDB in '..\SynDB.pas',
       SynDBSQLite3 in '..\SynDBSQLite3.pas',
-      SynDBOracle in '..\SynDBOracle.pas',
+      SynDBOracle in '..\SynDBOracle.pas', 
+      SynDBPostgres in '..\SynDBPostgres.pas',
       SynOleDB in '..\SynOleDB.pas',
       SynDBODBC in '..\SynDBODBC.pas',
+      // SynDBFirebird in '..\SynDBFirebird.pas',
+      // SynDBDataSet in '..\SynDBDataSet.pas',
       {$ifdef USEZEOS}
         SynDBZeos in '..\SynDBZeos.pas',
       {$endif}

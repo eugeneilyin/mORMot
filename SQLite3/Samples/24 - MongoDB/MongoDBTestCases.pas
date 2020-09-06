@@ -23,7 +23,7 @@ uses
 
 const
   MONGOSERVER = 'localhost';
-  // MONGOSERVER = '10.0.2.2'; // from a VirtualBox VM
+  //MONGOSERVER = '10.0.2.2'; // from a VirtualBox VM
   MONGOPORT = 27017;
 
 type
@@ -57,6 +57,7 @@ type
     fInts: TIntegerDynArray;
     fCreateTime: TCreateTime;
     fData: TSQLRawBlob;
+    fFP: double;
   published
     property Name: RawUTF8 read fName write fName stored AS_UNIQUE;
     property Age: integer read fAge write fAge;
@@ -65,6 +66,7 @@ type
     property Ints: TIntegerDynArray index 1 read fInts write fInts;
     property Data: TSQLRawBlob read fData write fData;
     property CreateTime: TCreateTime read fCreateTime write fCreateTime;
+    property FP: double read fFP write fFP;
   end;
 
   TTestORM = class(TSynTestCase)
@@ -183,8 +185,9 @@ begin
   Check(serverTime<>0);
   CheckSame(Now,serverTime,0.5);
   if System.Pos('MongoDB',Owner.CustomVersions)=0 then
-    Owner.CustomVersions := Owner.CustomVersions+'Using '+
-      string(fClient.ServerBuildInfoText);
+    Owner.CustomVersions := format('%sUsing %s'#13#10'Running on %s'#13#10+
+      'Compiled with mORMot '+SYNOPSE_FRAMEWORK_VERSION,
+      [Owner.CustomVersions,fClient.ServerBuildInfoText,OSVersionText]);
   fExpectedCount := COLL_COUNT;
 end;
 
@@ -205,7 +208,7 @@ begin
   Check(fDB.Collection[COLL_NAME]=Coll);
   Check(fDB.CollectionOrCreate[COLL_NAME]=Coll);
   errmsg := Coll.Drop;
-  Check(fClient.ServerBuildInfoNumber>20000);
+  CheckUTF8(fClient.ServerBuildInfoNumber>20000,errmsg);
   fValues := nil;
   SetLength(fValues,COLL_COUNT);
   for i := 0 to COLL_COUNT-1 do begin
@@ -452,6 +455,7 @@ begin
       R.Value := _ObjFast(['num',i]);
       R.Ints := nil;
       R.DynArray(1).Add(i);
+      R.FP := i*7.3445;
       Check(fClient.BatchAdd(R,True)>=0);
     end;
   finally
@@ -473,6 +477,7 @@ begin
   Check(Length(R.Ints)=1);
   Check(R.Ints[0]=aID);
   Check(R.CreateTime>=fStartTimeStamp);
+  CheckSame(R.FP,aID*7.3445);
 end;
 
 procedure TTestORM.Retrieve;
@@ -764,6 +769,8 @@ begin
     FormatUTF8('[{"min(RowID)":1,"max(RowID)":%,"Count(RowID)":%}]',[COLL_COUNT,COLL_COUNT]));
   doc := fClient.RetrieveDocVariant(TSQLORM,'',[],
     'min(RowID) as a,max(RowID) as b,Count(RowID) as c');
+  if checkfailed(not VarIsEmptyOrNull(doc),'abc docvariant') then
+    exit;
   check(doc.a=1);
   check(doc.b=COLL_COUNT);
   check(doc.c=COLL_COUNT);

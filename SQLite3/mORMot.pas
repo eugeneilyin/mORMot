@@ -47,7 +47,7 @@ unit mORMot;
     Ondrej
     Pavel Mashlyakovskii (mpv)
     Sabbiolina
-    Transmogrifix
+    Svetozar Belic (transmogrifix)
     Uian2000
     Vadim Orel
 
@@ -957,6 +957,10 @@ procedure CopyCollection(Source, Dest: TCollection);
 // - will also reset the published properties of the nested classes
 procedure SetDefaultValuesObject(Value: TObject);
 
+/// returns TRUE on a nil instance or if all its published properties are default/0
+// - calls internally TPropInfo.IsDefaultOrVoid()
+function IsObjectDefaultOrVoid(Value: TObject): boolean;
+
 /// will reset all the object properties to their default
 // - strings will be set to '', numbers to 0
 // - if FreeAndNilNestedObjects is the default FALSE, will recursively reset
@@ -1650,6 +1654,7 @@ type
     /// return the Default RTTI value defined for this property, or 0 if not set
     function DefaultOr0: integer; {$ifdef HASINLINE}inline;{$endif}
     /// return TRUE if the property has its Default RTTI value, or is 0/""/nil
+    // - will call function IsObjectDefaultOrVoid() for class properties
     function IsDefaultOrVoid(Instance: TObject): boolean;
     /// compute in how many bytes this property is stored
     function RetrieveFieldSize: integer;
@@ -7831,9 +7836,10 @@ type
     // (no additional memory buffer is allocated)
     function ParseAndConvert(Buffer: PUTF8Char; BufferLen: integer): boolean;
     /// will check then set (if needed) internal fPrivateCopy[Hash] values
-    // - returns TRUE if content changed (then fPrivateCopy+fPrivateCopyHash
-    // will be updated using crc32c hash)
-    function PrivateCopyChanged(aJSON: PUTF8Char; aLen: integer): boolean;
+    // - returns TRUE if fPrivateCopy content changed (then fPrivateCopyHash
+    // will be updated using crc32c hash if aUpdateHash is set)
+    function PrivateCopyChanged(aJSON: PUTF8Char; aLen: integer;
+      aUpdateHash: boolean): boolean;
   public
     /// create the result table from a JSON-formated Data message
     // - the JSON data is parsed and formatted in-place
@@ -8465,13 +8471,20 @@ type
 
   /// how a TSQLModel stores a foreign link to be cascaded
   TSQLModelRecordReference = record
+    /// refers to the source TSQLRecordClass as model Tables[] index
     TableIndex: integer;
+    /// the property
     FieldType: TSQLPropInfo;
+    /// the target TSQLRecordClass of the field
     FieldTable: TSQLRecordClass;
+    /// the target TSQLRecordClass of the field, from its Tables[] index
     FieldTableIndex: integer;
+    /// TRUE if this field is a TRecordReferenceToBeDeleted
     CascadeDelete: boolean;
   end;
   PSQLModelRecordReference = ^TSQLModelRecordReference;
+
+  TSQLModelRecordReferenceDynArray = array of TSQLModelRecordReference;
 
   /// a Database Model (in a MVC-driven way), for storing some tables types
   // as TSQLRecord classes
@@ -8504,13 +8517,8 @@ type
     fSortedTablesNameIndex: TIntegerDynArray;
     /// will contain the registered virtual table modules
     fVirtualTableModule: array of TSQLVirtualTableClass;
-    /// this array contain all TRecordReference and TSQLRecord properties
-    // existing in the database model
-    // - used in TSQLRestServer.Delete() to enforce relational database coherency
-    // after deletion of a record: all other records pointing to it will be
-    // reset to 0 or deleted (if CascadeDelete is true) by
-    // TSQLRestServer.AfterDeleteForceCoherency
-    fRecordReferences: array of TSQLModelRecordReference;
+    /// all TRecordReference and TSQLRecord properties of the model
+    fRecordReferences: TSQLModelRecordReferenceDynArray;
     fIDGenerator: array of TSynUniqueIdentifierGenerator;
     procedure SetRoot(const aRoot: RawUTF8);
     procedure SetTableProps(aIndex: integer);
@@ -8773,6 +8781,12 @@ type
     /// for every table, contains a locked record list
     // - very fast, thanks to the use one TSQLLocks entry by table
     property Locks: TSQLLocksDynArray read fLocks;
+    /// this array contain all TRecordReference and TSQLRecord properties
+    // existing in the database model
+    // - used in TSQLRestServer.Delete() to enforce relational database coherency
+    // after deletion of a record: all other records pointing to it will be
+    // reset to 0 or deleted (if CascadeDelete is true)
+    property RecordReferences: TSQLModelRecordReferenceDynArray read fRecordReferences;
     {$ifndef LVCL}
     /// set a callback event to be executed in loop during client remote
     // blocking process, e.g. to refresh the UI during a somewhat long request
@@ -18761,22 +18775,25 @@ type
   // - a typical usage is to validate a value to be unique in the table
   // (implemented in the TSynValidateUniqueField class)
   // - the optional associated parameters are to be supplied JSON-encoded
-  // - ProcessRest and ProcessRec properties will be filled before Process
+  // - ProcessRest and ProcessRec properties will be filled before Validate
   // method call by TSQLRecord.Validate()
   TSynValidateRest = class(TSynValidate)
   protected
     fProcessRest: TSQLRest;
     fProcessRec: TSQLRecord;
+    function DoValidate(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean; virtual; abstract;
   public
+    function Process(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string): boolean; override;
+    function Validate(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean;
     /// the associated TSQLRest instance
-    // - this value is updated by TSQLRecord.Validate with the current
+    // - this value is updated by Validate with the current
     // TSQLRest used for the validation
-    // - it can be used in the overridden Process method
+    // - it can be used in the overridden DoValidate method
     property ProcessRest: TSQLRest read fProcessRest;
     /// the associated TSQLRecord instance
-    // - this value is updated by TSQLRecord.Validate with the current
+    // - this value is updated by Validate with the current
     // TSQLRecord instance to be validated
-    // - it can be used in the overridden Process method
+    // - it can be used in the overridden DoValidate method
     property ProcessRec: TSQLRecord read fProcessRec;
   end;
 
@@ -18785,11 +18802,9 @@ type
   // - it will check that the field value is not void
   // - it will check that the field value is not a duplicate
   TSynValidateUniqueField = class(TSynValidateRest)
-  public
+  protected
     /// perform the unique field validation action to the specified value
-    // - duplication value check will use ProcessRest and ProcessRec properties,
-    // as set by TSQLRecord.Validate
-    function Process(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string): boolean; override;
+    function DoValidate(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean; override;
   end;
 
   /// will define an unicity validation for a set of TSQLRecord text fields
@@ -18803,11 +18818,9 @@ type
   protected
     fFieldNames: TRawUTF8DynArray;
     procedure SetParameters(const Value: RawUTF8); override;
-  public
     /// perform the unique fields validation action to the specified value
-    // - duplication value check will use ProcessRest and ProcessRec properties,
-    // as set by TSQLRecord.Validate
-    function Process(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string): boolean; override;
+    function DoValidate(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean; override;
+  public
     /// the validated field names
     property FieldNames: TRawUTF8DynArray read fFieldNames;
   end;
@@ -20633,9 +20646,9 @@ function SQLFieldTypeToDBField(aSQLFieldType: TSQLFieldType; aTypeInfo: pointer)
 begin
   {$ifndef NOVARIANTS}
   if aSQLFieldType=sftNullable then
-    result := SQLFIELDTYPETODBFIELDTYPE[NullableTypeToSQLFieldType(aTypeInfo)] else
+    aSQLFieldType := NullableTypeToSQLFieldType(aTypeInfo);
   {$endif}
-    result := SQLFIELDTYPETODBFIELDTYPE[aSqlFieldType];
+  result := SQLFIELDTYPETODBFIELDTYPE[aSQLFieldType];
 end;
 
 constructor TSQLPropInfo.Create(const aName: RawUTF8; aSQLFieldType: TSQLFieldType;
@@ -20828,7 +20841,7 @@ begin
 end;
 
 function ObjectLoadVariant(var ObjectInstance; const aDocVariant: variant;
-  TObjectListItemClass: TClass=nil; Options: TJSONToObjectOptions=[]): boolean;
+  TObjectListItemClass: TClass; Options: TJSONToObjectOptions): boolean;
 var tmp: RawUTF8;
 begin
   result := false;
@@ -22989,13 +23002,18 @@ var tmp: TSynTempBuffer;
     V: Variant;
 begin
   if ValueLen>0 then begin
-    if wasString and (GotoNextNotSpace(Value)^ in ['{','[']) then
-      wasString := false; // allow to create a TDocVariant stored as DB text
     tmp.Init(Value,ValueLen);
     try
       if fSQLFieldType=sftNullable then
-        GetVariantFromJSON(tmp.buf,wasString,V,nil) else
+        if fSQLDBFieldType=ftDate then begin // decode as date/time variant
+          TVarData(V).VType := varDate;
+          TVarData(V).VDate := Iso8601ToDateTimePUTF8Char(Value,ValueLen);
+        end else
+          GetVariantFromJSON(tmp.buf,wasString,V,nil) else begin
+        if wasString and (GotoNextNotSpace(Value)^ in ['{','[']) then
+          wasString := false; // allow to create a TDocVariant stored as DB text
         GetVariantFromJSON(tmp.buf,wasString,V,@DocVariantOptions);
+      end;
       fPropInfo.SetVariantProp(Instance,V);
     finally
       tmp.Done;
@@ -24412,7 +24430,7 @@ begin
     exit; // no selected -> all bits left to 0
   // we sort IDs to use FastFindInt64Sorted() and its O(log(n)) binary search
   ID := @IDs[0];
-  IDmax := high(IDs);
+  IDmax := length(IDs)-1;
   QuickSortInt64(ID,0,IDmax);
   if not Assigned(fIDColumn) then begin
     FID := fFieldIndexID; // get ID column field index
@@ -25875,7 +25893,7 @@ begin
 end;
 
 procedure ExchgFields(P1,P2: PPointer; FieldCount: PtrUInt);
-{$ifdef CPUX86}
+{$ifdef CPUX86} {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // eax=P1 edx=P2 ecx=FieldCount
         push    esi
         push    edi
@@ -27331,7 +27349,7 @@ begin
 end;
 
 procedure TJSONObjectDecoder.Decode(const JSON: RawUTF8; const Fields: TRawUTF8DynArray;
-  Params: TJSONObjectDecoderParams; const RowID: TID=0; ReplaceRowIDWithID: Boolean=false);
+  Params: TJSONObjectDecoderParams; const RowID: TID; ReplaceRowIDWithID: Boolean);
 var tmp: TSynTempBuffer;
     P: PUTF8Char;
 begin
@@ -27806,15 +27824,20 @@ end;
 
 { TSQLTableJSON }
 
-function TSQLTableJSON.PrivateCopyChanged(aJSON: PUTF8Char; aLen: integer): boolean;
+function TSQLTableJSON.PrivateCopyChanged(aJSON: PUTF8Char; aLen: integer;
+  aUpdateHash: boolean): boolean;
 var Hash: cardinal;
 begin
-  Hash := crc32c(0,pointer(aJSON),aLen);
-  result := (fPrivateCopyHash=0) or (Hash=0) or (Hash<>fPrivateCopyHash);
-  if not result then
-    exit;
-  FastSetString(fPrivateCopy,aJSON,aLen+16); // +16 for SSE4.2 read-ahead
-  fPrivateCopyHash := Hash;
+  if aUpdateHash then begin
+    Hash := crc32c(0,pointer(aJSON),aLen);
+    result := (fPrivateCopyHash=0) or (Hash=0) or (Hash<>fPrivateCopyHash);
+    if not result then
+      exit;
+    fPrivateCopyHash := Hash;
+  end else
+    result := true; // from Create() for better performance on single use
+  FastSetString(fPrivateCopy,nil,aLen+16); // +16 for SSE4.2 read-ahead
+  MoveFast(pointer(aJSON)^,pointer(fPrivateCopy)^,aLen+1); // +1 for trailing #0
 end;
 
 function TSQLTableJSON.ParseAndConvert(Buffer: PUTF8Char; BufferLen: integer): boolean;
@@ -27955,7 +27978,7 @@ function TSQLTableJSON.UpdateFrom(const aJSON: RawUTF8; var Refreshed: boolean;
 var len: Integer;
 begin
   len := length(aJSON);
-  if PrivateCopyChanged(pointer(aJSON),len) then
+  if PrivateCopyChanged(pointer(aJSON),len,{updatehash=}true) then
     if ParseAndConvert(pointer(fPrivateCopy),len) then begin
      // parse success from new aJSON data -> need some other update?
      if Assigned(fIDColumn) then begin
@@ -27986,7 +28009,7 @@ constructor TSQLTableJSON.Create(const aSQL, aJSON: RawUTF8);
 var len: integer;
 begin
   len := length(aJSON);
-  FastSetString(fPrivateCopy,pointer(aJSON),len+16); // +16 for SSE4.2 read-ahead
+  PrivateCopyChanged(pointer(aJSON),len,{updatehash=}false);
   Create(aSQL,pointer(fPrivateCopy),len);
 end;
 
@@ -28002,7 +28025,7 @@ constructor TSQLTableJSON.CreateFromTables(const Tables: array of TSQLRecordClas
 var len: integer;
 begin
   len := length(aJSON);
-  FastSetString(fPrivateCopy,pointer(aJSON),len+16);
+  PrivateCopyChanged(pointer(aJSON),len,{updatehash=}false);
   CreateFromTables(Tables,aSQL,pointer(fPrivateCopy),len);
 end;
 
@@ -28018,7 +28041,7 @@ constructor TSQLTableJSON.CreateWithColumnTypes(const ColumnTypes: array of TSQL
 var len: integer;
 begin
   len := length(aJSON);
-  FastSetString(fPrivateCopy,pointer(aJSON),len+16);
+  PrivateCopyChanged(pointer(aJSON),len,{updatehash=}false);
   CreateWithColumnTypes(ColumnTypes,aSQL,pointer(fPrivateCopy),len);
 end;
 
@@ -28979,14 +29002,16 @@ begin
   tkInt64{$ifdef FPC},tkQWord{$endif}:
     result := GetInt64Prop(Instance)=0;
   tkLString,{$ifdef HASVARUSTRING}tkUString,{$endif}{$ifdef FPC}tkLStringOld,{$endif}
-  tkWString,tkDynArray,tkClass,tkInterface: begin
+  tkWString,tkDynArray,tkInterface: begin
     p := GetFieldAddr(Instance);
     result := (p<>nil) and (p^=nil);
   end;
   tkVariant: begin
     p := GetFieldAddr(Instance);
-    result := (p<>nil) and VarDataIsEmptyOrNull(p^);
+    result := (p<>nil) and VarDataIsEmptyOrNull(p);
   end;
+  tkClass:
+    result := IsObjectDefaultOrVoid(GetObjProp(Instance));
   else result := false;
   end;
 end;
@@ -29459,7 +29484,7 @@ begin
     end else
     result := @NULL_SHORTSTRING;
 end;
-{$else}
+{$else} {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // eax=PEnumType edx=Value
         xor     ecx, ecx
         {$ifdef FPC_ENUMHASINNER}
@@ -30234,10 +30259,10 @@ end;
 function SQLFromSelect(const TableName, Select, Where, SimpleFields: RawUTF8): RawUTF8;
 begin
   if Select='*' then
-     // don't send BLOB values to query: retrieve all other fields
-    result := 'SELECT '+SimpleFields  else
-    result := 'SELECT '+Select;
-  result := result+' FROM '+TableName+SQLFromWhere(Where);
+    // don't send BLOB values to query: retrieve simple = all non-blob fields
+    result := SimpleFields else
+    result := Select;
+  result := 'SELECT '+result+' FROM '+TableName+SQLFromWhere(Where);
 end;
 
 function SelectInClause(const PropName: RawUTF8; const Values: array of RawUTF8;
@@ -30471,7 +30496,7 @@ begin
   fTableMapCount := 0;
   fFillCurrentRow :=  0;
   // release TSQLRecordMany.fDestID^ instances set by TSQLRecord.FillPrepareMany()
-  for i := 0 to high(fTableMapRecordManyInstances) do
+  for i := 0 to length(fTableMapRecordManyInstances)-1 do
   with fTableMapRecordManyInstances[i] do begin
     TObject(fDestID^).Free;
     fDestID^ := 0;
@@ -30493,12 +30518,12 @@ end;
 { TSQLRecord }
 
 constructor TSQLRecord.Create;
-var i: integer;
+var i: PtrInt;
 begin
   // auto-instanciate any TSQLRecordMany instance
   with RecordProps do
     if pointer(ManyFields)<>nil then
-    for i := 0 to high(ManyFields) do
+    for i := 0 to length(ManyFields)-1 do
       ManyFields[i].SetInstance(self,TSQLRecordClass(ManyFields[i].ObjectClass).Create);
 end;
 
@@ -30511,14 +30536,14 @@ begin
 end;
 
 function TSQLRecord.CreateCopy: TSQLRecord;
-var f: integer;
+var f: PtrInt;
 begin
   // create new instance
   result := RecordClass.Create;
   // copy properties content
   result.fID := fID;
   with RecordProps do
-    for f := 0 to high(CopiableFields) do
+    for f := 0 to length(CopiableFields)-1 do
       CopiableFields[f].CopyValue(self,result);
 end;
 
@@ -30886,7 +30911,7 @@ function TSQLRecord.SetFieldSQLVars(const Values: TSQLVarDynArray): boolean;
 var max, field: integer;
 begin
   result := false;
-  max := high(Values);
+  max := length(Values)-1;
   with RecordProps do begin
     // expect exact Values[] type match with FieldType[]
     if max<>Fields.Count-1 then // must match field count
@@ -31061,17 +31086,21 @@ end;
 {$ifndef NOVARIANTS}
 procedure TSQLRecord.ForceVariantFieldsOptions(aOptions: TDocVariantOptions);
 var i: integer;
+    p: TSQLPropInfo;
 begin
   if self<>nil then
   with RecordProps do
   if sftVariant in HasTypeFields then
   for i := 0 to Fields.Count-1 do
-    with TSQLPropInfoRTTIVariant(Fields.List[i]) do
-    if (SQLFieldType=sftVariant) and InheritsFrom(TSQLPropInfoRTTIVariant) then
-      if PropInfo.GetterIsField then
+  begin
+    p := Fields.List[i];
+    if (p.SQLFieldType=sftVariant) and p.InheritsFrom(TSQLPropInfoRTTIVariant) then
+      with TSQLPropInfoRTTIVariant(p) do
+        if PropInfo.GetterIsField then
         with _Safe(PVariant(PropInfo.GetterAddr(self))^)^ do
           if Count>0 then
             Options := aOptions;
+  end;
 end;
 {$endif}
 
@@ -31202,9 +31231,12 @@ begin
     fields := Props.Props.Fields;
     case Props.Kind of
     rFTS3, rFTS4, rFTS5: begin
-      if (Props.fFTSWithoutContentFields<>'') and (Props.fFTSWithoutContentTableIndex>=0) then
+      if (Props.fFTSWithoutContentFields<>'') and (Props.fFTSWithoutContentTableIndex>=0) then begin
         result := FormatUTF8('%content="%",',[result,
           aModel.Tables[Props.fFTSWithoutContentTableIndex].SQLTableName]);
+        if Props.Kind = rFTS5 then
+           result := FormatUTF8('%content_rowid="ID",',[result]);
+      end;
       for i := 0 to fields.Count-1 do
         result := result+fields.List[i].Name+',';
       tokenizer := 'simple';
@@ -31261,7 +31293,7 @@ begin
   if self=nil then
     exit;
   with RecordProps do
-    for i := 0 to High(SimpleFields) do
+    for i := 0 to length(SimpleFields)-1 do
     with SimpleFields[i] do begin
       // format is 'COL1='VAL1', COL2='VAL2'' }
       GetValueVar(self,true,V,@wasString);
@@ -31286,7 +31318,7 @@ begin
     if HasNotSimpleFields then // get 'COL1,COL2': no 'ID,' for INSERT (false below)
       result := SQLTableSimpleFieldsNoRowID; // always <> '*'
     result := result+' VALUES (';
-    for i := 0 to high(SimpleFields) do
+    for i := 0 to length(SimpleFields)-1 do
     with SimpleFields[i] do begin
       GetValueVar(self,true,V,@wasString);
       if wasString then
@@ -31322,7 +31354,7 @@ begin
      (PSQLRecordClass(Reference)^<>PSQLRecordClass(Self)^) or (Reference.fID<>fID) then
     exit;
   with RecordProps do
-    for i := 0 to high(SimpleFields) do
+    for i := 0 to length(SimpleFields)-1 do
       // compare not TSQLRawBlob/TSQLRecordMany fields
       with SimpleFields[i] do
         if CompareValue(self,Reference,false)<>0 then
@@ -31343,7 +31375,7 @@ begin
   if (PSQLRecordClass(Reference)^=PSQLRecordClass(self)^) then begin
     // faster comparison on same exact class
     with RecordProps do
-    for i := 0 to high(SimpleFields) do
+    for i := 0 to length(SimpleFields)-1 do
       // compare not TSQLRawBlob/TSQLRecordMany fields
       with SimpleFields[i] do
         if CompareValue(self,Reference,false)<>0 then
@@ -31352,7 +31384,7 @@ begin
     // comparison of all properties of Reference against self
     This := RecordProps;
     Ref := Reference.RecordProps;
-    for i := 0 to high(Ref.SimpleFields) do
+    for i := 0 to length(Ref.SimpleFields)-1 do
     with Ref.SimpleFields[i] do begin
       // compare not TSQLRawBlob/TSQLRecordMany fields
       O := This.Fields.ByRawUTF8Name(Name);
@@ -31374,13 +31406,13 @@ begin
   fID := 0;
   with RecordProps do
     if fFill.JoinedFields then begin
-      for i := 0 to high(CopiableFields) do
+      for i := 0 to length(CopiableFields)-1 do
         if CopiableFields[i].SQLFieldType<>sftID then
           CopiableFields[i].SetValue(self,nil,false) else
           TSQLRecord(TSQLPropInfoRTTIInstance(CopiableFields[i]).GetInstance(Self)).
             ClearProperties; // clear nested allocated TSQLRecord
     end else
-    for i := 0 to high(CopiableFields) do
+    for i := 0 to length(CopiableFields)-1 do
       CopiableFields[i].SetValue(self,nil,false);
 end;
 
@@ -31410,7 +31442,7 @@ begin
 end;
 {$else}
 function TSQLRecord.RecordClass: TSQLRecordClass;
-asm
+{$ifdef FPC} nostackframe; assembler; {$endif} asm
         test    eax, eax
         jz      @z
         mov     eax, [eax]
@@ -31427,7 +31459,7 @@ begin
 end;
 {$else}
 function TSQLRecord.ClassProp: PClassProp;
-asm
+{$ifdef FPC} nostackframe; assembler; {$endif} asm
         test    eax, eax
         jz      @z // avoid GPF
         mov     eax, [eax] // get ClassType of this TSQLRecord instance
@@ -31577,7 +31609,7 @@ begin
   n := 0;
   with props.props do begin // follow SQL.SelectAllJoined columns
     fFill.AddMapSimpleFields(Self,SimpleFields,n);
-    for i := 1 to high(JoinedFieldsTable) do begin
+    for i := 1 to length(JoinedFieldsTable)-1 do begin
       instance := JoinedFieldsTable[i].Create;
       JoinedFields[i-1].SetInstance(self,instance);
       fFill.AddMapSimpleFields(instance,JoinedFieldsTable[i].RecordProps.SimpleFields,n);
@@ -31740,7 +31772,7 @@ begin
   end;
   SQLFieldsCount := 0;
   aField := 'A00';
-  for f := 0 to high(ObjectsClass) do
+  for f := 0 to length(ObjectsClass)-1 do
     with ObjectsClass[f].RecordProps do begin
       PWord(@aField[2])^ := ord('I')+ord('D')shl 8;
       if not AddField(nil) then
@@ -31750,7 +31782,7 @@ begin
           aSQLFields := aSQLFields+',';
           aSQLFields := FormatUTF8('%%.RowID %',[aSQLFields,aField[1],aField]);
       end;
-      for i := 0 to high(SimpleFields) do
+      for i := 0 to length(SimpleFields)-1 do
       with SimpleFields[i] do begin
         if (f and 1=0) {self/dest} or
            not(IdemPropNameU(Name,'SOURCE') or
@@ -32187,7 +32219,7 @@ var f, i: integer;
     Value: RawUTF8;
     Validate: TSynValidate;
     ValidateRest: TSynValidateRest absolute Validate;
-    wasTSynValidateRest: boolean;
+    valid: boolean;
 begin
   result := '';
   if (self=nil) or IsZero(aFields) then
@@ -32202,29 +32234,21 @@ begin
       if Validate.InheritsFrom(TSynValidate) then begin
         if Value='' then
           Fields.List[f].GetValueVar(self,false,Value,nil);
-        wasTSynValidateRest := Validate.InheritsFrom(TSynValidateRest);
-        if wasTSynValidateRest then begin // set additional parameters
-          ValidateRest.fProcessRec := self;
-          ValidateRest.fProcessRest := aRest;
-        end;
-        try
-          if not Validate.Process(f,Value,result) then begin
-            // TSynValidate process failed -> notify caller
-            if aInvalidFieldIndex<>nil then
-              aInvalidFieldIndex^ := f;
-            if aValidator<>nil then
-              aValidator^ := Validate;
-            if result='' then
-              // no custom message -> show a default message
-              result := format(sValidationFailed,[
-                GetCaptionFromClass(Validate.ClassType)]);
-            exit;
-          end;
-        finally
-          if wasTSynValidateRest then begin // reset additional parameters
-            ValidateRest.fProcessRec := nil;
-            ValidateRest.fProcessRest := nil;
-          end;
+        if Validate.InheritsFrom(TSynValidateRest) then
+          valid := TSynValidateRest(Validate).Validate(f,Value,result, aRest, self)
+        else
+          valid := Validate.Process(f,Value,result);
+        if not valid then begin
+          // TSynValidate process failed -> notify caller
+          if aInvalidFieldIndex<>nil then
+            aInvalidFieldIndex^ := f;
+          if aValidator<>nil then
+            aValidator^ := Validate;
+          if result='' then
+            // no custom message -> show a default message
+            result := format(sValidationFailed,[
+              GetCaptionFromClass(Validate.ClassType)]);
+          exit;
         end;
       end;
     end;
@@ -32270,7 +32294,7 @@ function TSQLRecord.DynArray(const DynArrayFieldName: RawUTF8): TDynArray;
 var F: integer;
 begin
   with RecordProps do
-    for F := 0 to high(DynArrayFields) do
+    for F := 0 to length(DynArrayFields)-1 do
       with DynArrayFields[F] do
       if IdemPropNameU(Name,DynArrayFieldName) then begin
         GetDynArray(self,result);
@@ -32284,7 +32308,7 @@ var F: integer;
 begin
   if DynArrayFieldIndex>0 then
     with RecordProps do
-      for F := 0 to high(DynArrayFields) do
+      for F := 0 to length(DynArrayFields)-1 do
         with DynArrayFields[F] do
         if DynArrayIndex=DynArrayFieldIndex then begin
           GetDynArray(self,result);
@@ -32297,6 +32321,7 @@ procedure TSQLRecord.ComputeFieldsBeforeWrite(aRest: TSQLRest; aOccasion: TSQLEv
 var F: integer;
     types: TSQLFieldTypes;
     i64: Int64;
+    p: TSQLPropInfo;
 begin
   if (self<>nil) and (aRest<>nil) then
     with RecordProps do begin
@@ -32307,18 +32332,20 @@ begin
         include(types,sftCreateTime);
       if integer(types)<>0 then begin
         i64 := aRest.ServerTimestamp;
-        for F := 0 to Fields.Count-1 do
-        with TSQLPropInfoRTTIInt64(Fields.List[f]) do
-        if SQLFieldType in types then
-          fPropInfo.SetInt64Prop(Self,i64);
+        for F := 0 to Fields.Count-1 do begin
+          p := Fields.List[f];
+          if p.SQLFieldType in types then
+            TSQLPropInfoRTTIInt64(p).fPropInfo.SetInt64Prop(Self,i64);
+        end;
       end;
       if sftSessionUserID in HasTypeFields then begin
         i64 := aRest.GetCurrentSessionUserID;
         if i64<>0 then
-          for F := 0 to Fields.Count-1 do
-          with TSQLPropInfoRTTIInt64(Fields.List[f]) do
-          if SQLFieldType=sftSessionUserID then
-            fPropInfo.SetInt64Prop(Self,i64);
+          for F := 0 to Fields.Count-1 do begin
+            p := Fields.List[f];
+            if p.SQLFieldType=sftSessionUserID then
+              TSQLPropInfoRTTIInt64(p).fPropInfo.SetInt64Prop(Self,i64);
+          end;
       end;
     end;
 end;
@@ -32542,7 +32569,7 @@ begin
   if IdemPropNameU(ExtFieldName,RowIDFieldName) then
     result := -1 else begin
     // search for customized field mapping
-    for result := 0 to high(fExtFieldNamesUnQuotedSQL) do
+    for result := 0 to length(fExtFieldNamesUnQuotedSQL)-1 do
       if IdemPropNameU(ExtFieldName,fExtFieldNamesUnQuotedSQL[result]) then
         exit;
     result := -2; // indicates not found
@@ -32647,7 +32674,7 @@ procedure TSQLModelRecordProperties.SetKind(Value: TSQLRecordVirtualKind);
         result := TableName+IDComma[Kind] else
         result := IDComma[Kind] else
       result := '';
-    for i := 0 to high(Props.SimpleFields) do begin
+    for i := 0 to length(Props.SimpleFields)-1 do begin
       if withTableName then
         result := result+TableName;
       result := result+Props.SimpleFields[i].Name+','; // valid simple fields
@@ -32830,7 +32857,7 @@ begin
       // JoinedFieldsTable[0] is the class itself
       with Props.Props do begin
         W.Add('%.RowID as `%.RowID`,',[SQLTableName,SQLTableName]);
-        for f := 0 to High(SimpleFields) do
+        for f := 0 to length(SimpleFields)-1 do
           if SimpleFields[f].SQLFieldType<>sftID then
             W.Add('%.% as `%.%`,',[SQLTableName,SimpleFields[f].Name,
               SQLTableName,SimpleFields[f].Name]);
@@ -33413,10 +33440,10 @@ begin
 end;
 
 procedure TSQLModel.PurgeOlderThan(MinutesFromNow: cardinal);
-var i: integer;
+var i: PtrInt;
 begin
   if fLocks<>nil then
-    for i := 0 to high(fLocks) do
+    for i := 0 to length(fLocks)-1 do
      fLocks[i].PurgeOlderThan(MinutesFromNow);
 end;
 
@@ -33449,9 +33476,9 @@ begin
 end;
 
 procedure TSQLModel.UnLockAll;
-var i: integer;
+var i: PtrInt;
 begin
-  for i := 0 to high(fLocks) do
+  for i := 0 to length(fLocks)-1 do
     fLocks[i].Count := 0;
 end;
 
@@ -35129,7 +35156,7 @@ begin
   result := false;
   if OneFieldValues(Table,'RowID',SQLWhere,TInt64DynArray(IDs)) and
      (IDs<>nil) then begin
-    for i := 0 to high(IDs) do
+    for i := 0 to length(IDs)-1 do
       if not RecordCanBeUpdated(Table,IDs[i],seDelete) then
         exit;
     fCache.NotifyDeletions(tableIndex,TInt64DynArray(IDs));
@@ -35588,7 +35615,7 @@ begin
   with Value.RecordProps do
   if BlobFields<>nil then begin
     TableIndex := self.fModel.GetTableIndexExisting(PSQLRecordClass(Value)^);
-    for i := 0 to high(BlobFields) do begin
+    for i := 0 to length(BlobFields)-1 do begin
       BlobFields[i].PropInfo.GetLongStrProp(Value,BlobData);
       if not EngineUpdateBlob(TableIndex,Value.fID,BlobFields[i].PropInfo,BlobData) then
         exit;
@@ -35607,7 +35634,7 @@ begin
   with Value.RecordProps do
   if BlobFields<>nil then begin
     TableIndex := self.fModel.GetTableIndexExisting(PSQLRecordClass(Value)^);
-    for i := 0 to high(BlobFields) do
+    for i := 0 to length(BlobFields)-1 do
       if EngineRetrieveBlob(TableIndex,Value.fID,BlobFields[i].PropInfo,BlobData) then
         BlobFields[i].PropInfo.SetLongStrProp(Value,BlobData) else
         exit;
@@ -36064,30 +36091,30 @@ end;
 { TSQLRestCache }
 
 constructor TSQLRestCache.Create(aRest: TSQLRest);
-var i: integer;
+var i: PtrInt;
 begin
   if aRest=nil then
     EBusinessLayerException.CreateUTF8('%.Create',[self]);
   fRest := aRest;
   SetLength(fCache,length(fRest.Model.Tables));
-  for i := 0 to high(fCache) do
+  for i := 0 to length(fCache)-1 do
     fCache[i].Init;
 end;
 
 destructor TSQLRestCache.Destroy;
-var i: integer;
+var i: PtrInt;
 begin
-  for i := 0 to high(fCache) do
+  for i := 0 to length(fCache)-1 do
     fCache[i].Done;
   inherited;
 end;
 
 function TSQLRestCache.CachedEntries: cardinal;
-var i,j: integer;
+var i,j: PtrInt;
 begin
   result := 0;
   if self<>nil then
-    for i := 0 to high(fCache) do
+    for i := 0 to length(fCache)-1 do
       with fCache[i] do
       if CacheEnable then begin
         Mutex.Lock;
@@ -36102,18 +36129,18 @@ begin
 end;
 
 function TSQLRestCache.CachedMemory(FlushedEntriesCount: PInteger): cardinal;
-var i: integer;
+var i: PtrInt;
 begin
   result := 0;
   if FlushedEntriesCount<>nil then
     FlushedEntriesCount^ := 0;
   if self<>nil then
-    for i := 0 to high(fCache) do
+    for i := 0 to length(fCache)-1 do
       inc(result,fCache[i].CachedMemory(FlushedEntriesCount));
 end;
 
 function TSQLRestCache.SetTimeOut(aTable: TSQLRecordClass; aTimeoutMS: Cardinal): boolean;
-var i: integer;
+var i: PtrInt;
 begin
   result := false;
   if (self=nil) or (aTable=nil) then
@@ -36183,7 +36210,7 @@ end;
 
 function TSQLRestCache.SetCache(aTable: TSQLRecordClass; const aIDs: array of TID): boolean;
 var i: cardinal;
-    j: integer;
+    j: PtrInt;
 begin
   result := false;
   if (self=nil) or (aTable=nil) or (length(aIDs)=0) then
@@ -36205,10 +36232,10 @@ begin
 end;
 
 procedure TSQLRestCache.Clear;
-var i: integer;
+var i: PtrInt;
 begin
   if self<>nil then
-  for i := 0 to high(fCache) do
+  for i := 0 to length(fCache)-1 do
     fCache[i].Clear;
 end;
 
@@ -36235,10 +36262,10 @@ begin
 end;
 
 procedure TSQLRestCache.Flush;
-var i: integer;
+var i: PtrInt;
 begin
   if self<>nil then
-  for i := 0 to high(fCache) do
+  for i := 0 to length(fCache)-1 do
     fCache[i].FlushCacheAllEntries; // include *CriticalSection(Mutex)
 end;
 
@@ -36263,7 +36290,7 @@ begin
 end;
 
 procedure TSQLRestCache.Flush(aTable: TSQLRecordClass; const aIDs: array of TID);
-var i: integer;
+var i: PtrInt;
 begin
   if (self<>nil) and (length(aIDs)>0) then
     with fCache[fRest.Model.GetTableIndexExisting(aTable)] do
@@ -36324,7 +36351,7 @@ begin
 end;
 
 procedure TSQLRestCache.NotifyDeletions(aTableIndex: integer; const aIDs: array of Int64);
-var i: integer;
+var i: PtrInt;
 begin
   if (self<>nil) and (high(aIDs)>=0) and
      (Cardinal(aTableIndex)<Cardinal(Length(fCache))) then
@@ -37401,17 +37428,16 @@ begin
     exit;
   InternalURI(Call^);
   if ((Sender=nil) or OnIdleBackgroundThreadActive) and
-      not(isDestroying in fInternalState) then
+      not(isDestroying in fInternalState) then begin
     if (Call^.OutStatus=HTTP_NOTIMPLEMENTED) and (isOpened in fInternalState) then begin
       InternalClose; // force recreate connection
       Exclude(fInternalState,isOpened);
-      if ((Sender=nil) or OnIdleBackgroundThreadActive) then begin
+      if ((Sender=nil) or OnIdleBackgroundThreadActive) then
         InternalURI(Call^); // try request again
-        if Call^.OutStatus<>HTTP_NOTIMPLEMENTED then
-          Include(fInternalState,isOpened);
-      end;
-    end else
+    end;
+    if Call^.OutStatus<>HTTP_NOTIMPLEMENTED then
       Include(fInternalState,isOpened);
+  end;
 end;
 
 function TSQLRestClientURI.GetOnIdleBackgroundThreadActive: boolean;
@@ -40153,13 +40179,13 @@ begin
           // let SQLite3 do the sort and the paging (will be ignored by Static)
           SQLWhereCount := SQLWhere; // "select count(*)" won't expect any ORDER
           if (SQLSort<>'') and
-             not ContainsUTF8(pointer(SQLWhere),'ORDER BY') then begin
+             (StrPosI('ORDER BY ',pointer(SQLWhere))=nil) then begin
             if SameTextU(SQLDir,'DESC') then
               SQLSort := SQLSort+' DESC'; // allow DESC, default is ASC
             SQLWhere := SQLWhere+' ORDER BY '+SQLSort;
           end;
           SQLWhere := trim(SQLWhere);
-          if (SQLResults<>0) and not ContainsUTF8(pointer(SQLWhere),'LIMIT ') then begin
+          if (SQLResults<>0) and (StrPosI('LIMIT ',pointer(SQLWhere))=nil) then begin
             if (Server.URIPagingParameters.SendTotalRowsCountFmt<>'') then begin
               if SQLWhere=SQLWhereCount then begin
                 i := PosEx('ORDER BY ',UpperCase(SQLWhereCount));
@@ -40923,7 +40949,7 @@ begin
   if FileTime=0 then
     if Error404Redirect<>'' then
       Redirect(Error404Redirect) else
-      Error('',HTTP_NOTFOUND) else begin
+      Error('',HTTP_NOTFOUND,CacheControlMaxAge) else begin
     if not ExistsIniName(pointer(Call.OutHead),HEADER_CONTENT_TYPE_UPPER) then begin
       if Call.OutHead<>'' then
         Call.OutHead := Call.OutHead+#13#10;
@@ -47887,7 +47913,8 @@ begin
   fSafe.Done;
 end;
 
-function TJSONSerializerRegisteredClass.Find(JSON: PUTF8Char; AndRegisterClass: boolean): TClass;
+function TJSONSerializerRegisteredClass.Find(JSON: PUTF8Char;
+  AndRegisterClass: boolean): TClass;
 var token: shortstring;
     ClassNameValue: PUTF8Char;
     ClassNameLen: integer;
@@ -47935,7 +47962,8 @@ begin
   end;
 end;
 
-function TJSONSerializerRegisteredClass.Find(aClassName: PUTF8Char; aClassNameLen: integer): TClass;
+function TJSONSerializerRegisteredClass.Find(aClassName: PUTF8Char;
+  aClassNameLen: integer): TClass;
 var i: integer;
 begin
   result := nil;
@@ -48105,7 +48133,7 @@ begin
 end;
 
 function JSONToNewObject(var From: PUTF8Char; var Valid: boolean;
-  Options: TJSONToObjectOptions=[]): TObject;
+  Options: TJSONToObjectOptions): TObject;
 var ItemClass: TClass;
     ItemInstance: TClassInstance;
 begin
@@ -48196,8 +48224,7 @@ begin
 end;
 
 function JSONSettingsToObject(var InitialJsonContent: RawUTF8; Instance: TObject): boolean;
-var
-  tmp: TSynTempBuffer;
+var tmp: TSynTempBuffer;
 begin
   result := false;
   if InitialJsonContent='' then
@@ -48688,16 +48715,16 @@ begin
 end;
 
 function UrlDecodeObject(U: PUTF8Char; Upper: PAnsiChar; var ObjectInstance;
-  Next: PPUTF8Char=nil; Options: TJSONToObjectOptions=[]): boolean;
+  Next: PPUTF8Char; Options: TJSONToObjectOptions): boolean;
 var tmp: RawUTF8;
 begin
-  result := UrlDecodeValue(U, Upper, tmp, Next);
+  result := UrlDecodeValue(U,Upper,tmp,Next);
   if result then
     JSONToObject(ObjectInstance,Pointer(tmp),result,nil,Options);
 end;
 
 function JSONFileToObject(const JSONFile: TFileName; var ObjectInstance;
-  TObjectListItemClass: TClass=nil; Options: TJSONToObjectOptions=[]): boolean;
+  TObjectListItemClass: TClass; Options: TJSONToObjectOptions): boolean;
 var tmp: RawUTF8;
 begin
   tmp := AnyTextFileToRawUTF8(JSONFile,true);
@@ -48784,6 +48811,25 @@ begin
     end;
     c := GetClassParent(c);
   until c=TObject;
+end;
+
+function IsObjectDefaultOrVoid(Value: TObject): boolean;
+var i: integer;
+    C: TClass;
+    P: PPropinfo;
+begin
+  if Value<>nil then begin
+    result := false;
+    C := Value.ClassType;
+    repeat
+      for i := 1 to InternalClassPropInfo(C,P) do
+        if P^.IsDefaultOrVoid(Value) then
+          P := P^.Next else
+          exit;
+      C := GetClassParent(C);
+    until C=TObject;
+  end;
+  result := true;
 end;
 
 procedure ClearObject(Value: TObject; FreeAndNilNestedObjects: boolean=false);
@@ -48939,7 +48985,7 @@ end;
 procedure TClassInstance.SetCustomComment(var CustomComment: RawUTF8);
 begin
   FormatUTF8('array of {%}',[ClassFieldNamesAllPropsAsText(ItemClass,true)],
-    CustomComment)
+    CustomComment);
 end;
 
 {$ifdef MSWINDOWS}
@@ -49181,7 +49227,7 @@ begin
   InterlockedDecrement(fRefCount); // fRefCount=1 in NewInstance
 end;
 {$else}
-asm
+{$ifdef FPC} nostackframe; assembler; {$endif} asm
   lock dec [eax].TInterfacedObject.fRefCount
 end;
 {$endif}
@@ -49251,18 +49297,34 @@ begin
   fts := Props.Props.SQLTableName;
   ftsfields := Props.Props.SQLTableSimpleFieldsNoRowID;
   // see http://www.sqlite.org/fts3.html#*fts4content
-  Server.ExecuteFmt('CREATE TRIGGER %_bu BEFORE UPDATE ON % '+
-    'BEGIN DELETE FROM % WHERE docid=old.rowid; END;',
-    [main,main,fts]);
-  Server.ExecuteFmt('CREATE TRIGGER %_bd BEFORE DELETE ON % '+
-    'BEGIN DELETE FROM % WHERE docid=old.rowid; END;',
-    [main,main,fts]);
-  Server.ExecuteFmt('CREATE TRIGGER %_au AFTER UPDATE ON % '+
-    'BEGIN INSERT INTO %(docid,%) VALUES(new.rowid%); END;',
-    [main,main,fts,ftsfields,Props.fFTSWithoutContentFields]);
-  Server.ExecuteFmt('CREATE TRIGGER %_ai AFTER INSERT ON % '+
-    'BEGIN INSERT INTO %(docid,%) VALUES(new.rowid%); END;',
-    [main,main,fts,ftsfields,Props.fFTSWithoutContentFields]);
+  if Props.Kind=rFTS5 then begin
+    // In fts 5 we can't use docid only rowid, also use insert() values('delete',) to delete record
+    Server.ExecuteFmt('CREATE TRIGGER %_bu BEFORE UPDATE ON % '+
+      'BEGIN INSERT INTO %(%,rowid,%) VALUES(''delete'',old.rowid%); END;',
+      [main,main,fts,fts,ftsfields, StringReplaceAll(Props.fFTSWithoutContentFields, 'new.', 'old.')]);
+    Server.ExecuteFmt('CREATE TRIGGER %_bd BEFORE DELETE ON % '+
+      'BEGIN INSERT INTO %(%,rowid,%) VALUES(''delete'',old.rowid%); END;',
+      [main,main,fts,fts,ftsfields, StringReplaceAll(Props.fFTSWithoutContentFields, 'new.', 'old.')]);
+    Server.ExecuteFmt('CREATE TRIGGER %_au AFTER UPDATE ON % '+
+      'BEGIN INSERT INTO %(rowid,%) VALUES(new.rowid%); END;',
+      [main,main,fts,ftsfields,Props.fFTSWithoutContentFields]);
+    Server.ExecuteFmt('CREATE TRIGGER %_ai AFTER INSERT ON % '+
+      'BEGIN INSERT INTO %(rowid,%) VALUES(new.rowid%); END;',
+      [main,main,fts,ftsfields,Props.fFTSWithoutContentFields]);
+  end else begin
+    Server.ExecuteFmt('CREATE TRIGGER %_bu BEFORE UPDATE ON % '+
+      'BEGIN DELETE FROM % WHERE docid=old.rowid; END;',
+      [main,main,fts]);
+    Server.ExecuteFmt('CREATE TRIGGER %_bd BEFORE DELETE ON % '+
+      'BEGIN DELETE FROM % WHERE docid=old.rowid; END;',
+      [main,main,fts]);
+    Server.ExecuteFmt('CREATE TRIGGER %_au AFTER UPDATE ON % '+
+      'BEGIN INSERT INTO %(docid,%) VALUES(new.rowid%); END;',
+      [main,main,fts,ftsfields,Props.fFTSWithoutContentFields]);
+    Server.ExecuteFmt('CREATE TRIGGER %_ai AFTER INSERT ON % '+
+      'BEGIN INSERT INTO %(docid,%) VALUES(new.rowid%); END;',
+      [main,main,fts,ftsfields,Props.fFTSWithoutContentFields]);
+  end;
 end;
 
 
@@ -50572,29 +50634,46 @@ begin
     aPropertyPointer,aAttributes,aFieldWidth));
 end;
 
+{ TSynValidateRest }
+
+function TSynValidateRest.Process(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string): boolean;
+begin
+  Result := DoValidate(aFieldIndex, Value, ErrorMsg, fProcessRest, fProcessRec);
+end;
+
+function TSynValidateRest.Validate(aFieldIndex: integer; const Value: RawUTF8; var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean;
+begin
+  try
+    fProcessRest := aProcessRest;
+    fProcessRec := aProcessRec;
+    result := DoValidate(aFieldIndex,Value,ErrorMsg,aProcessRest,aProcessRec);
+  finally
+    fProcessRest := nil;
+    fProcessRec := nil;
+  end;
+end;
 
 { TSynValidateUniqueField }
 
-function TSynValidateUniqueField.Process(aFieldIndex: integer; const Value: RawUTF8;
-  var ErrorMsg: string): boolean;
+function TSynValidateUniqueField.DoValidate(aFieldIndex: integer; const Value: RawUTF8;
+  var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean;
 var aID: TID;
 begin
   result := false;
   if Value='' then
     ErrorMsg := sValidationFieldVoid else
-  if (fProcessRest=nil) or (fProcessRec=nil) then
+  if (aProcessRest=nil) or (aProcessRec=nil) then
     result := true else
-  with fProcessRec.RecordProps do
+  with aProcessRec.RecordProps do
     if cardinal(aFieldIndex)>=cardinal(Fields.Count) then
       result := true else begin
-      SetID(fProcessRest.OneFieldValue(Table,'RowID',
+      SetID(aProcessRest.OneFieldValue(Table,'RowID',
         Fields.List[aFieldIndex].Name+'=:('+QuotedStr(Value,'''')+'):'),aID);
-      if (aID>0) and (aID<>fProcessRec.fID) then
+      if (aID>0) and (aID<>aProcessRec.fID) then
         ErrorMsg := sValidationFieldDuplicate else
         result := true;
     end;
 end;
-
 
 { TSynValidateUniqueFields }
 
@@ -50611,22 +50690,22 @@ begin
   end;
 end;
 
-function TSynValidateUniqueFields.Process(aFieldIndex: integer;
-  const Value: RawUTF8; var ErrorMsg: string): boolean;
+function TSynValidateUniqueFields.DoValidate(aFieldIndex: integer;
+  const Value: RawUTF8; var ErrorMsg: string; aProcessRest: TSQLRest; aProcessRec: TSQLRecord): boolean;
 var where: RawUTF8;
     i: integer;
     aID: TID;
 begin
-  if (fProcessRest=nil) or (fProcessRec=nil) or (fFieldNames=nil) then
+  if (aProcessRest=nil) or (aProcessRec=nil) or (fFieldNames=nil) then
     result := true else begin
     for i := 0 to high(fFieldNames) do begin
       if where<>'' then
         where := where+' AND ';
       where := where+fFieldNames[i]+'=:('+
-        QuotedStr(fProcessRec.GetFieldValue(fFieldNames[i]),'''')+'):';
+        QuotedStr(aProcessRec.GetFieldValue(fFieldNames[i]),'''')+'):';
     end;
-    SetID(fProcessRest.OneFieldValue(fProcessRec.RecordClass,'ID',where),aID);
-    if (aID>0) and (aID<>fProcessRec.fID) then begin
+    SetID(aProcessRest.OneFieldValue(aProcessRec.RecordClass,'ID',where),aID);
+    if (aID>0) and (aID<>aProcessRec.fID) then begin
       ErrorMsg := sValidationFieldDuplicate;
       result := false;
     end else
@@ -50897,13 +50976,14 @@ var Added: boolean;
       {$endif NOVARIANTS}
       tkClass: begin
         Obj := P^.GetObjProp(Value);
-        if PropIsIDTypeCastedField(P,IsObj,Value) then begin
-          HR(P);
-          Add(PtrInt(Obj)); // not true instances, but ID
-        end else if Obj<>nil then begin
-          HR(P); // TPersistent or any class defined with $M+
-          WriteObject(Obj,Options);
-        end;
+        if not(woDontStore0 in Options) or not IsObjectDefaultOrVoid(Obj) then
+          if PropIsIDTypeCastedField(P,IsObj,Value) then begin
+            HR(P);
+            Add(PtrInt(Obj)); // not true instances, but ID
+          end else if Obj<>nil then begin
+            HR(P); // TPersistent or any class defined with $M+
+            WriteObject(Obj,Options);
+          end;
       end;
       // tkString (shortstring) and tkInterface is not handled
     end;
@@ -54213,7 +54293,7 @@ begin
           SizeInStack := ARGS_IN_STACK_SIZE[ValueType] else
       {$endif CPU32}
         SizeInStack := PTRSIZ; // always aligned to 8 bytes boundaries for 64-bit
-      if{$ifndef CPUARM}
+      if {$ifndef CPUARM}
         // on ARM, ordinals>PTRSIZ can also be placed in the normal registers !!
         (SizeInStack<>PTRSIZ) or
         {$endif CPUARM}
@@ -57886,32 +57966,17 @@ asm
 end;
 {$endif CPUX64}
 
-{$ifdef ISDELPHI7ANDUP}{$WARN COMPARING_SIGNED_UNSIGNED OFF}{$endif}
-// disable W1023 FPC_STACKALIGNMENT (not possible on Delphi 6)
-
 {$ifdef CPUX86}
 
-{$ifdef FPC}
-  {$ifdef DARWIN}
-    {$define REQUIREX86ALIGNEDSTACK16} // always require aligned stack on OSX
-  {$else}
-    {$if defined(FPC_STACKALIGNMENT) and (FPC_STACKALIGNMENT=16)}
-    {$define REQUIREX86ALIGNEDSTACK16} // e.g. on i386-linux since SVN 43005-43014
-    {$ifend} // https://www.mail-archive.com/fpc-devel@lists.freepascal.org/msg38885.html
-  {$endif DARWIN}
-{$endif FPC}
-
-procedure CallMethod(var Args: TCallMethodArgs); {$ifdef FPC}nostackframe; assembler;{$endif}
+procedure CallMethod(var Args: TCallMethodArgs);
+  {$ifdef FPC}nostackframe; assembler;{$endif}
 asm
         push    esi
         push    ebp
+        push    eax // keep stack aligned on 16 bytes - required on DARWIN
         mov     ebp, esp
         mov     esi, Args
         // copy stack content (if any)
-        {$ifdef REQUIREX86ALIGNEDSTACK16}
-        add     esp, 16
-        and     esp, -16
-        {$endif REQUIREX86ALIGNEDSTACK16}
         mov     eax, [esi].TCallMethodArgs.StackSize
         mov     edx, dword ptr[esi].TCallMethodArgs.StackAddr
         add     edx, eax // pascal/register convention = left-to-right
@@ -57922,7 +57987,9 @@ asm
         push    ecx
         dec     eax
         jnz     @n
-        // call method
+        // before a call instruction, esp should be divisible by 16:
+        // mandatory on Darwin, and also on Linux i386 as stated by Florian in
+        // https://www.mail-archive.com/fpc-devel@lists.freepascal.org/msg38885.html
 @z:     mov     eax, [esi + TCallMethodArgs.ParamRegs + REGEAX * 4 - 4]
         mov     edx, [esi + TCallMethodArgs.ParamRegs + REGEDX * 4 - 4]
         mov     ecx, [esi + TCallMethodArgs.ParamRegs + REGECX * 4 - 4]
@@ -57935,13 +58002,14 @@ asm
         je      @d
         cmp     cl, smvCurrency
         jne     @i
-        fistp   qword[esi].TCallMethodArgs.res64
+        fistp   qword [esi].TCallMethodArgs.res64
         jmp     @e
-@d:     fstp    qword[esi].TCallMethodArgs.res64
+@d:     fstp    qword [esi].TCallMethodArgs.res64
         jmp     @e
 @i:     mov     [esi].TCallMethodArgs.res64.Lo, eax
         mov     [esi].TCallMethodArgs.res64.Hi, edx
 @e:     mov     esp, ebp
+        pop     eax
         pop     ebp
         pop     esi
 end;
@@ -60250,12 +60318,11 @@ begin
     // create the stack and register content
     {$ifdef CPUX86}
     call.StackAddr := PtrInt(@Stack[0]);
-    {$ifdef DARWIN} // require aligned stack
-    a := ArgsSizeInStack+15;
-    call.StackSize := a-(a and 15);
-    {$else}
     call.StackSize := ArgsSizeInStack;
-    {$endif}
+    {$ifndef MSWINDOWS} // ensure always aligned by 16 bytes on POSIX
+    while call.StackSize and 15<>0 do
+      inc(call.StackSize,PTRSIZ); // needed for Darwin and Linux i386
+    {$endif MSWINDOWS}
     {$else}
     {$ifdef CPUINTEL}
     call.StackSize := ArgsSizeInStack shr 3;
@@ -60277,7 +60344,7 @@ begin
     {$endif CPUAARCH64}
     {$endif CPUINTEL}
     {$endif CPUX86}
-    for a := 1 to high(Args) do
+    for a := 1 to length(Args)-1 do
     with Args[a] do begin
       Value := fValues[a];
       if (ValueDirection<>smdConst) or

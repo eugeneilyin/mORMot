@@ -578,7 +578,7 @@ type
   PEPollData = ^TEPollData;
 
   /// epoll descriptor data structure
-  TEPollEvent = {$ifdef CPUX64}packed{$endif} record
+  TEPollEvent = packed record
     events: cardinal;
     data: TEpollData;
   end;
@@ -988,8 +988,8 @@ begin
       Hints2.ai_family := AF_INET6;
       TwoPass := True;
     end else begin
-      Hints2.ai_family := AF_INET;
       Hints1.ai_family := AF_INET6;
+      Hints2.ai_family := AF_INET;
       TwoPass := True;
     end;
   end else

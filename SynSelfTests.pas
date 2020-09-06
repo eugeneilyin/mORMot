@@ -246,7 +246,6 @@ type
   TTestLowLevelCommon = class(TSynTestCase)
   protected
     {$ifndef DELPHI5OROLDER}
-    da: IObjectDynArray; // force the interface to be defined BEFORE the array
     a: array of TSQLRecordPeople;
     {$endif}
     fAdd,fDel: RawUTF8;
@@ -462,6 +461,8 @@ type
     procedure _SHA3;
     /// AES encryption/decryption functions
     procedure _AES256;
+    /// AES-GCM encryption/decryption with authentication
+    procedure _AES_GCM;
     /// RC4 encryption function
     procedure _RC4;
     /// Base-64 encoding/decoding functions
@@ -3040,7 +3041,6 @@ var buf: RawByteString;
 {$ifdef HASCPUIDX64} var cpu: TX64CpuFeatures; {$endif}
 begin
   SetLength(buf,16 shl 20); // 16MB
-  Validate({rtl=}true);
   {$ifdef HASCPUIDX64} // activate and validate SSE2 + AVX branches
   cpu := CPUIDX64;
   CPUIDX64 := []; // default SSE2 128-bit process
@@ -3053,8 +3053,12 @@ begin
   {$endif FPC}
   CPUIDX64 := cpu; // there is no AVX2 move/fillchar (still 256-bit wide)
   if (cpu<>[]) and (cpu<>[cpuAvx]) and (cpu<>[cpuAvx,cpuAvx2]) then
-  {$endif HASCPUIDX64}
     Validate;
+  // no Validate(true): RedirectCode(@System.FillChar,@FillcharFast)
+  {$else}
+  Validate({rtl=}true);
+  Validate(false);
+  {$endif HASCPUIDX64}
 end;
 {$endif CPUINTEL}
 
@@ -3158,7 +3162,7 @@ begin
   str := UTF8ToString(UrlEncode(StringToUTF8('https://test3.diavgeia.gov.gr/doc/')));
   check(str='https%3A%2F%2Ftest3.diavgeia.gov.gr%2Fdoc%2F');
   Test('abcdef','abcdef');
-  Test('abcdefyzABCDYZ01239_-.~ ','abcdefyzABCDYZ01239_-.~+');
+  Test('abcdefyzABCDYZ01239_-.~ ','abcdefyzABCDYZ01239_-.%7E+');
   Test('"Aardvarks lurk, OK?"','%22Aardvarks+lurk%2C+OK%3F%22');
   Test('"Aardvarks lurk, OK%"','%22Aardvarks+lurk%2C+OK%25%22');
   Test('where=name like :(''Arnaud%'')','where%3Dname+like+%3A%28%27Arnaud%25%27%29');
@@ -3739,9 +3743,9 @@ begin
       int.Unique(tmp,SmallUInt32UTF8[v]);
       check(UTF8ToInteger(tmp)=v);
     end;
-    check(int.Count=512);
-    check(int.Clean=0);
-    check(int.Count=512);
+    checkEqual(int.Count,512);
+    checkEqual(int.Clean,0);
+    checkEqual(int.Count,512);
   finally
     int.Free;
   end;
@@ -3907,6 +3911,7 @@ var crc: array[0..10000] of record
       crc: cardinal;
     end;
     totallen: Cardinal;
+    s2: RawByteString;
 procedure Test(hash: THasher; const name: string);
 var i: Integer;
     Timer: TPrecisionTimer;
@@ -4032,6 +4037,11 @@ begin
     hmac32.Init(@c1,4);
     hmac32.Update(pointer(s),length(s));
     check(hmac32.Done=c2);
+    s2 := s;
+    SymmetricEncrypt(i, s2);
+    check(s2 <> s);
+    SymmetricEncrypt(i, s2);
+    check(s2 = s);
   end;
   Test(crc32creference,'pas');
   Test(crc32cfast,'fast');
@@ -4383,6 +4393,8 @@ begin
   CheckEqual(TestAddFloatStr('12.3e 230'),'12.3e');
   CheckEqual(TestAddFloatStr('12.3f230'),'12.3');
   CheckEqual(TestAddFloatStr('12.3E23.0'),'12.3E23');
+  CheckEqual(TestAddFloatStr('-.01'),'-0.01'); // ODBC numeric output
+  CheckEqual(TestAddFloatStr('.0002'),'0.0002'); // ODBC numeric output
   CheckEqual(OctToBin(''),'');
   CheckEqual(OctToBin('123'),'123');
   CheckEqual(OctToBin('\\123'),'\123');
@@ -4511,9 +4523,68 @@ begin
   Check(u='40640.5028819444',u);
   e := 40640.5028819444;
   CheckSame(d,e,1e-11);
+  Check(IsAnsiCompatible('t'));
+  Check(IsAnsiCompatible('te'));
+  Check(IsAnsiCompatible('tes'));
+  Check(IsAnsiCompatible('test'));
+  Check(IsAnsiCompatible('teste'));
   CheckDoubleToShort(0,'0');
   CheckDoubleToShort(1,'1');
   CheckDoubleToShort(-1,'-1');
+  CheckDoubleToShort(0.1,'0.1');
+  CheckDoubleToShort(0.01,'0.01');
+  CheckDoubleToShort(0.001,'0.001');
+  CheckDoubleToShort(0.0001,'0.0001');
+  CheckDoubleToShort(-0.1,'-0.1');
+  CheckDoubleToShort(-0.01,'-0.01');
+  CheckDoubleToShort(-0.001,'-0.001');
+  CheckDoubleToShort(-0.0001,'-0.0001');
+  CheckDoubleToShort(1.1,'1.1');
+  CheckDoubleToShort(1.01,'1.01');
+  CheckDoubleToShort(1.001,'1.001');
+  CheckDoubleToShort(1.0001,'1.0001');
+  CheckDoubleToShort(1.00001,'1.00001');
+  CheckDoubleToShort(-1.1,'-1.1');
+  CheckDoubleToShort(-1.01,'-1.01');
+  CheckDoubleToShort(-1.001,'-1.001');
+  CheckDoubleToShort(-1.0001,'-1.0001');
+  CheckDoubleToShort(-1.00001,'-1.00001');
+  CheckDoubleToShort(7,'7');
+  CheckDoubleToShort(-7,'-7');
+  CheckDoubleToShort(0.7,'0.7');
+  CheckDoubleToShort(0.07,'0.07');
+  CheckDoubleToShort(0.007,'0.007');
+  CheckDoubleToShort(0.0007,'0.0007');
+  CheckDoubleToShort(-0.7,'-0.7');
+  CheckDoubleToShort(-0.07,'-0.07');
+  CheckDoubleToShort(-0.007,'-0.007');
+  CheckDoubleToShort(-0.0007,'-0.0007');
+  CheckDoubleToShort(7.7,'7.7');
+  CheckDoubleToShort(7.07,'7.07');
+  CheckDoubleToShort(7.007,'7.007');
+  CheckDoubleToShort(7.0007,'7.0007');
+  CheckDoubleToShort(7.00007,'7.00007');
+  CheckDoubleToShort(-7.7,'-7.7');
+  CheckDoubleToShort(-7.07,'-7.07');
+  CheckDoubleToShort(-7.007,'-7.007');
+  CheckDoubleToShort(-7.0007,'-7.0007');
+  CheckDoubleToShort(-7.00007,'-7.00007');
+  {$ifdef FPC}
+  CheckDoubleToShort(0.00001,'0.00001');
+  CheckDoubleToShort(-0.00001,'-0.00001');
+  CheckDoubleToShort(0.00007,'0.00007');
+  CheckDoubleToShort(-0.00007,'-0.00007');
+  {$endif FPC}
+  CheckDoubleToShort(11111.1,'11111.1');
+  CheckDoubleToShort(11111.01,'11111.01');
+  CheckDoubleToShort(11111.001,'11111.001');
+  CheckDoubleToShort(11111.0001,'11111.0001');
+  CheckDoubleToShort(11111.00001,'11111.00001');
+  CheckDoubleToShort(-11111.1,'-11111.1');
+  CheckDoubleToShort(-11111.01,'-11111.01');
+  CheckDoubleToShort(-11111.001,'-11111.001');
+  CheckDoubleToShort(-11111.0001,'-11111.0001');
+  CheckDoubleToShort(-11111.00001,'-11111.00001');
   CheckDoubleToShort(0.9999999999999997,'1');
   CheckDoubleToShort(-0.9999999999999997,'-1');
   CheckDoubleToShort(9.999999999999997,'10');
@@ -4590,10 +4661,6 @@ begin
   Check(ident[1]='x');
   Check(ident[2]='Ftiti');
   Check(ident[3]='Uboat');
-  {$endif}
-  {$ifndef LVCL}
-  {$ifdef ISDELPHIXE}FormatSettings.{$endif}{$ifdef FPC}FormatSettings.{$endif}
-    DecimalSeparator := '.';
   {$endif}
   Check(xxHash32(0,'A',1)=275094093);
   Check(xxHash32(0,'ABACK',5)=314231639);
@@ -4676,6 +4743,7 @@ begin
     u := string(a);
     CheckEqual(TestAddFloatStr(s),s);
     Check(SysUtils.IntToStr(k)=u);
+    Check(IsAnsiCompatible(s));
     Check(Int64ToUtf8(k)=s);
     Check(IntToString(k)=u);
     Check(format('%d',[k])=u);
@@ -5390,6 +5458,10 @@ procedure TTestLowLevelCommon.Iso8601DateAndTime;
     Check(Abs(D-E)<(1/SecsPerDay)); // we allow 999 ms error
     I.From(D);
     Check(Iso8601ToTimeLog(s)=I.Value);
+    t := s;
+    t[11] := ''''; // as in SynDB VArray[] quoted parameters
+    J.From(pointer(t),10);
+    Check(I.Value and not(1 shl (6+6+5)-1)=J.Value);
     I.From(s);
     t := I.Text(Expanded);
     if t<>s then // we allow error on time = 00:00:00 -> I.Text = just date
@@ -6936,6 +7008,7 @@ procedure TTestLowLevelCommon._TObjectDynArrayWrapper;
 const MAX = 10000;
 var i,j: integer;
     s: RawUTF8;
+    da: IObjectDynArray; // force the interface to be defined BEFORE the array
 procedure CheckItem(p: TSQLRecordPeople; i: integer);
 var s: RawUTF8;
 begin
@@ -7753,7 +7826,25 @@ type
     abArr: array of TSubAB;
     cdArr: array of TSubCD;
   end;
-{$ifdef ISDELPHI2010}
+  TNestedDtoObject = class(TSynAutoCreateFields)
+  private
+    FFieldString: RawUTF8;
+    FFieldInteger: integer;
+    FFieldVariant: variant;
+  published
+    property FieldString: RawUTF8 read FFieldString write FFieldString;
+    property FieldInteger: integer read FFieldInteger write FFieldInteger;
+    property FieldVariant: variant read FFieldVariant write FFieldVariant;
+  end;
+  TDtoObject = class(TSynAutoCreateFields)
+  private
+    FFieldNestedObject: TNestedDtoObject;
+    FSomeField: RawUTF8;
+  published
+    property NestedObject: TNestedDtoObject read FFieldNestedObject;
+    property SomeField: RawUTF8 read FSomeField write FSomeField;
+  end;
+  {$ifdef ISDELPHI2010}
   TStaticArrayOfInt = packed array[1..5] of Integer;
   TNewRTTI = record
     Number: integer;
@@ -7808,6 +7899,7 @@ var J,U,U2: RawUTF8;
     JAS: TTestCustomJSONArraySimple;
 {$ifndef NOVARIANTS}
     JAV: TTestCustomJSONArrayVariant;
+    GDtoObject: TDtoObject;
 {$endif}
     Trans: TTestCustomJSON2;
     Disco: TTestCustomDiscogs;
@@ -8275,7 +8367,20 @@ var J,U,U2: RawUTF8;
       end;
     end;
     Check(JAV.D='4');
-  {$endif}
+    GDtoObject := TDtoObject.Create;
+    U := '{"SomeField":"Test"}';
+    Check(ObjectLoadJSON(GDtoObject, U, nil, []),'nestedvariant1');
+     J := ObjectToJSON(GDtoObject, []);
+    CheckEqual(J,'{"NestedObject":{"FieldString":"","FieldInteger":0,'+
+      '"FieldVariant":null},"SomeField":"Test"}');
+    J := ObjectToJSON(GDtoObject, [woDontStore0]);
+    CheckEqual(J,U);
+    U := '{"NestedObject":{"FieldVariant":{"a":1,"b":2}},"SomeField":"Test"}';
+    Check(ObjectLoadJSON(GDtoObject, U, nil, [j2oHandleCustomVariants]),'nestedvariant2');
+    J := ObjectToJSON(GDtoObject, [woDontStore0,woDontStoreEmptyString]);
+    CheckEqual(J,U);
+    GDtoObject.Free;
+  {$endif NOVARIANTS}
 
     Finalize(Cache);
     FillCharFast(Cache,sizeof(Cache),0);
@@ -10066,7 +10171,7 @@ const MAX=20000;
   '"TIMESTAMP_CALL":"2017-10-26T04:48:14"}]';
 var Doc,Doc2: TDocVariantData;
     vr: TTVarRecDynArray;
-    i,ndx: integer;
+    i,ndx: PtrInt;
     V,V1,V2: variant;
     s,j: RawUTF8;
     vd: double;
@@ -10137,7 +10242,7 @@ begin
   end;
   for i := 0 to V._count-1 do
     Check(V._(i)=Doc.Values[i]);
-  V.Add(4);
+  {$ifdef FPC}TDocVariantData(V).AddItem{$else}V.Add{$endif}(4);
   Check(V._count=4);
   for i := 0 to 2 do
     Check(V._(i)=Doc.Values[i]);
@@ -10170,7 +10275,7 @@ begin
   _UniqueFast(V1);      // change options of V1 to be by-reference
   V2 := V1;
   Check(V1._(1){$ifdef FPC}._JSON{$endif}='{"name":"John","year":1972}');
-  V1._(1).name := 'Jim';
+  {$ifdef FPC}TDocVariantData(V1).Values[1]{$else}V1._(1){$endif}.name := 'Jim';
   Check(V1{$ifdef FPC}._JSON{$endif}='["root",{"name":"Jim","year":1972}]');
   Check(V2{$ifdef FPC}._JSON{$endif}='["root",{"name":"Jim","year":1972}]');
   _UniqueFast(V2); // now V1 modifications should not affect V2
@@ -10185,19 +10290,30 @@ begin
     Check(GetInteger(Pointer(Doc.Names[i]))=i);
   for i := 0 to MAX do
     Check(Doc.Values[i]=i);
+  Doc2.Clear;
+  check(Doc2.Count=0);
+  s := Doc.ToJSON;
+  CheckEqual(Hash32(s),2110959969,'bigjson');
+  Doc2.InitJSON(s);
+  check(Doc2.Count=MAX+1);
+  for i := 0 to MAX do
+    Check(Doc2.Values[i]=Doc.Values[i]);
   for i := MAX downto 0 do
     if i and 1=0 then
       Doc.Delete(i);
   Check(Doc.Count=MAX div 2);
+  check(Doc2.Count=MAX+1);
   for i := 0 to Doc.Count-1 do
     Check(Doc.Names[i]=Doc.Values[i]);
+  s := Doc2.ToJSON;
+  CheckEqual(Hash32(s),2110959969,'bigjson2');
   Check(TDocVariantData(V1)._[1].U['name']='Jim');
   Check(TDocVariantData(V1)._[1].I['year']=1972);
   {$ifdef FPC}_Safe(V1)^.AddItem{$else}V1.Add{$endif}(3.1415);
   Check(V1{$ifdef FPC}._JSON{$endif}='["root",{"name":"Jim","year":1972},3.1415]');
-  V1._(1).Delete('year');
+  {$ifdef FPC}TDocVariantData(V1)._[1]{$else}V1._(1){$endif}.Delete('year');
   Check(V1{$ifdef FPC}._JSON{$endif}='["root",{"name":"Jim"},3.1415]');
-  V1.Delete(1); //<--- here we get an error with FPC on win64 if optimization = -O1 !??? All ok with -O2
+  {$ifdef FPC}TDocVariantData(V1){$else}V1{$endif}.Delete(1);
   Check(V1{$ifdef FPC}._JSON{$endif}='["root",3.1415]');
   TDocVariantData(V2).DeleteByProp('name','JIM',true);
   Check(V2{$ifdef FPC}._JSON{$endif}='["root",{"name":"Jim","year":1972}]');
@@ -12010,6 +12126,143 @@ begin
   {$endif CPUINTEL}
 end;
 
+procedure TTestCryptographicRoutines._AES_GCM;
+const
+  hex32: THash256 = ($00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,
+    $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$1a,$1b,$1c,$1d,$1e,$1f);
+  buf32: THash256 = ($92,$4e,$17,$8a,$17,$fa,$1c,$a0,$e7,$48,$6f,$04,$04,$12,$3b,$91,
+   $db,$f7,$97,$bb,$9d,$bd,$e9,$b1,$d4,$8d,$5c,$7f,$53,$16,$59,$12);
+  tag32: array[0..15] of byte = ($10,$f9,$72,$b6,$f9,$e0,$a3,$c1,$cf,$9c,$cf,$56,$54,$3d,$ca,$79);
+  K01: THash256 = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  I01: array[0..11] of byte = (0,0,0,0,0,0,0,0,0,0,0,0);
+  P01: array[0..15] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  C01: array[0..15] of byte = ($ce,$a7,$40,$3d,$4d,$60,$6b,$6e,$07,$4e,$c5,$d3,$ba,$f3,$9d,$18);
+  T01: array[0..15] of byte = ($d0,$d1,$c8,$a7,$99,$99,$6b,$f0,$26,$5b,$98,$b5,$d4,$8a,$b9,$19);
+  K02: THash256 = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  I02: array[0..11] of byte = (0,0,0,0,0,0,0,0,0,0,0,0);
+  H02: array[0..15] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  T02: array[0..15] of byte = ($2d,$45,$55,$2d,$85,$75,$92,$2b,$3c,$a3,$cc,$53,$84,$42,$fa,$26);
+  K03: THash256 = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  I03: array[0..11] of byte = (0,0,0,0,0,0,0,0,0,0,0,0);
+  H03: array[0..15] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  P03: array[0..15] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+  C03: array[0..15] of byte = ($ce,$a7,$40,$3d,$4d,$60,$6b,$6e,$07,$4e,$c5,$d3,$ba,$f3,$9d,$18);
+  T03: array[0..15] of byte = ($ae,$9b,$17,$71,$db,$a9,$cf,$62,$b3,$9b,$e0,$17,$94,$03,$30,$b4);
+  K04: THash256 = ($fb,$76,$15,$b2,$3d,$80,$89,$1d,$d4,$70,$98,$0b,$c7,$95,$84,$c8,
+    $b2,$fb,$64,$ce,$60,$97,$8f,$4d,$17,$fc,$e4,$5a,$49,$e8,$30,$b7);
+  I04: array[0..11] of byte = ($db,$d1,$a3,$63,$60,$24,$b7,$b4,$02,$da,$7d,$6f);
+  P04: array[0..15] of byte = ($a8,$45,$34,$8e,$c8,$c5,$b5,$f1,$26,$f5,$0e,$76,$fe,$fd,$1b,$1e);
+  C04: array[0..15] of byte = ($5d,$f5,$d1,$fa,$bc,$bb,$dd,$05,$15,$38,$25,$24,$44,$17,$87,$04);
+  T04: array[0..15] of byte = ($4c,$43,$cc,$e5,$a5,$74,$d8,$a8,$8b,$43,$d4,$35,$3b,$d6,$0f,$9f);
+  K05: THash256 = ($40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$4a,$4b,$4c,$4d,$4e,$4f,
+    $50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$5a,$5b,$5c,$5d,$5e,$5f);
+  I05: array[0..11] of byte = ($10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$1a,$1b);
+  H05: array[0..19] of byte = (0,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,$10,$11,$12,$13);
+  P05: array[0..23] of byte = ($20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$2a,$2b,$2c,$2d,$2e,$2f,$30,$31,$32,$33,$34,$35,$36,$37);
+  C05: array[0..23] of byte = ($59,$1b,$1f,$f2,$72,$b4,$32,$04,$86,$8f,$fc,$7b,$c7,$d5,$21,$99,$35,$26,$b6,$fa,$32,$24,$7c,$3c);
+  T05: array[0..15] of byte = ($7d,$e1,$2a,$56,$70,$e5,$70,$d8,$ca,$e6,$24,$a1,$6d,$f0,$9c,$08);
+  K07: THash256 = ($40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$4a,$4b,$4c,$4d,$4e,$4f,
+    $50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$5a,$5b,$5c,$5d,$5e,$5f);
+  I07: array[0..11] of byte = ($10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$1a,$1b);
+  H07: THash256 = ($20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$2a,$2b,$2c,$2d,$2e,$2f,
+    $30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$3a,$3b,$3c,$3d,$3e,$3f);
+  P07: array[0..255] of byte =(0,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,$10,$11,$12,$13,$14,$15,$16,$17,
+     $18,$19,$1a,$1b,$1c,$1d,$1e,$1f,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$2a,$2b,$2c,$2d,$2e,$2f,
+     $30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$3a,$3b,$3c,$3d,$3e,$3f,$40,$41,$42,$43,$44,$45,$46,$47,
+     $48,$49,$4a,$4b,$4c,$4d,$4e,$4f,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$5a,$5b,$5c,$5d,$5e,$5f,
+     $60,$61,$62,$63,$64,$65,$66,$67,$68,$69,$6a,$6b,$6c,$6d,$6e,$6f,$70,$71,$72,$73,$74,$75,$76,$77,
+     $78,$79,$7a,$7b,$7c,$7d,$7e,$7f,$80,$81,$82,$83,$84,$85,$86,$87,$88,$89,$8a,$8b,$8c,$8d,$8e,$8f,
+     $90,$91,$92,$93,$94,$95,$96,$97,$98,$99,$9a,$9b,$9c,$9d,$9e,$9f,$a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7,
+     $a8,$a9,$aa,$ab,$ac,$ad,$ae,$af,$b0,$b1,$b2,$b3,$b4,$b5,$b6,$b7,$b8,$b9,$ba,$bb,$bc,$bd,$be,$bf,
+     $c0,$c1,$c2,$c3,$c4,$c5,$c6,$c7,$c8,$c9,$ca,$cb,$cc,$cd,$ce,$cf,$d0,$d1,$d2,$d3,$d4,$d5,$d6,$d7,
+     $d8,$d9,$da,$db,$dc,$dd,$de,$df,$e0,$e1,$e2,$e3,$e4,$e5,$e6,$e7,$e8,$e9,$ea,$eb,$ec,$ed,$ee,$ef,
+     $f0,$f1,$f2,$f3,$f4,$f5,$f6,$f7,$f8,$f9,$fa,$fb,$fc,$fd,$fe,$ff);
+  C07: array[0..255] of byte =($79,$3b,$3f,$d2,$52,$94,$12,$24,$a6,$af,$dc,$5b,$e7,$f5,$01,$b9,
+     $15,$06,$96,$da,$12,$04,$5c,$1c,$60,$77,$d3,$ca,$c7,$74,$ac,$cf,$c3,$d5,$30,$d8,$48,$d6,$65,$d8,
+     $1a,$49,$cb,$b5,0,$b8,$8b,$bb,$62,$4a,$e6,$1d,$16,$67,$22,$9c,$30,$2d,$c6,$ff,$0b,$b4,$d7,$0b,
+     $db,$bc,$85,$66,$d6,$f5,$b1,$58,$da,$99,$a2,$ff,$2e,$01,$dd,$a6,$29,$b8,$9c,$34,$ad,$1e,$5f,$eb,
+     $a7,$0e,$7a,$ae,$43,$28,$28,$9c,$36,$29,$b0,$58,$83,$50,$58,$1c,$a8,$b9,$7c,$cf,$12,$58,$fa,$3b,
+     $be,$2c,$50,$26,$04,$7b,$a7,$26,$48,$96,$9c,$ff,$8b,$a1,$0a,$e3,$0e,$05,$93,$5d,$f0,$c6,$93,$74,
+     $18,$92,$b7,$6f,$af,$67,$13,$3a,$bd,$2c,$f2,$03,$11,$21,$bd,$8b,$b3,$81,$27,$a4,$d2,$ee,$de,$ea,
+     $13,$27,$64,$94,$f4,$02,$cd,$7c,$10,$7f,$b3,$ec,$3b,$24,$78,$48,$34,$33,$8e,$55,$43,$62,$87,$09,
+     $2a,$c4,$a2,$6f,$5e,$a7,$ea,$4a,$d6,$8d,$73,$15,$16,$39,$b0,$5b,$24,$e6,$8b,$98,$16,$d1,$39,$83,
+     $76,$d8,$e4,$13,$85,$94,$75,$8d,$b9,$ad,$3b,$40,$92,$59,$b2,$6d,$cf,$c0,$6e,$72,$2b,$e9,$87,$b3,
+     $76,$7f,$70,$a7,$b8,$56,$b7,$74,$b1,$ba,$26,$85,$b3,$68,$09,$14,$29,$fc,$cb,$8d,$cd,$de,$09,$e4);
+  T07: array[0..15] of byte = ($87,$ec,$83,$7a,$bf,$53,$28,$55,$b2,$ce,$a1,$69,$d6,$94,$3f,$cd);
+  K08: THash256 = ($fb,$76,$15,$b2,$3d,$80,$89,$1d,$d4,$70,$98,$0b,$c7,$95,$84,$c8,
+    $b2,$fb,$64,$ce,$60,$97,$87,$8d,$17,$fc,$e4,$5a,$49,$e8,$30,$b7);
+  I08: array[0..11] of byte = ($db,$d1,$a3,$63,$60,$24,$b7,$b4,$02,$da,$7d,$6f);
+  H08: array[0.. 0] of byte = ($36);
+  P08: array[0.. 0] of byte = ($a9);
+  C08: array[0.. 0] of byte = ($0a);
+  T08: array[0..15] of byte = ($be,$98,$7d,0,$9a,$4b,$34,$9a,$a8,$0c,$b9,$c4,$eb,$c1,$e9,$f4);
+  K09: THash256 = ($f8,$d4,$76,$cf,$d6,$46,$ea,$6c,$23,$84,$cb,$1c,$27,$d6,$19,$5d,
+    $fe,$f1,$a9,$f3,$7b,$9c,$8d,$21,$a7,$9c,$21,$f8,$cb,$90,$d2,$89);
+  I09: array[0..11] of byte = ($db,$d1,$a3,$63,$60,$24,$b7,$b4,$02,$da,$7d,$6f);
+  H09: array[0..19] of byte = ($7b,$d8,$59,$a2,$47,$96,$1a,$21,$82,$3b,$38,$0e,$9f,$e8,$b6,$50,$82,$ba,$61,$d3);
+  P09: array[0..19] of byte = ($90,$ae,$61,$cf,$7b,$ae,$bd,$4c,$ad,$e4,$94,$c5,$4a,$29,$ae,$70,$26,$9a,$ec,$71);
+  C09: array[0..19] of byte = ($ce,$20,$27,$b4,$7a,$84,$32,$52,$01,$34,$65,$83,$4d,$75,$fd,$0f,$07,$29,$75,$2e);
+  T09: array[0..15] of byte = ($ac,$d8,$83,$38,$37,$ab,$0e,$de,$84,$f4,$74,$8d,$a8,$89,$9c,$15);
+  K10: THash256 = ($db,$bc,$85,$66,$d6,$f5,$b1,$58,$da,$99,$a2,$ff,$2e,$01,$dd,$a6,
+    $29,$b8,$9c,$34,$ad,$1e,$5f,$eb,$a7,$0e,$7a,$ae,$43,$28,$28,$9c);
+  I10: array[0..15] of byte = ($cf,$c0,$6e,$72,$2b,$e9,$87,$b3,$76,$7f,$70,$a7,$b8,$56,$b7,$74);
+  P10: array[0..15] of byte = ($ce,$20,$27,$b4,$7a,$84,$32,$52,$01,$34,$65,$83,$4d,$75,$fd,$0f);
+  C10: array[0..15] of byte = ($dc,$03,$e5,$24,$83,$0d,$30,$f8,$8e,$19,$7f,$3a,$ca,$ce,$66,$ef);
+  T10: array[0..15] of byte = ($99,$84,$ef,$f6,$90,$57,$55,$d1,$83,$6f,$2d,$b0,$40,$89,$63,$4c);
+  K11: THash256 = ($0e,$05,$93,$5d,$f0,$c6,$93,$74,$18,$92,$b7,$6f,$af,$67,$13,$3a,
+    $bd,$2c,$f2,$03,$11,$21,$bd,$8b,$b3,$81,$27,$a4,$d2,$ee,$de,$ea);
+  I11: array[0..16] of byte = ($74,$b1,$ba,$26,$85,$b3,$68,$09,$14,$29,$fc,$cb,$8d,$cd,$de,$09,$e4);
+  H11: array[0..19] of byte = ($7b,$d8,$59,$a2,$47,$96,$1a,$21,$82,$3b,$38,$0e,$9f,$e8,$b6,$50,$82,$ba,$61,$d3);
+  P11: array[0..19] of byte = ($90,$ae,$61,$cf,$7b,$ae,$bd,$4c,$ad,$e4,$94,$c5,$4a,$29,$ae,$70,$26,$9a,$ec,$71);
+  C11: array[0..19] of byte = ($6b,$e6,$5e,$56,$06,$6c,$40,$56,$73,$8c,$03,$fe,$23,$20,$97,$4b,$a3,$f6,$5e,$09);
+  T11: array[0..15] of byte = ($61,$08,$dc,$41,$7b,$f3,$2f,$7f,$b7,$55,$4a,$e5,$2f,$08,$8f,$87);
+  procedure test(ptag: pointer; tlen: PtrInt; const key; kbits: PtrInt;
+    pIV: pointer; IV_Len: PtrInt; pAAD: pointer; aLen: PtrInt;
+    ctp: pointer; cLen: PtrInt; ptp: pointer; tn: integer);
+  var tag: TAESBLock;
+      ctxt: TAESGCMEngine;
+      pt, ct: array[0..511] of byte;
+  begin
+    FillCharFast(pt,SizeOf(pt),0);
+    CheckUTF8(ctxt.FullDecryptAndVerify(
+      key,kbits,pIV,IV_Len,pAAD,aLen,ctp,@pt,cLen,ptag,tlen),
+      'FullDecryptAndVerify #%',[tn]);
+    CheckUTF8(CompareMem(@pt,ptp,cLen),'Plain #%',[tn]);
+    FillCharFast(ct,SizeOf(ct),0);
+    CheckUTF8(ctxt.FullEncryptAndAuthenticate(
+      key,kbits,pIV,IV_len,pAAD,aLen,ptp,@ct,clen,tag),
+      'FullEncryptAndAuthenticate #%',[tn]);
+    CheckUTF8(CompareMem(@tag,ptag,tLen),'Tag #%',[tn]);
+    CheckUTF8(CompareMem(@ct,ctp,cLen),'Encoded #%',[tn]);
+  end;
+var ctxt: TAESGCMEngine;
+    key,tag: TAESBlock;
+    buf: THash512;
+    n: integer;
+begin
+  key := PAESBlock(@hex32)^;
+  for n := 1 to 32 do begin
+    Check(ctxt.Init(key,128));
+    Check(ctxt.Reset(@hex32,n));
+    Check(ctxt.Add_AAD(@hex32,n));
+    Check(ctxt.Encrypt(@hex32,@buf,n));
+    Check(ctxt.Final(tag));
+    key := tag;
+  end;
+  Check(CompareMem(@buf32,@buf,SizeOf(buf32)));
+  Check(CompareMem(@tag32,@tag,SizeOf(tag32)));
+  test(@T01,16,K01,8*sizeof(K01),@I01,sizeof(I01),nil,0,@C01,sizeof(C01),@P01,01);
+  test(@T02,16,K02,8*sizeof(K02),@I02,sizeof(I02),@H02,sizeof(H02),nil,0,nil,02);
+  test(@T03,16,K03,8*sizeof(K03),@I03,sizeof(I03),@H03,sizeof(H03),@C03,sizeof(C03),@P03,03);
+  test(@T04,16,K04,8*sizeof(K04),@I04,sizeof(I04),nil,0,@C04,sizeof(C04),@P04,04);
+  test(@T05,16,K05,8*sizeof(K05),@I05,sizeof(I05),@H05,sizeof(H05),@C05,sizeof(C05),@P05,05);
+  test(@T07,16,K07,8*sizeof(K07),@I07,sizeof(I07),@H07,sizeof(H07),@C07,sizeof(C07),@P07,07);
+  test(@T08,16,K08,8*sizeof(K08),@I08,sizeof(I08),@H08,sizeof(H08),@C08,sizeof(C08),@P08,08);
+  test(@T09,16,K09,8*sizeof(K09),@I09,sizeof(I09),@H09,sizeof(H09),@C09,sizeof(C09),@P09,09);
+  test(@T10,16,K10,8*sizeof(K10),@I10,sizeof(I10),nil,0,@C10,sizeof(C10),@P10,10);
+  test(@T11,16,K11,8*sizeof(K11),@I11,sizeof(I11),@H11,sizeof(H11),@C11,sizeof(C11),@P11,11);
+end;
+
 procedure TTestCryptographicRoutines._CompressShaAes;
 var s1,s2: RawByteString;
     keysize,i: integer;
@@ -12490,7 +12743,7 @@ begin
   Check(dlo+dhi=4000);
   Check(elo+ehi=4000);
   CheckUTF8((clo>=900) and (clo<=1100),'Random32 distribution clo=%',[clo]);
-  CheckUTF8((dlo>=1900) and (dlo<=2100),'RandomDouble distribution dlo=%',[dlo]);
+  CheckUTF8((dlo>=1800) and (dlo<=2100),'RandomDouble distribution dlo=%',[dlo]);
   CheckUTF8((elo>=1900) and (elo<=2100),'RandomExt distribution elo=%',[elo]);
   s1 := TAESPRNG.Main.FillRandom(100);
   for i := 1 to length(s1) do
@@ -12688,19 +12941,19 @@ type
     bSHA3_256, bSHA3_512,
     // encryption
     bRC4,
-    bAES128CFB, bAES128OFB, bAES128CFBCRC, bAES128OFBCRC,
-    bAES256CFB, bAES256OFB, bAES256CFBCRC, bAES256OFBCRC,
+    bAES128CFB, bAES128OFB, bAES128CFBCRC, bAES128OFBCRC, bAES128GCM,
+    bAES256CFB, bAES256OFB, bAES256CFBCRC, bAES256OFBCRC, bAES256GCM,
     bSHAKE128, bSHAKE256
     );
 
 procedure TTestCryptographicRoutines.Benchmark;
 const SIZ: array[0..4] of integer = (8, 50, 100, 1000, 10000);
       COUNT = 500;
-      AESCLASS: array[bAES128CFB .. bAES256OFBCRC] of TAESAbstractClass = (
-        TAESCFB, TAESOFB, TAESCFBCRC, TAESOFBCRC,
-        TAESCFB, TAESOFB, TAESCFBCRC, TAESOFBCRC);
-      AESBITS: array[bAES128CFB .. bAES256OFBCRC] of integer = (
-        128, 128, 128, 128, 256, 256, 256, 256);
+      AESCLASS: array[bAES128CFB .. bAES256GCM] of TAESAbstractClass = (
+        TAESCFB, TAESOFB, TAESCFBCRC, TAESOFBCRC, TAESGCM,
+        TAESCFB, TAESOFB, TAESCFBCRC, TAESOFBCRC, TAESGCM);
+      AESBITS: array[bAES128CFB .. bAES256GCM] of integer = (
+        128, 128, 128, 128, 128, 256, 256, 256, 256, 256);
 var b: TBenchmark;
     s, i, size, n: integer;
     data, encrypted: RawByteString;
@@ -12714,7 +12967,7 @@ var b: TBenchmark;
     RC4: TRC4;
     timer: TPrecisionTimer;
     time: array[TBenchmark] of Int64;
-    AES: array[bAES128CFB .. bAES256OFBCRC] of TAESAbstract;
+    AES: array[bAES128CFB .. bAES256GCM] of TAESAbstract;
     TXT: array[TBenchmark] of RawUTF8;
 begin
   GetEnumTrimmedNames(TypeInfo(TBenchmark),@TXT);
@@ -12753,9 +13006,10 @@ begin
         bSHA3_512:   SHA3.Full(pointer(data),SIZ[s],dig.b);
         bRC4:        RC4.EncryptBuffer(pointer(data), pointer(Encrypted), SIZ[s]);
         bAES128CFB, bAES128OFB, bAES256CFB, bAES256OFB:
-                     AES[b].EncryptPKCS7(Data, true);
-        bAES128CFBCRC, bAES128OFBCRC, bAES256CFBCRC, bAES256OFBCRC:
-                     AES[b].MACAndCrypt(Data,true);
+                     AES[b].EncryptPKCS7(Data,{encrypt=}true);
+        bAES128CFBCRC, bAES128OFBCRC, bAES256CFBCRC, bAES256OFBCRC,
+        bAES128GCM, bAES256GCM:
+                     AES[b].MACAndCrypt(Data,{encrypt=}true);
         bSHAKE128:   SHAKE128.Cypher(pointer(Data), pointer(Encrypted), SIZ[s]);
         bSHAKE256:   SHAKE256.Cypher(pointer(Data), pointer(Encrypted), SIZ[s]);
         end;
@@ -13944,6 +14198,7 @@ begin
     DeleteFile(TempFileName); // use a temporary file
     {$ifndef NOSQLITE3ENCRYPT}
     if ClassType<>TTestFileBasedMemoryMap then
+      // memory map is not compatible with our encryption
       password := 'password1';
     {$endif}
   end;
@@ -14040,7 +14295,7 @@ begin
     check(not IsOldSQLEncryptTable(TempFileName));
     Demo := TSQLDataBase.Create(TempFileName,'NewPass'); // reuse the temporary file
     Demo.Synchronous := smOff;
-    Demo.LockingMode := lmExclusive;
+    Demo.LockingMode := lmExclusive; 
     Demo.UseCache := true; // use the cache for the JSON requests
     Demo.WALMode := InheritsFrom(TTestFileBasedWAL); // test Write-Ahead Logging
     Check(Demo.WALMode=InheritsFrom(TTestFileBasedWAL));
@@ -20385,7 +20640,6 @@ begin
   fId := aId;
   fIsError := false;
   fHttpClient := TDDDThreadsHttpClient.Create('127.0.0.1', HTTP_DEFAULTPORT);
-  fHttpClient.SetUser('Admin', 'synopse');
 end;
 
 destructor TDDDThreadsThread.Destroy;
@@ -20400,6 +20654,9 @@ var
   test: TDDDTest;
   success: boolean;
 begin
+  fHttpClient.SetUser('Admin', 'synopse');
+  for i := 1 to 150 {15000} do
+    fHttpClient.ServerTimestampSynchronize; // calls root/timestamp
   test := TDDDTest.Create;
   try
     success := true;
@@ -20441,6 +20698,10 @@ end;
 
 
 initialization
+  {$ifndef LVCL}
+  {$ifdef ISDELPHIXE}FormatSettings.{$endif}{$ifdef FPC}FormatSettings.{$endif}
+    DecimalSeparator := '.';
+  {$endif LVCL}
   _uE0 := WinAnsiToUtf8(@UTF8_E0_F4_BYTES[0],1);
   _uE7 := WinAnsiToUtf8(@UTF8_E0_F4_BYTES[1],1);
   _uE8 := WinAnsiToUtf8(@UTF8_E0_F4_BYTES[2],1);

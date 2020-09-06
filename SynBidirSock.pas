@@ -30,6 +30,7 @@ unit SynBidirSock;
 
   Contributor(s):
   - Alfred (alf)
+  - AntoineGS
   - f-vicente
   - nortg
 
@@ -1071,7 +1072,8 @@ type
     // once it has been upgraded to WebSockets
     constructor Create(const aPort: SockString; OnStart,OnStop: TNotifyThreadEvent;
       const ProcessName: SockString; ServerThreadPoolCount: integer=2;
-      KeepAliveTimeOut: integer=30000; HeadersNotFiltered: boolean=false); override;
+      KeepAliveTimeOut: integer=30000; HeadersNotFiltered: boolean=false;
+      CreateSuspended: boolean = false); override;
     /// close the server
     destructor Destroy; override;
     /// will send a given frame to all connected clients
@@ -1118,6 +1120,8 @@ type
     // use AES-CFB 256 bits encryption
     // - if aWebSocketsAJAX is TRUE, it will also register TWebSocketProtocolJSON
     // so that AJAX applications would be able to connect to this server
+    // - warning: WaitStarted should be called after Create() to check for
+    // for actual port binding in the background thread
     constructor Create(const aPort: SockString; OnStart,OnStop: TNotifyThreadEvent;
       const aProcessName, aWebSocketsURI, aWebSocketsEncryptionKey: RawUTF8;
       aWebSocketsAJAX: boolean=false); reintroduce; overload;
@@ -1412,7 +1416,9 @@ begin
          'X-POWERED', 'USER-AGENT', 'REMOTEIP:', 'HOST:', 'ACCEPT:']) < 0 then begin
         if W = nil then
           W := TTextWriter.CreateOwnedStream(tmp);
-        W.AddNoJSONEscape(P, next - P);
+        if next=nil then
+          W.AddNoJSONEscape(P) else
+          W.AddNoJSONEscape(P, next - P);
       end;
       P := next;
     end;
@@ -3148,7 +3154,7 @@ end;
 
 constructor TWebSocketServer.Create(const aPort: SockString; OnStart,OnStop: TNotifyThreadEvent;
   const ProcessName: SockString; ServerThreadPoolCount, KeepAliveTimeOut: integer;
-  HeadersNotFiltered: boolean);
+  HeadersNotFiltered: boolean; CreateSuspended: boolean);
 begin
   // override with custom processing classes
   fSocketClass := TWebSocketServerSocket;
@@ -3161,7 +3167,7 @@ begin
   fCanNotifyCallback := true;
   // start the server
   inherited Create(aPort,OnStart,OnStop,ProcessName,ServerThreadPoolCount,
-    KeepAliveTimeOut,HeadersNotFiltered);
+    KeepAliveTimeOut,HeadersNotFiltered,CreateSuspended);
 end;
 
 function TWebSocketServer.WebSocketProcessUpgrade(ClientSock: THttpServerSocket;
@@ -3471,7 +3477,7 @@ var Ctxt: THttpServerRequest;
 begin
   if fProcess<>nil then begin
     if fProcess.fClientThread.fThreadState=sCreate then
-      sleep(10); // allow TWebSocketProcessClientThread.Execute warmup
+      sleep(10); // paranoid warmup of TWebSocketProcessClientThread.Execute
     if fProcess.fClientThread.fThreadState<>sRun then
       // WebSockets closed by server side
       result := STATUS_NOTIMPLEMENTED else begin
@@ -3485,7 +3491,7 @@ begin
           block := wscNonBlockWithoutAnswer else
           block := wscBlockWithAnswer;
         result := fProcess.NotifyCallback(Ctxt,block);
-        if IdemPChar(pointer(Ctxt.OutContentType), JSON_CONTENT_TYPE_UPPER) then
+        if IdemPChar(pointer(Ctxt.OutContentType),JSON_CONTENT_TYPE_UPPER) then
           HeaderSetText(Ctxt.OutCustomHeaders) else
           HeaderSetText(Ctxt.OutCustomHeaders,Ctxt.OutContentType);
         Content := Ctxt.OutContent;
@@ -3600,11 +3606,16 @@ end;
 
 constructor TWebSocketProcessClient.Create(aSender: THttpClientWebSockets;
   aProtocol: TWebSocketProtocol; const aProcessName: RawUTF8);
+var endtix: Int64;
 begin
   fMaskSentFrames := FRAME_LEN_MASK; // https://tools.ietf.org/html/rfc6455#section-10.3
   inherited Create(aSender,aProtocol,0,nil,aSender.fSettings,aProcessName);
   // initialize the thread after everything is set (Execute may be instant)
   fClientThread := TWebSocketProcessClientThread.Create(self);
+  endtix := GetTickCount64+5000;
+  repeat // wait for TWebSocketProcess.ProcessLoop to initiate
+    SleepHiRes(0);
+  until fProcessEnded or (fState<>wpsCreate) or (GetTickCount64>endtix);
 end;
 
 destructor TWebSocketProcessClient.Destroy;
@@ -3637,20 +3648,19 @@ end;
 
 { TWebSocketProcessClientThread }
 
-constructor TWebSocketProcessClientThread.Create(
-  aProcess: TWebSocketProcessClient);
+constructor TWebSocketProcessClientThread.Create(aProcess: TWebSocketProcessClient);
 begin
   fProcess := aProcess;
   fProcess.fOwnerThread := self;
-  inherited Create(false);
+  inherited Create({suspended=}false);
 end;
 
 procedure TWebSocketProcessClientThread.Execute;
 begin
-  if fProcess<>nil then // may happen when debugging under FPC (alf)
-    SetCurrentThreadName('% % %',[fProcess.fProcessName,self,fProcess.Protocol.Name]);
-  fThreadState := sRun;
   try
+    fThreadState := sRun;
+    if fProcess<>nil then // may happen when debugging under FPC (alf)
+      SetCurrentThreadName('% % %',[fProcess.fProcessName,self,fProcess.Protocol.Name]);
     WebSocketLog.Add.Log(sllDebug,'Execute: before ProcessLoop %', [fProcess], self);
     if not Terminated and (fProcess<>nil) then
       fProcess.ProcessLoop;
@@ -3662,9 +3672,9 @@ begin
           OnWebSocketsClosed(self);
   except // ignore any exception in the thread
   end;
+  fThreadState := sFinished; // safely set final state
   if (fProcess<>nil) and (fProcess.fState=wpsClose) then
-    fThreadState := sClosed else
-    fThreadState := sFinished;
+    fThreadState := sClosed;
   WebSocketLog.Add.Log(sllDebug,'Execute: done (%)',[ToText(fThreadState)^],self);
 end;
 
@@ -3729,12 +3739,19 @@ end;
 
 function TAsynchConnectionsSockets.SlotFromConnection(connection: TObject): PPollSocketsSlot;
 begin
-  if not connection.InheritsFrom(TAsynchConnection) or
-     (TAsynchConnection(connection).Handle=0) then begin
-    fOwner.fLog.Add.Log(sllStackTrace,'SlotFromConnection() with dangling pointer',self);
+  try
+    if (connection=nil) or not connection.InheritsFrom(TAsynchConnection) or
+       (TAsynchConnection(connection).Handle=0) then begin
+      fOwner.fLog.Add.Log(sllStackTrace,'SlotFromConnection() with dangling pointer %',
+        [connection],self);
+      result := nil;
+    end else
+      result := @TAsynchConnection(connection).fSlot;
+  except
+    fOwner.fLog.Add.Log(sllError,'SlotFromConnection() with dangling pointer %',
+     [pointer(connection)],self);
     result := nil;
-  end else
-    result := @TAsynchConnection(connection).fSlot;
+  end;
 end;
 
 function TAsynchConnectionsSockets.Write(connection: TObject;

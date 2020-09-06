@@ -2167,7 +2167,7 @@ type
     fReaderTemp: PRawByteString;
     fLoadFromLastUncompressed, fSaveToLastUncompressed: integer;
     fLoadFromLastAlgo: TAlgoCompress;
-    /// low-level virtual methods implementing the persistence reading
+    /// low-level virtual methods implementing the persistence
     procedure LoadFromReader; virtual;
     procedure SaveToWriter(aWriter: TFileBufferWriter); virtual;
   public
@@ -2658,6 +2658,8 @@ type
     function ComputeCredential(previous: boolean; const UserName,PassWord: RawUTF8): cardinal; virtual;
     function GetPassword(const UserName: RawUTF8; out Password: RawUTF8): boolean; virtual; abstract;
     function GetUsersCount: integer; virtual; abstract;
+    // check the given Hash challenge, against stored credentials
+    function CheckCredentials(const UserName: RaWUTF8; Hash: cardinal): boolean; virtual;
   public
     /// initialize the authentication scheme
     constructor Create;
@@ -2919,9 +2921,6 @@ type
     function NextPendingTask: RawByteString; virtual;
     /// flush all pending tasks
     procedure Clear; virtual;
-    /// access to the locking methods of this instance
-    // - use Safe.Lock/TryLock with a try ... finally Safe.Unlock block
-    property Safe: PSynlocker read fSafe;
     /// access to the internal TPendingTaskListItem.Timestamp stored value
     // - corresponding to the current time
     // - default implementation is to return GetTickCount64, with a 16 ms
@@ -3942,7 +3941,7 @@ function GetDiskInfo(var aDriveFolderOrFile: TFileName;
   {$ifdef MSWINDOWS}; aVolumeName: PFileName = nil{$endif}): boolean;
 
 
-{ ************ Markup (e.g. Emoji) process  ************************** }
+{ ************ Markup (e.g. HTML or Emoji) process ******************** }
 
 type
   /// tune AddHtmlEscapeWiki/AddHtmlEscapeMarkdown wrapper functions process
@@ -5117,6 +5116,11 @@ procedure ToSBFStr(const Value: RawByteString; out Result: TSBFString);
 
 implementation
 
+{$ifdef WITH_FASTMM4STATS}
+uses
+  FastMM4; // override OS information by actual FastMM4 status
+{$endif WITH_FASTMM4STATS}
+
 {$ifdef FPCLINUX}
 uses
   termio,
@@ -5210,7 +5214,7 @@ end;
 { TSynTable }
 
 {$ifdef CPUX86}
-function SortQWord(const A,B: QWord): integer;
+function SortQWord(const A,B: QWord): integer; {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // Delphi x86 compiler is not efficient, and oldest even incorrect
         mov     ecx, [eax]
         mov     eax, [eax + 4]
@@ -5226,7 +5230,7 @@ asm // Delphi x86 compiler is not efficient, and oldest even incorrect
 @p:     mov     eax, 1
 end;
 
-function SortInt64(const A,B: Int64): integer;
+function SortInt64(const A,B: Int64): integer; {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // Delphi x86 compiler is not efficient at compiling below code
         mov     ecx, [eax]
         mov     eax, [eax + 4]
@@ -6210,8 +6214,8 @@ var len: integer;
     PA: PAnsiChar absolute FieldBuffer;
     PU: PUTF8Char absolute FieldBuffer;
     tmp: RawByteString;
-    {$ifndef UNICODE}
-    WS: WideString;
+    {$ifndef HASVARUSTRING}
+    WS: SynUnicode;
     {$endif}
 begin
   case FieldType of
@@ -6246,7 +6250,7 @@ begin
   tftWinAnsi: begin
     len := FromVarUInt32(PB);
     if len>0 then
-      {$ifdef UNICODE}
+      {$ifdef HASVARUSTRING}
       result := WinAnsiToUnicodeString(PA,len)
       {$else}
       result := CurrentAnsiConvert.AnsiToAnsi(WinAnsiConvert,PA,len)
@@ -6256,7 +6260,7 @@ begin
   tftUTF8: begin
     len := FromVarUInt32(PB);
     if len>0 then
-      {$ifdef UNICODE}
+      {$ifdef HASVARUSTRING}
       result := UTF8DecodeToUnicodeString(PU,len)
       {$else} begin
         UTF8ToSynUnicode(PU,len,WS);
@@ -10138,7 +10142,7 @@ end;
 
 {$ifdef CPUINTEL} // crc32c SSE4.2 hardware accellerated dword hash
 function crc32csse42(buf: pointer): cardinal;
-{$ifdef CPUX86}
+{$ifdef CPUX86} {$ifdef FPC} nostackframe; assembler; {$endif}
 asm
         mov     edx, eax
         xor     eax, eax
@@ -13694,27 +13698,31 @@ end;
 
 procedure TSynAuthenticationAbstract.AuthenticateUser(const aName, aPassword: RawUTF8);
 begin
-  raise ESynException.CreateFmt('%.AuthenticateUser() is not implemented',[self]);
+  raise ESynException.CreateUTF8('%.AuthenticateUser() is not implemented',[self]);
 end;
 
 procedure TSynAuthenticationAbstract.DisauthenticateUser(const aName: RawUTF8);
 begin
-  raise ESynException.CreateFmt('%.DisauthenticateUser() is not implemented',[self]);
+  raise ESynException.CreateUTF8('%.DisauthenticateUser() is not implemented',[self]);
 end;
 
-function TSynAuthenticationAbstract.CreateSession(const User: RawUTF8; Hash: cardinal): integer;
+function TSynAuthenticationAbstract.CheckCredentials(const UserName: RaWUTF8;
+  Hash: cardinal): boolean;
 var password: RawUTF8;
+begin
+  result := GetPassword(UserName,password) and
+     ((ComputeCredential(false,UserName,password)=Hash) or
+      (ComputeCredential(true,UserName,password)=Hash));
+end;
+
+function TSynAuthenticationAbstract.CreateSession(const User: RawUTF8;
+  Hash: cardinal): integer;
 begin
   result := 0;
   fSafe.Lock;
   try
-    // check the given Hash challenge, against stored credentials
-    if not GetPassword(User,password) then
+    if not CheckCredentials(User,Hash) then
       exit;
-    if (ComputeCredential(false,User,password)<>Hash) and
-       (ComputeCredential(true,User,password)<>Hash) then
-      exit;
-    // create the new session
     repeat
       result := fSessionGenerator;
       inc(fSessionGenerator);

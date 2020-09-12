@@ -547,10 +547,10 @@ begin
     for i := n downto 0 do // may appear several times, with another Security
     if fDBServers[i].Server=aServer then begin
       {$ifndef ONLYUSEHTTPSOCKET}
-      if fHttpServer.InheritsFrom(THttpApiServer) then
-        if THttpApiServer(fHttpServer).RemoveUrl(aServer.Model.Root,fPublicPort,
-           fDBServers[i].Security=secSSL,fDomainName)<>NO_ERROR then
-          log.Log(sllLastError,'%.RemoveUrl(%)',[self,aServer.Model.Root],self);
+//      if fHttpServer.InheritsFrom(THttpApiServer) then
+//        if THttpApiServer(fHttpServer).RemoveUrl(aServer.Model.Root,fPublicPort,
+//           fDBServers[i].Security=secSSL,fDomainName)<>NO_ERROR then
+//          log.Log(sllLastError,'%.RemoveUrl(%)',[self,aServer.Model.Root],self);
       {$endif}
       for j := i to n-1 do
         fDBServers[j] := fDBServers[j+1];

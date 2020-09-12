@@ -1929,7 +1929,7 @@ type
       /// =$ff for a ptField address, or =$fe for a ptVirtual method
       Kind: byte;
     end;
-  {$A+} // back to normal alignment
+    {$A+} // back to normal alignment
 {$endif FPC}
 
 const
@@ -34513,7 +34513,7 @@ begin
 end;
 
 function TSQLRest.OneFieldValues(Table: TSQLRecordClass; const FieldName,
-  WhereClause: RawUTF8; Strings: TStrings; IDToIndex: PID=nil): Boolean;
+  WhereClause: RawUTF8; Strings: TStrings; IDToIndex: PID): Boolean;
 var Row: integer;
     aID: TID;
     T: TSQLTableJSON;
@@ -34554,7 +34554,7 @@ end;
 
 function TSQLRest.OneFieldValues(Table: TSQLRecordClass; const FieldName,
   WhereClause, Separator: RawUTF8): RawUTF8;
-var i, Len, SepLen, L: integer;
+var i, Len, SepLen, L: PtrInt;
     Lens: TIntegerDynArray;
     T: TSQLTableJSON;
     P: PUTF8Char;
@@ -34568,13 +34568,12 @@ begin
     // calculate row values CSV needed memory
     SetLength(Lens,T.fRowCount);
     SepLen := length(Separator);
-    Len := 0;
+    Len := SepLen*(T.fRowCount-1);
     for i := 1 to T.fRowCount do begin
       L := StrLen(T.fResults[i]); // ignore fResults[0] i.e. field name
-      inc(Len,L+SepLen);
+      inc(Len,L);
       Lens[i-1] := L;
     end;
-    dec(Len,SepLen);
     SetLength(result,Len);
     // add row values as CSV
     P := pointer(result);

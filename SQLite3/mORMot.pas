@@ -16886,12 +16886,12 @@ type
     // - a specific findservice=ServiceName parameter will not return any
     // statistics, but matching URIs from the server AssociatedServices list
     procedure Stat(Ctxt: TSQLRestServerURIContext);
+  public
     /// REST service accessible from ModelRoot/Auth URI
     // - called by the clients for authentication and session management
     // - this method won't require an authenticated client, since it is used to
     // initiate authentication
     // - this global callback method is thread-safe
-  public
     procedure Auth(Ctxt: TSQLRestServerURIContext);
     /// REST service accessible from the ModelRoot/Timestamp URI
     // - returns the server time stamp TTimeLog/Int64 value as UTF-8 text

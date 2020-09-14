@@ -16858,20 +16858,6 @@ function SynLZDecompressBody(P,Body: PAnsiChar; PLen,BodyLen: integer;
 function SynLZDecompressPartial(P,Partial: PAnsiChar; PLen,PartialLen: integer): integer;
 
 
-resourcestring
-  sInvalidIPAddress = '"%s" is an invalid IP v4 address';
-  sInvalidEmailAddress = '"%s" is an invalid email address';
-  sInvalidPattern = '"%s" does not match the expected pattern';
-  sCharacter01n = 'character,character,characters';
-  sInvalidTextLengthMin = 'Expect at least %d %s';
-  sInvalidTextLengthMax = 'Expect up to %d %s';
-  sInvalidTextChar = 'Expect at least %d %s %s,Expect up to %d %s %s,'+
-    'alphabetical,digital,punctuation,lowercase,uppercase,space,'+
-    'Too much spaces on the left,Too much spaces on the right';
-  sValidationFailed = '"%s" rule failed';
-  sValidationFieldVoid = 'An unique key field must not be void';
-  sValidationFieldDuplicate = 'Value already used for this unique key field';
-
 
 implementation
 
@@ -37689,7 +37675,8 @@ begin
       exit; // avoid integer overflow e.g. if '0000' is an invalid date
     Div100(Y,d100);
     unaligned(result) := (146097*d100.d) shr 2 + (1461*d100.m) shr 2 +
-          (153*M+2) div 5+D-693900;
+          (153*M+2) div 5+D;
+    unaligned(result) := unaligned(result)-693900; // as float: avoid sign issue
     if L<15 then
       exit; // not enough space to retrieve the time
   end;
@@ -38270,7 +38257,8 @@ begin // faster version by AB
       else exit; // Month <= 0
     Div100(Year,d100);
     Date := (146097*d100.D) shr 2+(1461*d100.M) shr 2+
-            (153*Month+2) div 5+Day-693900;
+            (153*Month+2) div 5+Day;
+    Date := Date-693900; // should be separated to avoid sign issues
     result := true;
   end;
 end;

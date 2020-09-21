@@ -73,7 +73,7 @@ interface
     whereas deflate, even with its level set to 1 (fastest), is 25 % slower
   - TSQLHttpClientGeneric.Compression shall contain hcSynLZ to handle it }
 
-{$define COMPRESSDEFLATE}
+{.$define COMPRESSDEFLATE}
 { if defined, will use gzip (and not deflate/zip) for content compression
   - can be set global for Client and Server applications
   - deflate/zip is just broken between browsers and client, and should be

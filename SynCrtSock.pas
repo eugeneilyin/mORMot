@@ -9199,6 +9199,9 @@ var Req: PHTTP_REQUEST;
             fCompress,Context.OutContentType,Context.fOutContent);
           pRawValue := pointer(OutContentEncoding);
           RawValueLength := length(OutContentEncoding);
+          if OutContentEncoding <> '' then
+            Context.OutCustomHeaders := Context.OutCustomHeaders + #$D#$A +
+              'Content-Encoding: ' + OutContentEncoding;
         end;
       end;
       Resp^.SetContent(DataChunkInMemory,Context.OutContent,Context.OutContentType);

@@ -4930,8 +4930,8 @@ begin
         {$endif}
         {$endif}
       end else begin
-        fWriter.AddShort(' stack trace API ');
-        for i := 0 to n-1 do
+        fWriter.AddShort('stack trace API ');
+        for i := 3 to n-1 do
           TSynMapFile.Log(fWriter,BackTrace[i],false); // ignore any TSynLog.*
       end;
     except

@@ -2562,6 +2562,10 @@ function HttpGetAuth(const aURI, aAuthToken: SockString;
 function HttpPost(const server, port: SockString; const url, Data, DataType: SockString;
   outData: PSockString=nil; const auth: SockString=''): boolean;
 
+/// send some data to a remote web server, using the HTTP/1.1 protocol and PUT method
+function HttpPut(const server, port: SockString; const url, Data, DataType: SockString;
+  outData: PSockString=nil; const auth: SockString=''): boolean;
+
 /// compute the 'Authorization: Bearer ####' HTTP header of a given token value
 function AuthorizationBearer(const AuthToken: SockString): SockString;
 
@@ -5228,7 +5232,7 @@ begin
     exit;
   if ResultClass=nil then
     ResultClass := TCrtSocket;
-  result := ResultClass.Create;
+  result := ResultClass.Create(Timeout);
   result.AcceptRequest(client,@sin);
   result.CreateSockIn; // use SockIn with 1KB input buffer: 2x faster
 end;
@@ -5916,6 +5920,23 @@ begin
   if Http<>nil then
   try
     result := Http.Post(url,Data,DataType,0,AuthorizationBearer(auth)) in
+      [STATUS_SUCCESS,STATUS_CREATED,STATUS_NOCONTENT];
+    if outdata<>nil then
+      outdata^ := Http.Content;
+  finally
+    Http.Free;
+  end;
+end;
+
+function HttpPut(const server, port: SockString; const url, Data, DataType: SockString;
+  outData: PSockString; const auth: SockString): boolean;
+var Http: THttpClientSocket;
+begin
+  result := false;
+  Http := OpenHttp(server,port);
+  if Http<>nil then
+  try
+    result := Http.Put(url,Data,DataType,0,AuthorizationBearer(auth)) in
       [STATUS_SUCCESS,STATUS_CREATED,STATUS_NOCONTENT];
     if outdata<>nil then
       outdata^ := Http.Content;
@@ -7000,7 +7021,7 @@ begin
         PWord(@line[len])^ := 13+10 shl 8; // CR + LF
         SockSend(@line,len+2);
       end else
-        SockSend(s);
+        SockSend(s); // SockSend() internal buffer is used as temporary buffer
   until false;
   Headers := copy(fSndBuf, 1, fSndBufLen);
   fSndBufLen := 0;

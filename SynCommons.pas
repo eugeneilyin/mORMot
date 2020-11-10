@@ -1818,7 +1818,19 @@ procedure ResourceSynLZToRawByteString(const ResName: string;
 // - implemented using x86 asm, if possible
 // - this Trim() is seldom used, but this RawUTF8 specific version is needed
 // e.g. by Delphi 2009+, to avoid two unnecessary conversions into UnicodeString
+// - in the middle of VCL code, consider using TrimU() which won't have name
+// collision ambiguity as with SysUtils' homonymous function
 function Trim(const S: RawUTF8): RawUTF8;
+{$ifdef UNICODE} overload;
+/// overloaded UnicodeString version of Trim()
+// - to avoid collision ambiguity in Delphi 2009+ VCL code
+function Trim(const S: UnicodeString): string; overload;
+{$endif UNICODE}
+
+/// fast dedicated RawUTF8 version of Trim()
+// - could be used if overloaded Trim() from SysUtils.pas is ambiguous
+function TrimU(const S: RawUTF8): RawUTF8;
+  {$ifdef HASINLINE}inline;{$endif}
 
 {$define OWNNORMTOUPPER} { NormToUpper[] exists only in our enhanced RTL }
 
@@ -12384,6 +12396,7 @@ type
   TDateTimeMSDynArray = array of TDateTimeMS;
   PDateTimeMSDynArray = ^TDateTimeMSDynArray;
 
+  {$A-}
   /// a simple way to store a date as Year/Month/Day
   // - with no needed computation as with TDate/TUnixTime values
   // - consider using TSynSystemTime if you need to handle both Date and Time
@@ -12391,7 +12404,10 @@ type
   // is safe to be used
   // - DayOfWeek field is not handled by its methods by default, but could be
   // filled on demand via ComputeDayOfWeek - making this record 64-bit long
-  TSynDate = object
+  // - some Delphi revisions have trouble with "object" as own method parameters
+  // (e.g. IsEqual) so we force to use "record" type if possible
+  {$ifdef USERECORDWITHMETHODS}TSynDate = record{$else}
+  TSynDate = object{$endif}
     Year, Month, DayOfWeek, Day: word;
     /// set all fields to 0
     procedure Clear; {$ifdef HASINLINE}inline;{$endif}
@@ -12435,7 +12451,10 @@ type
   // for fast conversion from TDateTime to its ready-to-display members
   // - DayOfWeek field is not handled by most methods by default, but could be
   // filled on demand via ComputeDayOfWeek
-  TSynSystemTime = object
+  // - some Delphi revisions have trouble with "object" as own method parameters
+  // (e.g. IsEqual) so we force to use "record" type if possible
+  {$ifdef USERECORDWITHMETHODS}TSynSystemTime = record{$else}
+  TSynSystemTime = object{$endif}
   public
     Year, Month, DayOfWeek, Day,
     Hour, Minute, Second, MilliSecond: word;
@@ -12507,6 +12526,7 @@ type
     procedure IncrementMS(ms: integer);
   end;
   PSynSystemTime = ^TSynSystemTime;
+  {$A+}
 
   /// fast bit-encoded date and time value
   // - faster than Iso-8601 text and TDateTime, e.g. can be used as published
@@ -23655,11 +23675,11 @@ begin
   L := Length(S);
   I := 1;
   while (I<=L) and (S[I]<=' ') do inc(I);
-  if I>L then
+  if I>L then // void string
     result := '' else
-  if (I=1) and (S[L]>' ') then
+  if (I=1) and (S[L]>' ') then // nothing to trim
     result := S else begin
-    while S[L]<=' ' do dec(L);
+    while S[L]<=' ' do dec(L); // allocated trimmed
     result := Copy(S,I,L-I+1);
   end;
 end;
@@ -24015,6 +24035,11 @@ begin
   if Value=0 then
     result := SmallUInt32UTF8[0] else
     FastSetString(result,@tmp[1],DoubleToShort(tmp,Value));
+end;
+
+function TrimU(const S: RawUTF8): RawUTF8;
+begin
+  result := Trim(s);
 end;
 
 function FormatUTF8(const Format: RawUTF8; const Args: array of const): RawUTF8;
@@ -34010,6 +34035,20 @@ begin
   end;
 end;
 
+function Trim(const S: UnicodeString): string;
+var I,L: PtrInt;
+begin
+  L := Length(S);
+  I := 1;
+  while (I<=L) and (S[I]<=' ') do inc(I);
+  if I>L then // void string
+    result := '' else
+  if (I=1) and (S[L]>' ') then // nothing to trim
+    result := S else begin
+    while S[L]<=' ' do dec(L); // allocated trimmed
+    result := Copy(S,I,L-I+1);
+  end;
+end;
 {$endif UNICODE}
 
 function IdemPCharAndGetNextItem(var source: PUTF8Char; const searchUp: RawUTF8;

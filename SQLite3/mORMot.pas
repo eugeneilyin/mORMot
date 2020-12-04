@@ -3441,7 +3441,7 @@ type
   end;
 
 var
-  /// acccess to Zip Deflate compression in level 6 as a TSynCompress class
+  /// acccess to Zip Deflate compression in level 6 as a TAlgoCompress class
   AlgoDeflate: TAlgoCompress;
   /// acccess to Zip Deflate compression in level 1 as a TAlgoCompress class
   AlgoDeflateFast: TAlgoCompress;
@@ -6907,6 +6907,9 @@ type
     // EORMException: in this case, you should use a TID / T*ID kind of
     // published property, and not a TSQLRecord, which is limited to the
     // pointer size
+    // - on FPC, if you get an Error: Incompatible types: got "Pointer" expected
+    // "T...", then you are missing a {$mode Delphi} conditional in your unit:
+    // the easiest is to include {$I Synopse.inc} at the top of your unit
     property AsTSQLRecord: pointer read GetIDAsPointer;
     /// this property is set to true, if any published property is a BLOB (TSQLRawBlob)
     property HasBlob: boolean read GetHasBlob;
@@ -9054,7 +9057,7 @@ type
 
   /// this base class will create a FTS3 table using the Unicode61 Stemming algorithm
   // - see http://sqlite.org/fts3.html#tokenizer
-  // - will generate tokenize=unicode64 by convention from the class name
+  // - will generate tokenize=unicode61 by convention from the class name
   TSQLRecordFTS3Unicode61 = class(TSQLRecordFTS3);
 
   /// a base record, corresponding to a FTS4 table, which is an enhancement to FTS3
@@ -9085,7 +9088,7 @@ type
 
   /// this base class will create a FTS4 table using the Unicode61 Stemming algorithm
   // - see http://sqlite.org/fts3.html#tokenizer
-  // - will generate tokenize=unicode64 by convention from the class name
+  // - will generate tokenize=unicode61 by convention from the class name
   TSQLRecordFTS4Unicode61 = class(TSQLRecordFTS4);
 
   /// a base record, corresponding to a FTS5 table, which is an enhancement to FTS4
@@ -9107,7 +9110,7 @@ type
 
   /// this base class will create a FTS5 table using the Unicode61 Stemming algorithm
   // - see https://sqlite.org/fts5.html#tokenizers
-  // - will generate tokenize=unicode64 by convention from the class name
+  // - will generate tokenize=unicode61 by convention from the class name
   TSQLRecordFTS5Unicode61 = class(TSQLRecordFTS5);
 
   /// class-reference type (metaclass) of a FTS3/FTS4/FTS5 virtual table
@@ -29737,7 +29740,7 @@ begin
   {$endif}
 end;
 
-function TEnumType.GetCaptionStrings(UsedValuesBits: Pointer=nil): string;
+function TEnumType.GetCaptionStrings(UsedValuesBits: Pointer): string;
 var List: TStringList;
 begin
   List := TStringList.Create;
@@ -31243,15 +31246,17 @@ begin
       end;
       for i := 0 to fields.Count-1 do
         result := result+fields.List[i].Name+',';
-      tokenizer := 'simple';
+      if Props.Kind=rFTS5 then // FTS5 knows ascii/porter/unicode61
+        tokenizer := 'ascii' else
+        tokenizer := 'simple'; // FTS3-4 know simple/porter/unicode61
       c := self;
       repeat
         ToText(c,cname); // TSQLFTSTest = class(TSQLRecordFTS3Porter)
         if IdemPChar(pointer(cname),'TSQLRECORDFTS') and
            (cname[14] in ['3','4','5']) then begin
           if length(cname)>14 then
-            tokenizer := copy(cname,15,100); // e.g. TSQLRecordFTS3Porter -> 'Porter'
-          break;
+            tokenizer := copy(cname,15,100);
+          break; // e.g. TSQLRecordFTS3Porter -> 'Porter'
         end;
         c := GetClassParent(c);
       until c=TSQLRecord;
@@ -41975,7 +41980,7 @@ begin
 end;
 
 procedure TSQLRestServer.Auth(Ctxt: TSQLRestServerURIContext);
-var i: integer;
+var i: PtrInt;
 begin
   if fSessionAuthentication=nil then
     exit;
@@ -58076,7 +58081,7 @@ begin
       fImplementationClass.GetInterfaceEntry(fInterface.fInterfaceIID);
     if fImplementationClassInterfaceEntry=nil then
       raise EServiceException.CreateUTF8('%.Create: % does not implement I%',
-        [self,fImplementationClass,fInterfaceURI]) else
+        [self,fImplementationClass,fInterfaceURI]);
   end;
   if (fInterface.MethodIndexCallbackReleased>=0) and
      (InstanceCreation<>sicShared) then

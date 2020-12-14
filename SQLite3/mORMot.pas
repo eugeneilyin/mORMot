@@ -17892,7 +17892,7 @@ type
     // same time, you should better use BATCH process, specifying a positive
     // AutomaticTransactionPerRow parameter to BatchStart()
     function TransactionBegin(aTable: TSQLRecordClass;
-  	  SessionID: cardinal=CONST_AUTHENTICATION_NOT_USED): boolean; override;
+      SessionID: cardinal=CONST_AUTHENTICATION_NOT_USED): boolean; override;
     /// end a transaction (calls REST END Member)
     // - by default, Client transaction will use here a pseudo session
     procedure Commit(SessionID: cardinal=CONST_AUTHENTICATION_NOT_USED;
@@ -35851,7 +35851,7 @@ procedure TSQLRest.EndCurrentThread(Sender: TThread);
 begin // most will be done e.g. in TSQLRestServer.EndCurrentThread
   {$ifdef WITHLOG}
   fLogFamily.OnThreadEnded(Sender);
-  {$endif}
+  {$endif WITHLOG}
 end;
 
 procedure TSQLRest.WriteLock;

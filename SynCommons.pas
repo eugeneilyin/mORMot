@@ -17078,9 +17078,6 @@ function TSynAnsiConvert.AnsiBufferToUnicode(Dest: PWideChar;
   Source: PAnsiChar; SourceChars: Cardinal; NoTrailingZero: boolean): PWideChar;
 var c: cardinal;
 {$ifndef MSWINDOWS}
-{$ifdef FPC}
-    tmp: UnicodeString;
-{$endif}
 {$ifdef KYLIX3}
     ic: iconv_t;
     DestBegin: PAnsiChar;
@@ -17124,10 +17121,8 @@ begin
       fCodePage,MB_PRECOMPOSED,Source,SourceChars,Dest,SourceChars);
     {$else}
     {$ifdef FPC}
-    widestringmanager.Ansi2UnicodeMoveProc(Source,
-      {$ifdef ISFPC27}fCodePage,{$endif}tmp,SourceChars);
-    MoveFast(Pointer(tmp)^,Dest^,length(tmp)*2);
-    result := Dest+length(tmp);
+    // uses our SynFPCLinux ICU API helper
+    result := Dest+AnsiToWideICU(fCodePage,Source,Dest,SourceChars);
     {$else}
     {$ifdef KYLIX3}
     result := Dest; // makes compiler happy
@@ -17179,7 +17174,8 @@ begin
   if SourceChars=0 then
     result := Dest else begin
     U := AnsiBufferToUnicode(tmp.Init(SourceChars*3),Source,SourceChars);
-    result := Dest+RawUnicodeToUtf8(Dest,SourceChars*3,tmp.buf,(PtrUInt(U)-PtrUInt(tmp.buf))shr 1,[ccfNoTrailingZero]);
+    result := Dest+RawUnicodeToUtf8(Dest,SourceChars*3,tmp.buf,
+      (PtrUInt(U)-PtrUInt(tmp.buf))shr 1,[ccfNoTrailingZero]);
     tmp.Done;
   end;
   if not NoTrailingZero then
@@ -17306,9 +17302,6 @@ function TSynAnsiConvert.UnicodeBufferToAnsi(Dest: PAnsiChar;
   Source: PWideChar; SourceChars: Cardinal): PAnsiChar;
 var c: cardinal;
 {$ifndef MSWINDOWS}
-{$ifdef FPC}
-    tmp: RawByteString;
-{$endif}
 {$ifdef KYLIX3}
     ic: iconv_t;
     DestBegin: PAnsiChar;
@@ -17351,10 +17344,8 @@ begin
       fCodePage,0,Source,SourceChars,Dest,SourceChars*3,@DefaultCharVar,nil);
     {$else}
     {$ifdef FPC}
-    widestringmanager.Unicode2AnsiMoveProc(Source,tmp,
-      {$ifdef ISFPC27}fCodePage,{$endif}SourceChars);
-    MoveFast(Pointer(tmp)^,Dest^,length(tmp));
-    result := Dest+length(tmp);
+    // uses our SynFPCLinux ICU API helper
+    result := Dest+WideToAnsiICU(fCodePage,Source,Dest,SourceChars);
     {$else}
     {$ifdef KYLIX3}
     result := Dest; // makes compiler happy
@@ -19528,7 +19519,7 @@ smlu32: Res.Text := pointer(SmallUInt32UTF8[result]);
     vtPointer,vtInterface: begin
       Res.Text := @Res.Temp;
       Res.Len := SizeOf(pointer)*2;
-      BinToHexDisplayLower(V.VPointer,@Res.Temp,SizeOf(Pointer));
+      BinToHexDisplayLower(@V.VPointer,@Res.Temp,SizeOf(Pointer));
       result := SizeOf(pointer)*2;
       exit;
     end;
@@ -29189,37 +29180,45 @@ begin
   Dest.Add(');'#13#10'  %_LEN = SizeOf(%);'#13#10,[ConstName,ConstName]);
 end;
 
+{$ifdef KYLIX3}
 function UpperCaseUnicode(const S: RawUTF8): RawUTF8;
-{$ifdef MSWINDOWS}
-var tmp: RawUnicode;
-    TmpLen: integer;
-{$endif}
 begin
-{$ifdef MSWINDOWS} // no temporary WideString involved
-  tmp := Utf8DecodeToRawUnicodeUI(S,@TmpLen);
-  TmpLen := TmpLen shr 1;
-  CharUpperBuffW(pointer(tmp),TmpLen);
-  RawUnicodeToUtf8(pointer(tmp),TmpLen,result);
-{$else}
   result := WideStringToUTF8(WideUpperCase(UTF8ToWideString(S)));
-{$endif}
 end;
 
 function LowerCaseUnicode(const S: RawUTF8): RawUTF8;
-{$ifdef MSWINDOWS}
-var tmp: RawUnicode;
-    TmpLen: integer;
-{$endif}
 begin
-{$ifdef MSWINDOWS} // no temporary WideString involved
-  tmp := Utf8DecodeToRawUnicodeUI(S,@TmpLen);
-  TmpLen := TmpLen shr 1;
-  CharLowerBuffW(pointer(tmp),TmpLen);
-  RawUnicodeToUtf8(pointer(tmp),TmpLen,result);
-{$else}
   result := WideStringToUTF8(WideLowerCase(UTF8ToWideString(S)));
-{$endif}
 end;
+{$else}
+function UpperCaseUnicode(const S: RawUTF8): RawUTF8;
+var tmp: TSynTempBuffer;
+    len: integer;
+begin
+  if S='' then begin
+    result := '';
+    exit;
+  end;
+  tmp.Init(length(s)*2);
+  len := UTF8ToWideChar(tmp.buf,pointer(S),length(S)) shr 1;
+  RawUnicodeToUtf8(tmp.buf,CharUpperBuffW(tmp.buf,len),result);
+  tmp.Done;
+end;
+
+function LowerCaseUnicode(const S: RawUTF8): RawUTF8;
+var tmp: TSynTempBuffer;
+    len: integer;
+begin
+  if S='' then begin
+    result := '';
+    exit;
+  end;
+  tmp.Init(length(s)*2);
+  len := UTF8ToWideChar(tmp.buf,pointer(S),length(S)) shr 1;
+  RawUnicodeToUtf8(tmp.buf,CharLowerBuffW(tmp.buf,len),result);
+  tmp.Done;
+end;
+{$endif KYLIX3}
 
 function IsCaseSensitive(const S: RawUTF8): boolean;
 begin

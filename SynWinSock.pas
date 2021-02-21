@@ -6,7 +6,7 @@ unit SynWinSock;
 {
     This file is part of Synopse framework.
 
-    Synopse framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -27,7 +27,7 @@ unit SynWinSock;
   Portions created by Lukas Gebauer are Copyright (C) 2003.
   All Rights Reserved.
 
-  Portions created by Arnaud Bouchez are Copyright (C) 2020 Arnaud Bouchez.
+  Portions created by Arnaud Bouchez are Copyright (C) 2021 Arnaud Bouchez.
   All Rights Reserved.
 
   Contributor(s):
@@ -406,7 +406,7 @@ const
 
 { Windows Sockets definitions of regular Microsoft C error constants }
 
-  WSAEINTR                = (WSABASEERR+4);
+  WSAEINTR                = (WSABASEERR+4); // legacy error
   WSAEBADF                = (WSABASEERR+9);
   WSAEACCES               = (WSABASEERR+13);
   WSAEFAULT               = (WSABASEERR+14);
@@ -1920,7 +1920,7 @@ begin
         exit;  // report connection closed
       if integer(s) < 0 then begin
         res := WSAGetLastError;
-        if (res <> WSATRY_AGAIN) and (res <> WSAEINTR) then begin
+        if res <> WSATRY_AGAIN then begin
           result := s;
           exit; // report socket fatal error
         end;

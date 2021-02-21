@@ -6,7 +6,7 @@ unit SynSelfTests;
 {
     This file is part of Synopse mORMot framework.
 
-    Synopse framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit SynSelfTests;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -826,15 +826,15 @@ type
     {$ifdef MSWINDOWS}
     /// test external DB using the JET engine
     procedure JETDatabase;
-    {$endif}
-    {$endif}
-    {$endif}
+    {$endif MSWINDOWS}
+    {$endif LVCL}
+    {$endif CPU64}
     {$ifdef MSWINDOWS}
     {$ifdef USEZEOS}
     /// test external Firebird embedded engine via Zeos/ZDBC (if available)
     procedure FirebirdEmbeddedViaZDBCOverHTTP;
-    {$endif}
-    {$endif}
+    {$endif USEZEOS}
+    {$endif MSWINDOWS}
   end;
 
   /// a test case for multi-threading abilities of the framework
@@ -8806,6 +8806,14 @@ check(IsValidJSON(J));
   check(IsValidJSON('['+J));
   J := GetJSONObjectAsSQL(J,false,true);
   CheckEqual(J,U);
+  J := '{'#10'"httpServer": {'#10'"host": "*",'#10'"port": "8881",'#10 +
+    '"serverType": "Socket",'#10'/*"reverseProxy": {'#10'"kind": "nginx",'#10 +
+    '"sendFileLocationRoot": "snake-ukrpatent-local"'#10'}*/'#10'} //eol'#10'}';
+  check(not IsValidJSON(J));
+  RemoveCommentsFromJSON(UniqueRawUTF8(J));
+  CheckUTF8(IsValidJSON(J),J);
+  J := JSONReformat(J,jsonCompact);
+  CheckEqual(J,'{"httpServer":{"host":"*","port":"8881","serverType":"Socket"}}');
   J := '{"RowID":  210 ,"Name":"Alice","Role":"User","Last Login":null, // comment'#13#10+
     '"First Login" : /* to be ignored */  null  ,  "Department"  :  "{\"relPath\":\"317\\\\\",\"revision\":1}" } ]';
   check(not IsValidJSON(J));
@@ -11782,9 +11790,9 @@ var s,t,rle: RawByteString;
     i,j, complen2: integer;
     comp2,dec1: array of byte;
     {$ifdef CPUINTEL}
-    comp1,dec2: array of byte;
+    comp1, dec2: array of byte;
     complen1: integer;
-    {$endif}
+    {$endif CPUINTEL}
 begin
   for i := 1 to 200 do begin
     s := SynLZCompress(StringOfChar(AnsiChar(i),i));
@@ -15501,6 +15509,8 @@ type
     {$endif}
   end;
 
+{ TSQLRecordCustomProps }
+
 class procedure TSQLRecordCustomProps.InternalRegisterCustomProperties(Props: TSQLRecordProperties);
 begin
   Props.RegisterCustomPropertyFromTypeName(self,'TGUID','GUID',
@@ -15800,6 +15810,9 @@ begin
         Test(dJet,true,'select top 2 id,firstname from SampleRecord order by firstname');
         Test(dMySQL,true,'select id,firstname from SampleRecord order by firstname limit 2');
         Test(dSQLite,true,'select id,firstname from SampleRecord order by firstname limit 2');
+        SqlOrigin := 'SELECT RowID,firstname FROM PeopleExt WHERE :(3001): '+
+          'BETWEEN firstname AND RowID LIMIT 1';
+        Test(dSQLite,false);
       finally
         Ext.Free;
       end;

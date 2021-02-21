@@ -6,7 +6,7 @@ unit mORMot;
 (*
     This file is part of Synopse mORMot framework.
 
-    Synopse mORMot framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse mORMot framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit mORMot;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -15842,6 +15842,7 @@ type
   // unless rsoGetUserRetrieveNoBlobData is defined
   // - rsoNoInternalState could be state to avoid transmitting the
   // 'Server-InternalState' header, e.g. if the clients wouldn't need it
+  // - rsoNoTableURI will disable any /root/tablename URI for safety
   TSQLRestServerOption = (
     rsoNoAJAXJSON,
     rsoGetAsJsonNotAsString,
@@ -15857,7 +15858,8 @@ type
     rsoTimestampInfoURIDisable,
     rsoHttpHeaderCheckDisable,
     rsoGetUserRetrieveNoBlobData,
-    rsoNoInternalState);
+    rsoNoInternalState,
+    rsoNoTableURI);
   /// allow to customize the TSQLRestServer process via its Options property
   TSQLRestServerOptions = set of TSQLRestServerOption;
 
@@ -16017,6 +16019,13 @@ type
     // - will perform any needed clean-up, and log the event
     // - this method is not thread-safe: caller should use Sessions.Lock/Unlock
     procedure SessionDelete(aSessionIndex: integer; Ctxt: TSQLRestServerURIContext);
+    /// SessionAccess will detect and delete outdated sessions, but you can call
+    // this method to force checking for deprecated session now
+    // - may be used e.g. from OnSessionCreate to limit the number of active sessions
+    // - this method is not thread-safe: caller should use Sessions.Lock/Unlock
+    // - you can call it often: it will seek for outdated sessions once per second
+    // - returns the current system Ticks number (at second resolution)
+    function SessionDeleteDeprecated: cardinal;
     /// returns TRUE if this table is worth caching (e.g. already in memory)
     // - this overridden implementation returns FALSE for TSQLRestStorageInMemory
     function CacheWorthItForTable(aTableIndex: cardinal): boolean; override;
@@ -30250,7 +30259,7 @@ end;
 
 function SQLWhereIsEndClause(const Where: RawUTF8): boolean;
 begin
-  result := IdemPCharArray(pointer(Where),['ORDER BY ','GROUP BY ',
+  result := IdemPCharArray(GotoNextNotSpace(pointer(Where)),['ORDER BY ','GROUP BY ',
     'LIMIT ','OFFSET ','LEFT ','RIGHT ','INNER ','OUTER ','JOIN '])>=0;
 end;
 
@@ -38204,7 +38213,7 @@ begin
   aMethodName := trim(aMethodName);
   if aMethodName='' then
     raise EServiceException.CreateUTF8('%.ServiceMethodRegister('''')',[self]);
-  if Model.GetTableIndex(aMethodName)>=0 then
+  if not(rsoNoTableURI in fOptions) and (Model.GetTableIndex(aMethodName)>=0) then
     raise EServiceException.CreateUTF8('Published method name %.% '+
       'conflicts with a Table in the Model!',[self,aMethodName]);
   with PSQLRestServerMethod(fPublishedMethods.AddUniqueName(aMethodName,
@@ -39497,7 +39506,9 @@ end;
 procedure TSQLRestServerURIContext.InternalSetTableFromTableName(TableName: PUTF8Char);
 begin
   TableEngine := Server;
-  InternalSetTableFromTableIndex(Server.Model.GetTableIndexPtr(TableName));
+  if rsoNoTableURI in Server.Options then
+    TableIndex := -1 else
+    InternalSetTableFromTableIndex(Server.Model.GetTableIndexPtr(TableName));
   if TableIndex<0 then
     exit;
   Static := Server.GetStaticTableIndex(TableIndex,StaticKind);
@@ -40899,7 +40910,7 @@ begin
        (Length(Result)>64) then begin
       FindNameValue(Call.InHead,'IF-NONE-MATCH: ',clientHash);
       if ServerHash='' then
-        ServerHash := '"'+crc32cUTF8ToHex(Result)+'"';
+        ServerHash := crc32cUTF8ToHex(Result);
       ServerHash := '"'+ServerHash+'"';
       if clientHash<>ServerHash then
         Call.OutHead := Call.OutHead+#13#10'ETag: '+ServerHash else begin
@@ -42034,7 +42045,7 @@ end;
 procedure TSQLRestServer.SessionDelete(aSessionIndex: integer;
   Ctxt: TSQLRestServerURIContext);
 var sess: TAuthSession;
-begin
+begin // caller made fSessions.Safe.Lock
   if (self<>nil) and (cardinal(aSessionIndex)<cardinal(fSessions.Count)) then begin
     sess := fSessions.List[aSessionIndex];
     if Services<>nil then
@@ -42051,38 +42062,48 @@ begin
   end;
 end;
 
+function TSQLRestServer.SessionDeleteDeprecated: cardinal;
+var i: PtrInt;
+begin // caller made fSessions.Safe.Lock
+  result := GetTickCount64 shr 10;
+  if (self<>nil) and (fSessions<>nil) then begin
+    if result<>fSessionsDeprecatedTix then begin
+      fSessionsDeprecatedTix := result; // check sessions every second
+      for i := fSessions.Count-1 downto 0 do
+        if result>TAuthSession(fSessions.List[i]).TimeOutTix then
+          SessionDelete(i,nil);
+    end;
+  end;
+end;
+
 function TSQLRestServer.SessionAccess(Ctxt: TSQLRestServerURIContext): TAuthSession;
 var i: integer;
     tix, session: cardinal;
     sessions: ^TAuthSession;
-begin // caller of RetrieveSession() made fSessions.Safe.Lock
+begin // caller made fSessions.Safe.Lock
   if (self<>nil) and (fSessions<>nil) then begin
-    tix := GetTickCount64 shr 10;
-    if tix<>fSessionsDeprecatedTix then begin
-      fSessionsDeprecatedTix := tix; // check deprecated sessions every second
-      for i := fSessions.Count-1 downto 0 do
-        if tix>TAuthSession(fSessions.List[i]).TimeOutTix then
-          SessionDelete(i,nil);
-    end;
+    // check deprecated sessions every second
+    tix := SessionDeleteDeprecated;
     // retrieve session from its ID
     sessions := pointer(fSessions.List);
     session := Ctxt.Session;
-    for i := 1 to fSessions.Count do
-      if sessions^.IDCardinal=session then begin
-        result := sessions^;
-        result.fTimeOutTix := tix+result.TimeoutShr10;
-        Ctxt.fSession := result; // for TSQLRestServer internal use
-        // make local copy of TAuthSession information
-        Ctxt.SessionUser := result.User.fID;
-        Ctxt.SessionGroup := result.User.GroupRights.fID;
-        Ctxt.SessionUserName := result.User.LogonName;
-        if (result.RemoteIP<>'') and (Ctxt.fRemoteIP='') then
-          Ctxt.fRemoteIP := result.RemoteIP;
-        Ctxt.fSessionAccessRights := result.fAccessRights;
-        Ctxt.Call^.RestAccessRights := @Ctxt.fSessionAccessRights;
-        exit;
-      end else
-        inc(sessions);
+    if session>CONST_AUTHENTICATION_NOT_USED then
+      for i := 1 to fSessions.Count do
+        if sessions^.IDCardinal=session then begin
+          result := sessions^;
+          result.fTimeOutTix := tix+result.TimeoutShr10;
+          Ctxt.fSession := result; // for TSQLRestServer internal use
+          // make local copy of TAuthSession information
+          Ctxt.SessionUser := result.User.fID;
+          Ctxt.SessionGroup := result.User.GroupRights.fID;
+          Ctxt.SessionUserName := result.User.LogonName;
+          if (result.RemoteIP<>'') and (Ctxt.fRemoteIP='') then
+            Ctxt.fRemoteIP := result.RemoteIP;
+          Ctxt.fSessionAccessRights := result.fAccessRights;
+          Ctxt.Call^.RestAccessRights := @Ctxt.fSessionAccessRights;
+          exit;
+        end else
+          inc(sessions);
   end;
   result := nil;
 end;

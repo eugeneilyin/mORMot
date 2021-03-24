@@ -45968,6 +45968,7 @@ begin
       n := FindWhereEqual(WhereField,FieldValue,DoAddToListEvent,match,0,0);
       if n=0 then
         exit;
+      result := true;
       SetLength(ResultID,n);
       for i := 0 to n-1 do
         ResultID[i] := TSQLRecord(match.List[i]).fID;

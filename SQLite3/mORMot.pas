@@ -16901,7 +16901,7 @@ type
     // - during authentication, this class will be used for every TSQLAuthGroup
     // table access
     property SQLAuthGroupClass: TSQLAuthGroupClass read fSQLAuthGroupClass;
-  published { standard method-based services }
+  public { standard method-based services }
     /// REST service accessible from ModelRoot/Stat URI to gather detailed information
     // - returns the current execution statistics of this server, as a JSON object
     // - this method will require an authenticated client, for safety
@@ -16920,7 +16920,6 @@ type
     // - a specific findservice=ServiceName parameter will not return any
     // statistics, but matching URIs from the server AssociatedServices list
     procedure Stat(Ctxt: TSQLRestServerURIContext);
-  public
     /// REST service accessible from ModelRoot/Auth URI
     // - called by the clients for authentication and session management
     // - this method won't require an authenticated client, since it is used to
